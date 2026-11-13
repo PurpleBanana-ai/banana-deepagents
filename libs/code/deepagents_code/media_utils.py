@@ -13,11 +13,12 @@ import subprocess  # noqa: S404
 import sys
 import tempfile
 from collections import Counter
-from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from langchain_core.messages.content import VideoContentBlock
 
 logger = logging.getLogger(__name__)
@@ -207,7 +208,7 @@ class VideoData:
     placeholder: str  # Display text like "[video 1]"
     placeholder_span: tuple[int, int] | None = None
 
-    def to_message_content(self) -> "VideoContentBlock":
+    def to_message_content(self) -> VideoContentBlock:
         """Convert to LangChain `VideoContentBlock` format.
 
         Returns:
@@ -285,7 +286,9 @@ def get_image_from_path(path: pathlib.Path) -> ImageData | None:
             format=image_format,
             placeholder="[image]",
         )
-    except (UnidentifiedImageError, OSError) as e:
+    except UnidentifiedImageError:
+        return None
+    except OSError as e:
         logger.debug("Failed to load image from %s: %s", path, e, exc_info=True)
         return None
 

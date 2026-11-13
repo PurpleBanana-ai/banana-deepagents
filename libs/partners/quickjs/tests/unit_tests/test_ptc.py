@@ -10,6 +10,7 @@ import json
 from typing import Any, Literal
 
 import pytest
+from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.types import Command
@@ -634,7 +635,8 @@ def test_middleware_ptc_list_includes_prompt_block() -> None:
     from types import SimpleNamespace
 
     mw = CodeInterpreterMiddleware(ptc=["greet", "eval"])
-    req = SimpleNamespace(tools=[_greet_tool(), _echo_tool("eval")])
+    state = {"_quickjs_slot_id": "ptc-prompt"}
+    req = SimpleNamespace(tools=[_greet_tool(), _echo_tool("eval")], state=state)
     prompt = mw._prepare_for_call(req)
     # Greet included
     assert "tools.greet(" in prompt
@@ -647,44 +649,97 @@ def test_middleware_ptc_list_of_tools_exposes_without_agent_tools() -> None:
     from types import SimpleNamespace
 
     mw = CodeInterpreterMiddleware(ptc=[_greet_tool()])
-    req = SimpleNamespace(tools=[])
+    state = {"_quickjs_slot_id": "ptc-tool-only"}
+    req = SimpleNamespace(tools=[], state=state)
     prompt = mw._prepare_for_call(req)
     assert "tools.greet(" in prompt
+
+
+def test_middleware_ptc_prompt_follows_each_slots_own_tools() -> None:
+    """Same-named tools with different schemas never share a rendered prompt.
+
+    One middleware serves every run of a compiled graph, so concurrent runs
+    (slots) can expose different `lookup` tools, and a run can swap one in.
+    """
+    from types import SimpleNamespace
+
+    def lookup_tool(description: str) -> BaseTool:
+        def lookup(query: str) -> str:
+            return query
+
+        return StructuredTool.from_function(
+            lookup, name="lookup", description=description
+        )
+
+    mw = CodeInterpreterMiddleware(ptc=["lookup"])
+    acme = {"_quickjs_slot_id": "run-acme"}
+    globex = {"_quickjs_slot_id": "run-globex"}
+
+    acme_prompt = mw._prepare_for_call(
+        SimpleNamespace(tools=[lookup_tool("Search acme issues.")], state=acme)
+    )
+    globex_prompt = mw._prepare_for_call(
+        SimpleNamespace(tools=[lookup_tool("Search globex issues.")], state=globex)
+    )
+    swapped = mw._prepare_for_call(
+        SimpleNamespace(tools=[lookup_tool("Search acme pull requests.")], state=acme)
+    )
+
+    assert "Search acme issues." in acme_prompt
+    assert "Search globex issues." in globex_prompt
+    assert "acme" not in globex_prompt
+    assert "Search acme pull requests." in swapped
+
+
+def test_middleware_ptc_requires_private_slot_state() -> None:
+    from types import SimpleNamespace
+
+    mw = CodeInterpreterMiddleware(ptc=["greet"])
+    with pytest.raises(ValueError, match="_quickjs_slot_id"):
+        mw._prepare_for_call(SimpleNamespace(tools=[_greet_tool()]))
 
 
 async def test_ptc_install_and_eval_resolve_to_same_repl() -> None:
     """PTC install and the eval tool must see the same REPL instance.
 
-    Regression: without a stable fallback thread id, each call to
-    `_resolve_thread_id` minted a fresh UUID, so `wrap_model_call`
-    installed tools on one REPL and the eval ran on another — JS saw
-    `ReferenceError: tools is not defined`.
+    Regression: PTC installation must use the private slot id that the eval
+    tool reads from runtime state, not a shared middleware fallback.
     """
     from types import SimpleNamespace
 
     mw = CodeInterpreterMiddleware(ptc=["greet", "eval"])
-    # Simulate a model-call turn without any langgraph config present.
-    req = SimpleNamespace(tools=[_greet_tool(), _echo_tool("eval")])
+    state = {"_quickjs_slot_id": "ptc-shared-slot"}
+    req = SimpleNamespace(tools=[_greet_tool(), _echo_tool("eval")], state=state)
     mw._prepare_for_call(req)
-    # Now invoke the eval tool directly via the middleware-owned registry.
-    # The resolver should return the *same* REPL instance.
-    first = mw._registry.get(mw._fallback_thread_id)
-    outcome = await first.eval_async("typeof tools.greet")
-    assert outcome.error_type is None, outcome.error_message
-    assert outcome.result == "function"
+    assert mw._registry.get_if_exists(state["_quickjs_slot_id"]) is None
+    runtime = ToolRuntime(
+        state=state,
+        context={},
+        config={},
+        stream_writer=lambda _: None,
+        tools=mw.tools,
+        tool_call_id="lazy-ptc",
+        store=None,
+    )
+    try:
+        result = await mw.tools[0].ainvoke(
+            {"runtime": runtime, "code": "typeof tools.greet"}
+        )
+        assert result.content == "<result>function</result>"
+    finally:
+        mw._registry.close()
 
 
 async def test_middleware_eval_tool_returns_tool_message_only() -> None:
     from types import SimpleNamespace
 
-    from langchain.tools import ToolRuntime
-
     command_tool = _command_tool()
     mw = CodeInterpreterMiddleware(ptc=[command_tool])
     tool = mw.tools[0]
-    mw._prepare_for_call(SimpleNamespace(tools=[command_tool, tool]))
+    state = {"_quickjs_slot_id": "ptc-command-slot"}
+    mw._prepare_for_call(SimpleNamespace(tools=[command_tool, tool], state=state))
     runtime = ToolRuntime(
-        state={},
+        state=state,
         context={},
         config={},
         stream_writer=lambda _chunk: None,
@@ -705,14 +760,13 @@ async def test_middleware_eval_tool_returns_tool_message_only() -> None:
 async def test_mode_call_reinstalls_ptc_tools_for_each_eval_call() -> None:
     from types import SimpleNamespace
 
-    from langchain.tools import ToolRuntime
-
     greet_tool = _greet_tool()
     mw = CodeInterpreterMiddleware(ptc=[greet_tool], mode="call")
     tool = mw.tools[0]
-    mw._prepare_for_call(SimpleNamespace(tools=[greet_tool, tool]))
+    state = {"_quickjs_slot_id": "ptc-call-slot"}
+    mw._prepare_for_call(SimpleNamespace(tools=[greet_tool, tool], state=state))
     runtime = ToolRuntime(
-        state={},
+        state=state,
         context={},
         config={},
         stream_writer=lambda _chunk: None,
@@ -828,10 +882,8 @@ def _stub() -> None:
         (type(None), "Promise<null>"),
         # Containers of primitives.
         (list[int], "Promise<number[]>"),
-        # `dict[str, V]` uses `additionalProperties` in the schema, which
-        # `_json_schema_to_ts` doesn't currently read — value type collapses
-        # to `unknown`.
-        (dict[str, int], "Promise<Record<string, unknown>>"),
+        (dict[str, int], "Promise<Record<string, number>>"),
+        (list[int | None], "Promise<(number | null)[]>"),
         # Optional / Literal / unions all flow through `anyOf` or `enum`.
         (int | None, "Promise<number | null>"),
         (Literal["active", "resolved"], 'Promise<"active" | "resolved">'),
@@ -839,10 +891,9 @@ def _stub() -> None:
         # Top-level TypedDict / BaseModel — Pydantic inlines the schema.
         (_UserLookup, "Promise<{ id: number; name: string }>"),
         (_Status, "Promise<{ status: string; count: number }>"),
-        # Compound types that hit `$ref` (collections of TypedDict /
-        # BaseModel) — we don't resolve refs, so they collapse to `unknown`.
-        (list[_UserLookup], "Promise<unknown[]>"),
-        (list[_Status], "Promise<unknown[]>"),
+        # Collections of TypedDict / BaseModel resolve their `$ref` inline.
+        (list[_UserLookup], "Promise<{ id: number; name: string }[]>"),
+        (list[_Status], "Promise<{ status: string; count: number }[]>"),
     ],
 )
 def test_render_ptc_prompt_return_types(annotation: Any, expected: str) -> None:
@@ -895,3 +946,60 @@ async def test_pydantic_return_arrives_as_object_matching_schema(
     )
     assert outcome.error_type is None, outcome.error_message
     assert outcome.result == "object:ok:3"
+
+
+# ---------------------------------------------------------------------------
+# Nested models
+# ---------------------------------------------------------------------------
+
+
+class _Address(BaseModel):
+    city: str
+
+
+class _User(BaseModel):
+    name: str
+    address: _Address
+    home: _Address | None = None
+
+
+class _UsersInput(BaseModel):
+    users: list[_User]
+
+
+class _TreeNode(BaseModel):
+    value: int
+    children: list[_TreeNode] = []
+
+
+def _normalize_users(users: list[_User]) -> list[_User]:
+    """Normalize users."""
+    return users
+
+
+def _walk(value: int, children: list[_TreeNode] | None = None) -> _TreeNode:
+    """Walk a tree."""
+    return _TreeNode(value=value, children=children or [])
+
+
+def _ptc_body(tools: list[BaseTool]) -> str:
+    """Return the fenced API reference block of the rendered PTC prompt."""
+    return render_ptc_prompt(tools).rsplit("```typescript\n", 1)[1]
+
+
+def test_nested_models_render_inline() -> None:
+    """Nested, list-of-model and Optional fields render inline, not `unknown`."""
+    user = "{ name: string; address: { city: string }; home?: { city: string } | null }"
+    tool = StructuredTool.from_function(
+        _normalize_users, name="normalize_users", args_schema=_UsersInput
+    )
+    body = _ptc_body([tool])
+    assert f"  users: {user}[];\n}}): Promise<{user}[]>" in body
+
+
+def test_recursive_model_back_reference_renders_unknown() -> None:
+    """A model's reference to itself is cut off as `unknown`."""
+    tool = StructuredTool.from_function(_walk, name="walk", args_schema=_TreeNode)
+    body = _ptc_body([tool])
+    assert "  children?: { value: number; children?: unknown[] }[];" in body
+    assert "): Promise<{ value: number; children?: unknown[] }>" in body

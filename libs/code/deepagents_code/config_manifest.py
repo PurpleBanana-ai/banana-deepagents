@@ -12,7 +12,7 @@ shared process resolver and the `config` CLI command builds one from the
 generation it snapshots, so introspection can never drift from what the app
 actually reads. Resolution precedence mirrors the loaders: managed TOML beats
 `DEEPAGENTS_CODE_`-prefixed and canonical env, env beats user `config.toml`,
-and the typed default is the final fallback. A malformed numeric/list/PTC
+and the typed default is the final fallback. A malformed numeric/list/PTC/ISO
 value, an unrecognized boolean token, or a wrong-typed TOML value is logged
 and falls back to the next layer rather than raising, so one bad entry does
 not discard valid sibling policy.
@@ -36,23 +36,27 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from enum import Enum, StrEnum
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Any,
+    Generic,
     Literal,
     NotRequired,
     TypedDict,
+    TypeIs,
+    TypeVar,
     Unpack,
     get_args,
     overload,
 )
 
-from typing_extensions import TypeIs
-
 from deepagents_code import _env_vars
+from deepagents_code.terminal_title import DEFAULT_TERMINAL_TAB_TITLE
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -99,6 +103,15 @@ call indefinitely, so it stays bounded: a mistyped or hostile override cannot
 effectively remove it. A resolved value above the ceiling is rejected and falls
 through to the next layer / default.
 """
+
+MCP_TOOL_TIMEOUT_SECONDS_DEFAULT = 120.0
+"""Default wall-clock budget for one MCP tool call."""
+
+MCP_TOOL_TIMEOUT_FLOOR = 1.0
+"""Smallest accepted MCP tool-call timeout."""
+
+MCP_TOOL_TIMEOUT_CEILING = 900.0
+"""Largest accepted MCP tool-call timeout."""
 
 RECURSION_LIMIT_FLOOR = 25
 """Smallest `recursion_limit` accepted from managed config, the env var, or TOML.
@@ -154,6 +167,78 @@ VALID_CURSOR_STYLES: frozenset[str] = frozenset(get_args(CursorStyle))
 """Allowlist derived from `CursorStyle` so the two never drift."""
 
 
+def normalize_iso_datetime(value: object) -> str | None:
+    """Normalize an ISO 8601 date or aware datetime to a UTC timestamp.
+
+    Returns:
+        The normalized timestamp, or `None` when the value is invalid.
+    """
+    parsed: datetime
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time(), tzinfo=UTC)
+    elif isinstance(value, str):
+        text = value.strip()
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            try:
+                parsed = datetime.combine(
+                    date.fromisoformat(text), datetime.min.time(), tzinfo=UTC
+                )
+            except ValueError:
+                return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC).isoformat()
+
+
+_DURATION_UNITS = {
+    "s": 1,
+    "m": 60,
+    "h": 60 * 60,
+    "d": 24 * 60 * 60,
+    "w": 7 * 24 * 60 * 60,
+}
+_MAX_DURATION_SECONDS = int(timedelta.max.total_seconds())
+
+
+def normalize_duration(value: object) -> str | None:
+    """Normalize a positive integer duration such as `7d`.
+
+    Returns:
+        The normalized duration, or `None` when invalid.
+    """
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"([1-9][0-9]*)([smhdw])", value.strip().lower())
+    if match is None:
+        return None
+    digits, unit = match.groups()
+    if len(digits) > len(str(_MAX_DURATION_SECONDS)):
+        return None
+    count = int(digits)
+    seconds = count * _DURATION_UNITS[unit]
+    return f"{count}{unit}" if seconds <= _MAX_DURATION_SECONDS else None
+
+
+def parse_duration_seconds(value: object) -> int | None:
+    """Parse a positive integer duration such as `7d` into seconds.
+
+    Returns:
+        The duration in seconds, or `None` when invalid.
+    """
+    normalized = normalize_duration(value)
+    if normalized is None:
+        return None
+    return int(normalized[:-1]) * _DURATION_UNITS[normalized[-1]]
+
+
 class OptionKind(Enum):
     """How an option's raw env/TOML value is coerced to a typed value.
 
@@ -163,7 +248,7 @@ class OptionKind(Enum):
     `option_accepts_toml` is the public seam over that same coercion.
     `LOG_LEVEL_DELEGATE`, `SHELL_LIST_DELEGATE`, `EXTENSION_TRUST_DELEGATE`,
     `SKILLS_DIRS_DELEGATE`, `PTC_DELEGATE`, and `STARTUP_MODE_DELEGATE` defer to
-    bespoke parsers (their semantics — dynamic debug fallback, colon-split Path
+    bespoke parsers (their semantics — dynamic debug fallback, pathsep-split Path
     resolution, comma + `recommended`/`all` sentinels, and the PTC/startup-mode
     allowlists — do not compress into a generic coercion). `THEME_DELEGATE` is
     coerced by the providers themselves (`ranked_theme_toml_value` and
@@ -196,6 +281,12 @@ class OptionKind(Enum):
 
     NON_EMPTY_STR = "non_empty_str"
     """A string stripped of surrounding whitespace; blank values are unset."""
+
+    ISO_DATETIME = "iso_datetime"
+    """An ISO 8601 date or timezone-aware datetime normalized to UTC."""
+
+    DURATION_SECONDS = "duration_seconds"
+    """A positive integer duration with an `s`, `m`, `h`, `d`, or `w` suffix."""
 
     MODEL_LIST_DELEGATE = "model_list"
     """Validates a list of `provider:model` specs and `provider:*` wildcards."""
@@ -245,6 +336,8 @@ _KIND_TYPE_LABEL: dict[OptionKind, str] = {
     OptionKind.FLOAT: "float",
     OptionKind.STR: "str",
     OptionKind.NON_EMPTY_STR: "non-empty str",
+    OptionKind.ISO_DATETIME: "ISO 8601 date or timezone-aware datetime",
+    OptionKind.DURATION_SECONDS: "duration (for example, 7d)",
     OptionKind.MODEL_LIST_DELEGATE: "list[provider:model]",
     OptionKind.EXTENSION_TRUST_DELEGATE: "str",
     OptionKind.LOG_LEVEL_DELEGATE: "str",
@@ -357,6 +450,7 @@ class _CommonFields(TypedDict):
     summary: str
     env_var: NotRequired[str | None]
     fallback_env_vars: NotRequired[tuple[str, ...]]
+    prefix_aware_fallbacks: NotRequired[bool]
     toml_keys: NotRequired[tuple[str, ...] | None]
     invert_toml_bool: NotRequired[bool]
     cli_flag: NotRequired[str | None]
@@ -375,6 +469,8 @@ type _BoolKind = Literal[OptionKind.BOOL, OptionKind.BOOL_PRESENCE]
 type _StrKind = Literal[
     OptionKind.STR,
     OptionKind.NON_EMPTY_STR,
+    OptionKind.ISO_DATETIME,
+    OptionKind.DURATION_SECONDS,
     OptionKind.CURSOR_STYLE_DELEGATE,
     OptionKind.EXTENSION_TRUST_DELEGATE,
     OptionKind.STARTUP_MODE_DELEGATE,
@@ -386,8 +482,11 @@ type _SynthesizedStrKind = Literal[
 ]
 
 
+T_co = TypeVar("T_co", covariant=True)
+
+
 @dataclass(frozen=True)
-class ConfigOption[T]:
+class ConfigOption(Generic[T_co]):  # noqa: UP046  # Explicit covariance avoids dataclass __replace__ inference.
     """One user-tunable configuration option and where it can be set.
 
     `T` is the type `ConfigResolver.get` yields for this option. It is not
@@ -413,7 +512,7 @@ class ConfigOption[T]:
     kind: OptionKind
     """How env/TOML values are coerced to a typed value."""
 
-    default: T | None = None
+    default: T_co | None = None
     """Typed default value, or `None` when there is no static default.
 
     Declaring one is what removes `None` from `T`: `_resolve` falls back to
@@ -433,9 +532,18 @@ class ConfigOption[T]:
     fallback_env_vars: tuple[str, ...] = ()
     """Secondary env vars read (in order) when `env_var` is unset.
 
-    Read literally — no `DEEPAGENTS_CODE_` prefix logic — so `config`/`config get`
-    mirror runtime fallbacks such as `get_langsmith_project_name` reading bare
-    `LANGSMITH_PROJECT`.
+    Read literally unless `prefix_aware_fallbacks` is set, so `config`/`config
+    get` mirror runtime fallbacks such as `get_langsmith_project_name` reading
+    bare `LANGSMITH_PROJECT`.
+    """
+
+    prefix_aware_fallbacks: bool = False
+    """Whether `fallback_env_vars` honor `DEEPAGENTS_CODE_` prefix overrides.
+
+    Set for credentials, whose runtime lookup routes every accepted name
+    through `resolve_env_var` -- including empty-prefix shadowing. Left off for
+    fallbacks the runtime reads literally, where applying the override would
+    let an empty prefixed variable shadow a set canonical one.
     """
 
     toml_keys: tuple[str, ...] | None = None
@@ -767,7 +875,7 @@ def load_config_toml() -> dict[str, Any]:
             return tomllib.load(f)
     except FileNotFoundError:
         return {}
-    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+    except OSError, tomllib.TOMLDecodeError, UnicodeDecodeError:
         # `UnicodeDecodeError` is neither of the other two (it subclasses
         # `ValueError`), but a file saved as UTF-16 or holding a stray byte is
         # unreadable TOML in exactly the same way -- without it, a config that
@@ -1067,7 +1175,7 @@ def _notify_cli_warning(message: str) -> bool:
         from textual._context import active_app  # noqa: PLC2701
 
         app = active_app.get()
-    except (ImportError, LookupError):
+    except ImportError, LookupError:
         return False
     if not app.is_running:
         return False
@@ -1292,6 +1400,7 @@ def load_bool_display_preference(
     key: str,
     *,
     fallback: bool,
+    default: bool | None = None,
     on_rejected: Callable[[str], None] | None = None,
 ) -> bool:
     """Resolve a boolean `Display` option through the config manifest.
@@ -1315,6 +1424,9 @@ def load_bool_display_preference(
             not a `BOOL` option — both mean a caller and the manifest disagree.
             Pinned against each option's declared default by
             `test_bool_display_preference_fallbacks_match_the_manifest`.
+        default: Value to use instead of the declared default when no tier
+            sets the option. For a mode whose default differs from the
+            manifest's, such as headless reasoning output.
         on_rejected: Called once per rejection reason when a tier at or above
             the winning tier supplied a value that failed to parse — a
             rejection a weaker tier could not have influenced, and one at a
@@ -1330,6 +1442,7 @@ def load_bool_display_preference(
     Returns:
         The resolved value.
     """
+    from deepagents_code.configuration.resolver import DEFAULT_RANK
     from deepagents_code.configuration.types import Invalid
 
     option = get_option(key)
@@ -1353,6 +1466,8 @@ def load_bool_display_preference(
     ranked = _resolve_option(option)
     _emit_ranked_diagnostics(option, ranked)
     resolved = bool(ranked.value)
+    if default is not None and ranked.ranks == (DEFAULT_RANK,):
+        resolved = default
     # Keep the source: a display option turned off by managed policy is
     # otherwise indistinguishable from one the user turned off themselves.
     # Visible under `DEEPAGENTS_CODE_DEBUG`; `dcode config get` is the answer
@@ -1530,6 +1645,82 @@ def resolve_auto_classifier_timeout(
             `[AUTO_CLASSIFIER_TIMEOUT_FLOOR, AUTO_CLASSIFIER_TIMEOUT_CEILING]`.
     """
     value, _ = resolve_auto_classifier_timeout_with_source(
+        toml_data=toml_data,
+        managed_toml_data=managed_toml_data,
+    )
+    return value
+
+
+def _is_valid_mcp_tool_timeout(value: object) -> TypeIs[float]:
+    """Return whether `value` is an accepted MCP tool-call timeout."""
+    return (
+        isinstance(value, float)
+        and math.isfinite(value)
+        and MCP_TOOL_TIMEOUT_FLOOR <= value <= MCP_TOOL_TIMEOUT_CEILING
+    )
+
+
+def resolve_mcp_tool_timeout_with_source(
+    *,
+    toml_data: dict[str, Any] | None = None,
+    managed_toml_data: dict[str, Any] | None = None,
+) -> tuple[float, str]:
+    """Resolve the wall-clock budget for one MCP tool call.
+
+    Out-of-range overrides fall through to the next configuration source.
+
+    Args:
+        toml_data: Parsed user TOML. Omit both tables to use the shared resolver.
+        managed_toml_data: Parsed managed TOML for an explicit generation.
+
+    Returns:
+        `(timeout_seconds, source)` with the timeout within the accepted bounds.
+    """
+    option = get_option("mcp.tool_timeout")
+    if option is None:
+        return MCP_TOOL_TIMEOUT_SECONDS_DEFAULT, "default"
+
+    resolver = _resolver_for_option_sources(
+        toml_data=toml_data,
+        managed_toml_data=managed_toml_data,
+    )
+    excluded: set[int] = set()
+    while True:
+        resolved = resolver.get_without_ranks(option, excluded)
+        _emit_ranked_diagnostics(option, resolved)
+        value, source = resolved.value, _ranked_source(resolved)
+        if _is_valid_mcp_tool_timeout(value):
+            return value, source
+        if source == "default" or not resolved.ranks:
+            return MCP_TOOL_TIMEOUT_SECONDS_DEFAULT, "default"
+        logger.warning(
+            "Ignoring %s mcp.tool_timeout %r (expected seconds in [%g, %g]); "
+            "falling through to the next config source",
+            source,
+            value,
+            MCP_TOOL_TIMEOUT_FLOOR,
+            MCP_TOOL_TIMEOUT_CEILING,
+        )
+        # Exclude the rejected provider from this read, preserving the active
+        # workspace environment and the resolver's pinned file snapshots.
+        excluded.update(resolved.ranks)
+
+
+def resolve_mcp_tool_timeout(
+    *,
+    toml_data: dict[str, Any] | None = None,
+    managed_toml_data: dict[str, Any] | None = None,
+) -> float:
+    """Resolve the bounded wall-clock budget for one MCP tool call.
+
+    Args:
+        toml_data: Parsed user TOML. Omit both tables to use the shared resolver.
+        managed_toml_data: Parsed managed TOML for an explicit generation.
+
+    Returns:
+        The resolved timeout in seconds within the accepted bounds.
+    """
+    value, _ = resolve_mcp_tool_timeout_with_source(
         toml_data=toml_data,
         managed_toml_data=managed_toml_data,
     )
@@ -1862,12 +2053,6 @@ def resolve_recursion_limit(
 
 # --- Option definitions -----------------------------------------------------
 
-# Search credentials that are not provider API keys live outside
-# `PROVIDER_API_KEY_ENV`, so they are declared explicitly.
-_EXTRA_CREDENTIAL_ENV: dict[str, str] = {
-    "tavily": "TAVILY_API_KEY",
-}
-
 _SECRET_NAME_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "APIKEY")
 
 _PROVIDER_DEPENDENCIES: dict[str, tuple[str, str]] = {
@@ -1961,7 +2146,7 @@ def is_provider_package_installed(provider: str) -> bool:
         return True
     try:
         return importlib.util.find_spec(dependency[0]) is not None
-    except (ImportError, ValueError):
+    except ImportError, ValueError:
         # `find_spec` re-raises errors from a broken parent package and raises
         # `ValueError` for a malformed spec. Treat "can't tell" as "missing"
         # so the model selector routes to the install prompt rather than
@@ -1983,18 +2168,23 @@ def _is_secret_env(name: str) -> bool:
 def _credential_options() -> tuple[ConfigOption[object], ...]:
     """Build credential options from the canonical provider/key registries.
 
-    Generating these from `PROVIDER_API_KEY_ENV` (rather than hand-listing
-    them) guarantees every provider the app knows how to authenticate has a
-    manifest entry, so new providers can never silently miss the config
-    surface.
+    Generating these from the provider and service registries guarantees every
+    credential the app knows how to authenticate has a manifest entry, so new
+    providers and services can never silently miss the config surface.
 
     Returns:
-        One credential `ConfigOption` per known provider/key env var.
+        One credential `ConfigOption` per provider in `PROVIDER_API_KEY_ENV`
+            and per service in `SERVICE_API_KEY_ENV`. Service entries win on a
+            name collision.
     """
-    from deepagents_code.model_config import PROVIDER_API_KEY_ENV
+    from deepagents_code.model_config import (
+        PROVIDER_API_KEY_ENV,
+        SERVICE_API_KEY_ENV,
+        SERVICE_API_KEY_FALLBACK_ENV_VARS,
+    )
 
     options: list[ConfigOption[object]] = []
-    sources = {**PROVIDER_API_KEY_ENV, **_EXTRA_CREDENTIAL_ENV}
+    sources = {**PROVIDER_API_KEY_ENV, **SERVICE_API_KEY_ENV}
     for name, env_var in sorted(sources.items()):
         redacted = _is_secret_env(env_var)
         summary = (
@@ -2010,6 +2200,8 @@ def _credential_options() -> tuple[ConfigOption[object], ...]:
                 summary=summary,
                 kind=OptionKind.STR,
                 env_var=env_var,
+                fallback_env_vars=SERVICE_API_KEY_FALLBACK_ENV_VARS.get(name, ()),
+                prefix_aware_fallbacks=True,
                 redacted=redacted,
                 provider=name,
                 dependency_module=dependency[0] if dependency else None,
@@ -2079,6 +2271,17 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
         env_var=_env_vars.TERMINAL_PROGRESS,
         toml_keys=("ui", "terminal_progress"),
         empty_env_is_false=True,
+    ),
+    ConfigOption(
+        key="terminal.tab_title",
+        group="Display",
+        summary=(
+            "Terminal tab title template using {app_name}, {thread_name}, {cwd}, "
+            "and {branch}."
+        ),
+        kind=OptionKind.STR,
+        default=DEFAULT_TERMINAL_TAB_TITLE,
+        toml_keys=("terminal", "tab_title"),
     ),
     ConfigOption(
         key="display.show_message_timestamps",
@@ -2159,9 +2362,12 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
     ConfigOption(
         key="display.show_reasoning",
         group="Display",
-        summary="Show provider-visible reasoning in local output (off by default).",
+        summary=(
+            "Show provider-visible reasoning in local output "
+            "(on in the TUI, off in headless mode)."
+        ),
         kind=OptionKind.BOOL,
-        default=False,
+        default=True,
         env_var=_env_vars.SHOW_REASONING,
         toml_keys=("ui", "show_reasoning"),
         cli_flag="--show-reasoning",
@@ -2184,6 +2390,15 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
         default=False,
         env_var=_env_vars.DEBUG_CONSOLE_CLICK_TO_COPY,
         toml_keys=("ui", "debug_console_click_to_copy"),
+    ),
+    ConfigOption(
+        key="display.ask_about_selection",
+        group="Display",
+        summary='Show "Ask about this" for selected conversation text (on by default).',
+        kind=OptionKind.BOOL,
+        default=True,
+        env_var=_env_vars.ASK_ABOUT_SELECTION,
+        toml_keys=("ui", "ask_about_selection"),
     ),
     ConfigOption(
         key="display.collapse_pastes",
@@ -2434,6 +2649,19 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
         toml_keys=("tracing", "langsmith_redact"),
     ),
     ConfigOption(
+        key="tracing.git_attribution",
+        group="Tracing",
+        summary=(
+            "Run read-only git checks around checkout-changing tools to label "
+            "traces with the repository and branch worked on."
+        ),
+        kind=OptionKind.BOOL,
+        default=True,
+        env_var=_env_vars.GIT_ATTRIBUTION,
+        empty_env_is_false=True,
+        toml_keys=("tracing", "git_attribution"),
+    ),
+    ConfigOption(
         key="tracing.user_id",
         group="Tracing",
         summary="User identifier attached to LangSmith trace metadata.",
@@ -2470,7 +2698,7 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
         group="Tools",
         summary=(
             "Extra directories added to the skill symlink containment "
-            "allowlist (env is colon-separated)."
+            "allowlist (env uses the platform path separator)."
         ),
         kind=OptionKind.SKILLS_DIRS_DELEGATE,
         env_var=_env_vars.EXTRA_SKILLS_DIRS,
@@ -2483,6 +2711,19 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
         kind=OptionKind.BOOL,
         default=True,
         env_var=_env_vars.OLLAMA_DISCOVERY,
+    ),
+    ConfigOption(
+        key="models.provider_tool_search",
+        group="Tools",
+        summary=(
+            "Use provider-native MCP tool discovery on supported OpenAI/Anthropic "
+            "models, directly or through LangSmith gateway; other routes stay eager."
+        ),
+        kind=OptionKind.BOOL,
+        default=True,
+        env_var=_env_vars.PROVIDER_TOOL_SEARCH,
+        empty_env_is_false=True,
+        toml_keys=("models", "provider_tool_search"),
     ),
     ConfigOption(
         key="models.openai_prompt_cache_key",
@@ -2655,6 +2896,25 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
         toml_keys=("threads", "compact_on_resume_threshold"),
     ),
     ConfigOption(
+        key="threads.max_resume_age",
+        group="Threads",
+        summary=(
+            "Block resuming threads older than this duration (for example, '7d')."
+        ),
+        kind=OptionKind.DURATION_SECONDS,
+        toml_keys=("threads", "max_resume_age"),
+    ),
+    ConfigOption(
+        key="threads.resume_after",
+        group="Threads",
+        summary=(
+            "Block resuming threads last updated before this ISO 8601 date or "
+            "timezone-aware datetime."
+        ),
+        kind=OptionKind.ISO_DATETIME,
+        toml_keys=("threads", "resume_after"),
+    ),
+    ConfigOption(
         key="threads.relative_time",
         group="Threads",
         summary="Show thread timestamps as relative time.",
@@ -2695,7 +2955,34 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
         env_var=_env_vars.HISTORY_RETENTION_DAYS,
         toml_keys=("history", "retention_days"),
     ),
+    ConfigOption(
+        key="history.idle_compaction_tokens",
+        group="History",
+        summary=(
+            "Automatically offload idle context at this token count during the "
+            "final 20% of prompt-cache retention, capped at 120 seconds "
+            "(disabled by default; "
+            "0 disables). Uses the "
+            "offload model and may incur summarization costs."
+        ),
+        kind=OptionKind.NON_NEGATIVE_INT,
+        default=0,
+        env_var=_env_vars.IDLE_COMPACTION_TOKENS,
+        toml_keys=("history", "idle_compaction_tokens"),
+    ),
     # --- Warnings ------------------------------------------------------
+    ConfigOption(
+        key="warnings.cache_prompt",
+        group="Warnings",
+        summary=(
+            "When to prompt about an expired prompt cache: 'expiry' offers a "
+            "summarized new thread when the window lapses, 'send' warns only "
+            "on submit, 'off' disables both."
+        ),
+        kind=OptionKind.STR,
+        default="expiry",
+        toml_keys=("warnings", "cache_prompt"),
+    ),
     ConfigOption(
         key="warnings.cold_cache_min_delta_usd",
         group="Warnings",
@@ -2758,6 +3045,15 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
         env_var=_env_vars.SUPPRESS_ENV_OVERRIDE_WARNING,
     ),
     # --- MCP ------------------------------------------------------------
+    ConfigOption(
+        key="mcp.tool_timeout",
+        group="MCP",
+        summary="Seconds an MCP tool call may run before returning an error (1-900).",
+        kind=OptionKind.FLOAT,
+        default=MCP_TOOL_TIMEOUT_SECONDS_DEFAULT,
+        env_var=_env_vars.MCP_TOOL_TIMEOUT,
+        toml_keys=("mcp", "tool_timeout"),
+    ),
     # Project trust lists are parsed by `model_config.load_mcp_server_trust_lists`,
     # which reads them only from the user-level config.toml (never a project file),
     # so they are STRUCTURED-for-discovery here rather than env-backed scalars. The
@@ -2824,7 +3120,10 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
     ConfigOption(
         key="plugins.auto_update",
         group="Plugins",
-        summary="Update opted-in plugins after the first prompt; disable globally.",
+        summary=(
+            "Check plugins for updates after the first prompt and install "
+            "opted-in ones; disable globally."
+        ),
         kind=OptionKind.BOOL,
         default=True,
         env_var=_env_vars.PLUGIN_AUTO_UPDATE,
@@ -2968,7 +3267,7 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
         group="Debug",
         summary="Directory for per-thread debug log files.",
         kind=OptionKind.STR,
-        default="/tmp/deepagents_debug",  # noqa: S108  # documents the app default, not a write target
+        default=_env_vars.DEFAULT_DEBUG_DIRECTORY,
         env_var=_env_vars.DEBUG_DIRECTORY,
         toml_keys=("debug", "directory"),
     ),
@@ -3050,6 +3349,8 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
 NON_OPTION_ENV_VARS: frozenset[str] = frozenset(
     {
         _env_vars.SERVER_ENV_PREFIX,
+        # Prefixed alias for the existing `display.charset` option.
+        _env_vars.UI_CHARSET_MODE,
         # Set then popped during the self-update restart handshake (main.py);
         # never user-configured.
         _env_vars.RESTARTED_AFTER_UPDATE,

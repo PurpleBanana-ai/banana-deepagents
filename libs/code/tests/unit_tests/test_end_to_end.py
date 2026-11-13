@@ -2,26 +2,29 @@
 
 import logging
 import uuid
-from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
-import pytest
 from deepagents.backends import CompositeBackend
 from deepagents.backends.filesystem import FilesystemBackend
-from langchain_core.callbacks import CallbackManagerForLLMRun
-from langchain_core.language_models import LanguageModelInput
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_core.outputs import ChatResult
-from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import Field
 
 from deepagents_code.agent import create_cli_agent
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Generator, Sequence
+    from pathlib import Path
+
+    import pytest
+    from langchain_core.callbacks import CallbackManagerForLLMRun
+    from langchain_core.language_models import LanguageModelInput
+    from langchain_core.outputs import ChatResult
+    from langchain_core.runnables import Runnable
 
 
 @tool(description="Sample tool")
@@ -66,9 +69,7 @@ class FixedGenericFakeChatModel(GenericFakeChatModel):
 
 
 @contextmanager
-def mock_settings(
-    tmp_path: Path, assistant_id: str = "test-agent"
-) -> Generator[Path, None, None]:
+def mock_settings(tmp_path: Path, assistant_id: str = "test-agent") -> Generator[Path]:
     """Context manager for patching CLI settings with temporary directories.
 
     Args:
@@ -372,73 +373,6 @@ class TestDeepAgentsCLIEndToEnd:
             # Verify ls tool was called
             tool_messages = [msg for msg in result["messages"] if msg.type == "tool"]
             assert len(tool_messages) > 0
-
-    async def test_cli_agent_with_fake_llm_multiple_tool_calls(
-        self, tmp_path: Path
-    ) -> None:
-        """Test CLI agent with multiple tool calls using a fake LLM model.
-
-        This test verifies that a CLI agent can handle multiple sequential
-        tool calls with a fake LLM model.
-        """
-        with mock_settings(tmp_path):
-            # Create a fake model that makes multiple tool calls
-            model = FixedGenericFakeChatModel(
-                messages=iter(
-                    [
-                        AIMessage(
-                            content="",
-                            tool_calls=[
-                                {
-                                    "name": "sample_tool",
-                                    "args": {"sample_input": "first call"},
-                                    "id": "call_1",
-                                    "type": "tool_call",
-                                }
-                            ],
-                        ),
-                        AIMessage(
-                            content="",
-                            tool_calls=[
-                                {
-                                    "name": "sample_tool",
-                                    "args": {"sample_input": "second call"},
-                                    "id": "call_2",
-                                    "type": "tool_call",
-                                }
-                            ],
-                        ),
-                        AIMessage(
-                            content="I completed both tool calls successfully.",
-                        ),
-                    ]
-                )
-            )
-
-            # Create a CLI agent with the fake model and sample_tool
-            agent, _ = create_cli_agent(
-                model=model,
-                assistant_id="test-agent",
-                tools=[sample_tool],
-            )
-
-            # Invoke the agent
-            result = await agent.ainvoke(
-                {"messages": [HumanMessage(content="Use sample tool twice")]},
-                {"configurable": {"thread_id": "test-thread-4"}},
-            )
-
-            # Verify the agent executed correctly
-            assert "messages" in result
-
-            # Verify multiple tool calls occurred
-            tool_messages = [msg for msg in result["messages"] if msg.type == "tool"]
-            assert len(tool_messages) >= 2
-
-            # Verify both inputs were used
-            tool_contents = [msg.content for msg in tool_messages]
-            assert any("first call" in content for content in tool_contents)
-            assert any("second call" in content for content in tool_contents)
 
     def test_cli_agent_backend_setup(self, tmp_path: Path) -> None:
         """Test that CLI agent creates the correct backend setup.

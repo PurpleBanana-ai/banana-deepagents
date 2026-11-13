@@ -3,57 +3,61 @@
 import asyncio
 import io
 import logging
+import os
 import signal
 import sys
-from collections.abc import AsyncIterator, Iterator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from rich.console import Console
 
 if TYPE_CHECKING:
-    from langchain_core.runnables import RunnableConfig
-from rich.style import Style
-from rich.text import Text
+    from collections.abc import AsyncIterator, Iterator, Sequence
 
-from deepagents_code._tool_stream import (
-    TOOL_OUTPUT_TRUNCATION_MARKER,
-    UNRENDERABLE_TOOL_OUTPUT,
-    ToolCallBuffer,
-)
+    from langchain_core.runnables import RunnableConfig
+from typing import cast
+
+from rich.style import Style
+
+from deepagents_code._tool_stream import ToolCallBuffer
 from deepagents_code._tracing import RESUME_TRACE_TAG
 from deepagents_code.approval_mode import ApprovalMode
+from deepagents_code.client.headless_resume import (
+    ResumeError,
+    ResumeRequest,
+    ResumeTarget,
+)
 from deepagents_code.client.non_interactive import (
-    _MAX_HITL_ITERATIONS,
     RETRY_BOUNDARY_LINE,
     HITLIterationLimitError,
-    InFlightToolCall,
     StreamState,
     ThreadUrlLookupState,
     _build_non_interactive_header,
-    _collect_action_request_warnings,
-    _compaction_result_id,
-    _dispatch_orphaned_tool_result_hooks,
+    _ConsoleSpinner,
     _end_headless_session,
     _make_hitl_decision,
-    _make_stdio_encoding_safe,
     _process_ai_message,
     _process_hitl_interrupts,
     _process_message_chunk,
+    _process_rubric_event,
     _process_stream_chunk,
     _record_usage_from_message,
     _run_agent_loop,
     _run_startup_command,
     _start_langsmith_thread_url_lookup,
     _stream_agent,
-    _summarization_stream_status,
     run_non_interactive,
 )
-from deepagents_code.config import SHELL_ALLOW_ALL, ModelResult, runtime_state
+from deepagents_code.config import (
+    ASCII_GLYPHS,
+    SHELL_ALLOW_ALL,
+    get_glyphs,
+    runtime_state,
+)
 from deepagents_code.file_ops import (
     DiffOutcome,
     FileOperationRecord,
@@ -74,7 +78,18 @@ from deepagents_code.hooks.models.domain import (
     UserPromptSubmitDecision,
 )
 from deepagents_code.hooks.transcript import TranscriptRecorder, TranscriptStore
+from deepagents_code.model_metadata import ModelMetadata
+from deepagents_code.thread_ownership import ensure_owned, held_lease
 from deepagents_code.tool_display import format_tool_message_content
+
+
+def _headless_agent() -> MagicMock:
+    """Return a remote-agent double with server-resolved startup metadata."""
+    agent = MagicMock()
+    agent.aget_model_metadata = AsyncMock(
+        return_value=ModelMetadata("test-model", "test")
+    )
+    return agent
 
 
 @pytest.fixture(autouse=True)
@@ -101,132 +116,13 @@ def console() -> Console:
     return Console(quiet=True)
 
 
-def test_visible_reasoning_is_opt_in_and_stays_out_of_final_answer(
-    console: Console, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    stdout = io.StringIO()
-    stderr = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", stdout)
-    monkeypatch.setattr(sys, "stderr", stderr)
-    state = StreamState(show_reasoning=True)
-    message = AIMessage(
-        content=[
-            {"type": "reasoning", "reasoning": "first"},
-            {"type": "reasoning", "reasoning": " "},
-            {"type": "reasoning", "reasoning": "second"},
-            {"type": "reasoning", "reasoning": "\n"},
-            {"type": "text", "text": "answer"},
-            {"type": "reasoning", "reasoning": "third"},
-            {"type": "non_standard", "value": {"type": "redacted_thinking"}},
-            {"type": "tool_call", "name": "search", "args": {}, "id": None},
-        ]
-    )
-
-    _process_ai_message(message, state, console)
-
-    assert stdout.getvalue() == "answer\n"
-    assert stderr.getvalue() == "Reasoning:\nfirst second\n\n\nReasoning:\nthird\n"
-    assert state.reasoning_active is False
-    assert state.full_response == ["answer"]
-
-
-def test_reasoning_after_streamed_text_starts_on_a_new_terminal_line(
-    console: Console, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    terminal = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", terminal)
-    monkeypatch.setattr(sys, "stderr", terminal)
-    state = StreamState(show_reasoning=True)
-
-    _process_ai_message(
-        AIMessage(
-            content=[
-                {"type": "text", "text": "answer"},
-                {"type": "reasoning", "reasoning": "follow-up"},
-            ]
-        ),
-        state,
-        console,
-    )
-
-    assert terminal.getvalue() == "answer\nReasoning:\nfollow-up"
-
-
-def test_reasoning_separator_stays_out_of_streamed_stdout(
-    console: Console, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    stdout = io.StringIO()
-    stderr = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", stdout)
-    monkeypatch.setattr(sys, "stderr", stderr)
-    state = StreamState(show_reasoning=True)
-
-    _process_ai_message(
-        AIMessage(
-            content=[
-                {"type": "text", "text": "first"},
-                {"type": "reasoning", "reasoning": "thinking"},
-                {"type": "text", "text": "second"},
-            ]
-        ),
-        state,
-        console,
-    )
-
-    assert stdout.getvalue() == "firstsecond"
-    assert stderr.getvalue() == "\nReasoning:\nthinking\n"
-
-
-async def test_reasoning_only_stream_ends_with_newline(
-    console: Console, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    class ReasoningOnlyAgent:
-        async def astream(self, *_args: Any, **_kwargs: Any) -> AsyncIterator[object]:
-            yield (
-                (),
-                "messages",
-                (AIMessage(content=[{"type": "reasoning", "reasoning": "solo"}]), {}),
-            )
-
-    stderr = io.StringIO()
-    monkeypatch.setattr(sys, "stderr", stderr)
-    state = StreamState(show_reasoning=True)
-
-    await _stream_agent(
-        ReasoningOnlyAgent(),
-        {"messages": []},
-        {},
-        state,
-        console,
-        FileOpTracker(assistant_id="assistant"),
-        {},
-    )
-
-    assert stderr.getvalue() == "Reasoning:\nsolo\n"
-    assert state.reasoning_active is False
-
-
-def test_visible_reasoning_defaults_off(
-    console: Console, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    stderr = io.StringIO()
-    monkeypatch.setattr(sys, "stderr", stderr)
-
-    _process_ai_message(
-        AIMessage(content=[{"type": "reasoning", "reasoning": "hidden"}]),
-        StreamState(),
-        console,
-    )
-
-    assert stderr.getvalue() == ""
-
-
-def test_nested_usage_event_updates_headless_stats(console: Console) -> None:
+def test_mixed_id_usage_counts_once_in_headless_stats(console: Console) -> None:
     state = StreamState(thread_id="thread-1")
     event = {
         "type": "model_usage",
         "version": 1,
         "request_id": "child-1",
+        "invocation_id": "child-run",
         "usage_metadata": {
             "input_tokens": 1_000,
             "output_tokens": 100,
@@ -238,84 +134,26 @@ def test_nested_usage_event_updates_headless_stats(console: Console) -> None:
         "scope": "tools:task",
     }
 
-    _process_stream_chunk(
-        (("tools:task",), "custom", event),
-        state,
-        console,
-        FileOpTracker(assistant_id="assistant"),
+    message = AIMessageChunk(
+        content="",
+        id="lc_run--child-run",
+        usage_metadata={
+            "input_tokens": 1_000,
+            "output_tokens": 100,
+            "total_tokens": 1_100,
+        },
     )
+    deliveries = [
+        (("tools:task",), "messages", (message, {})),
+        (("tools:task",), "custom", event),
+    ]
+    for delivery in deliveries:
+        _process_stream_chunk(
+            delivery, state, console, FileOpTracker(assistant_id="assistant")
+        )
 
     assert state.stats.request_count == 1
     assert state.stats.per_kind["subagent"].request_count == 1
-
-
-def test_nested_grader_output_is_not_rendered_or_transcribed(tmp_path: Path) -> None:
-    """Headless grading hides partial tokens from output and hook transcripts."""
-    output = io.StringIO()
-    console = Console(file=output, force_terminal=False, color_system=None)
-    transcripts = TranscriptStore(tmp_path / "transcripts")
-    state = StreamState(
-        thread_id="thread-1",
-        transcript=TranscriptRecorder(transcripts, "thread-1"),
-    )
-    chunk = (
-        ("ReliableRubricMiddleware.after_agent:grader",),
-        "messages",
-        (AIMessage(id="grader-partial", content="partial verdict"), {}),
-    )
-
-    _process_stream_chunk(
-        chunk,
-        state,
-        console,
-        FileOpTracker(assistant_id="assistant"),
-    )
-
-    assert output.getvalue() == ""
-    assert state.full_response == []
-    transcript = transcripts.materialize("thread-1")
-    assert transcript.path.read_text(encoding="utf-8") == ""
-
-
-def test_subagent_summarization_does_not_signal_compaction() -> None:
-    chunk = (
-        ("subagent",),
-        "messages",
-        (AIMessage(content="summary"), {"lc_source": "summarization"}),
-    )
-
-    assert _summarization_stream_status(chunk) is None
-
-
-def test_compaction_result_id_requires_compact_tool_name() -> None:
-    """Ordinary tool output echoing the prefix must not signal compaction."""
-    ordinary = (
-        (),
-        "messages",
-        (
-            ToolMessage(
-                content="Conversation compacted. Summarized 2 messages.",
-                tool_call_id="tc-1",
-                name="execute",
-            ),
-            {},
-        ),
-    )
-    assert _compaction_result_id(ordinary) is None
-
-    compact = (
-        (),
-        "messages",
-        (
-            ToolMessage(
-                content="Conversation compacted. Summarized 2 messages.",
-                tool_call_id="tc-2",
-                name="compact_conversation",
-            ),
-            {},
-        ),
-    )
-    assert _compaction_result_id(compact) == "tc-2"
 
 
 @pytest.fixture(autouse=True)
@@ -331,13 +169,6 @@ def skip_mcp_metadata_preload() -> Iterator[None]:
 
 class TestMakeHitlDecision:
     """Tests for _make_hitl_decision()."""
-
-    def test_non_shell_action_approved(self, console: Console) -> None:
-        """Non-shell actions should be auto-approved."""
-        result = _make_hitl_decision(
-            {"name": "read_file", "args": {"path": "/tmp/test"}}, console
-        )
-        assert result == {"type": "approve"}
 
     def test_shell_without_allow_list_rejected(self, console: Console) -> None:
         """Shell commands should be rejected when no allow-list is configured."""
@@ -388,11 +219,6 @@ class TestMakeHitlDecision:
             )
             assert "ls" in result["message"]
             assert "cat" in result["message"]
-
-    def test_empty_action_name_approved(self, console: Console) -> None:
-        """Actions with empty name should be approved (non-shell)."""
-        result = _make_hitl_decision({"name": "", "args": {}}, console)
-        assert result == {"type": "approve"}
 
     def test_shell_piped_command_allowed(self, console: Console) -> None:
         """Piped shell commands where all segments are allowed should pass."""
@@ -450,33 +276,6 @@ class TestMakeHitlDecision:
                 {"name": "execute", "args": {"command": "rm -rf /"}}, console
             )
             assert result["type"] == "reject"
-
-    def test_collect_action_request_warnings_for_hidden_unicode(self) -> None:
-        """Hidden Unicode in action args should generate warnings."""
-        warnings = _collect_action_request_warnings(
-            {"name": "execute", "args": {"command": "echo he\u200bllo"}}
-        )
-        assert warnings
-        assert any("hidden Unicode" in warning for warning in warnings)
-
-    def test_collect_action_request_warnings_for_suspicious_url(self) -> None:
-        """Suspicious URLs in action args should generate warnings."""
-        warnings = _collect_action_request_warnings(
-            {"name": "fetch_url", "args": {"url": "https://аpple.com"}}
-        )
-        assert warnings
-        assert any("URL warning" in warning for warning in warnings)
-
-    def test_collect_action_request_warnings_nested_values(self) -> None:
-        """Nested string values should be inspected recursively."""
-        warnings = _collect_action_request_warnings(
-            {
-                "name": "fetch_url",
-                "args": {"headers": {"Referer": "echo \u200bhello"}},
-            }
-        )
-        assert warnings
-        assert any("hidden Unicode" in warning for warning in warnings)
 
 
 class TestBuildNonInteractiveHeader:
@@ -559,19 +358,11 @@ class TestSandboxTypeForwarding:
 
     async def test_sandbox_type_passed_to_server(self) -> None:
         """run_non_interactive should forward sandbox_type to the server."""
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter([]))
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -584,11 +375,15 @@ class TestSandboxTypeForwarding:
                 return_value=None,
             ),
             patch(
+                "deepagents_code.client.non_interactive.owned_sandbox",
+            ) as mock_owned_sandbox,
+            patch(
                 "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
                 new_callable=AsyncMock,
                 return_value=(mock_agent, mock_server_proc, None),
             ) as mock_start_server,
         ):
+            mock_owned_sandbox.return_value.__aenter__.return_value = "owned-sandbox"
             mock_settings.return_value = None
             mock_settings.has_tavily = False
             runtime_state.model_name = None
@@ -600,6 +395,7 @@ class TestSandboxTypeForwarding:
             )
 
         _, kwargs = mock_start_server.call_args
+        assert kwargs["sandbox_id"] == "owned-sandbox"
         assert kwargs["sandbox_type"] == "modal"
         assert kwargs["profile_overrides"] == {"max_input_tokens": 32_000}
         assert kwargs["enable_interpreter"] is None
@@ -610,18 +406,10 @@ class TestSandboxTypeForwarding:
         runtime.configured_events.return_value = frozenset(
             {HookEvent.PERMISSION_REQUEST}
         )
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -666,19 +454,11 @@ class TestSandboxTypeForwarding:
 
     async def test_sandbox_snapshot_name_passed_to_server(self) -> None:
         """`sandbox_snapshot_name` must reach `start_server_and_get_agent`."""
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter([]))
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -691,11 +471,15 @@ class TestSandboxTypeForwarding:
                 return_value=None,
             ),
             patch(
+                "deepagents_code.client.non_interactive.owned_sandbox",
+            ) as mock_owned_sandbox,
+            patch(
                 "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
                 new_callable=AsyncMock,
                 return_value=(mock_agent, mock_server_proc, None),
             ) as mock_start_server,
         ):
+            mock_owned_sandbox.return_value.__aenter__.return_value = "owned-sandbox"
             mock_settings.return_value = None
             mock_settings.has_tavily = False
             runtime_state.model_name = None
@@ -707,6 +491,7 @@ class TestSandboxTypeForwarding:
             )
 
         _, kwargs = mock_start_server.call_args
+        assert kwargs["sandbox_id"] == "owned-sandbox"
         assert kwargs["sandbox_snapshot_name"] == "my-snap"
 
 
@@ -720,19 +505,11 @@ class TestAllowFsToolsForwarding:
     """
 
     async def test_allow_fs_tools_passed_to_server(self) -> None:
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter([]))
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -766,60 +543,6 @@ class TestAllowFsToolsForwarding:
 class TestQuietMode:
     """Tests for --quiet flag in run_non_interactive."""
 
-    @pytest.mark.parametrize(
-        ("quiet", "expected_kwargs"),
-        [
-            pytest.param(True, {"stderr": True}, id="quiet-redirects-to-stderr"),
-            pytest.param(False, {}, id="default-uses-stdout"),
-        ],
-    )
-    async def test_console_creation(
-        self, quiet: bool, expected_kwargs: dict[str, object]
-    ) -> None:
-        """Console should use stderr when quiet=True, stdout otherwise."""
-        mock_console = MagicMock(spec=Console)
-        mock_agent = MagicMock()
-        mock_agent.astream = MagicMock(return_value=_async_iter([]))
-        mock_server_proc = MagicMock()
-
-        with (
-            patch(
-                "deepagents_code.client.non_interactive.Console",
-                return_value=mock_console,
-            ) as mock_console_cls,
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.generate_thread_id",
-                return_value="test-thread",
-            ),
-            patch(
-                "deepagents_code.client.non_interactive._resolve_shell_allow_list",
-            ) as mock_settings,
-            patch(
-                "deepagents_code.client.non_interactive.build_langsmith_thread_url",
-                return_value=None,
-            ),
-            patch(
-                "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
-                new_callable=AsyncMock,
-                return_value=(mock_agent, mock_server_proc, None),
-            ),
-        ):
-            mock_settings.return_value = None
-            mock_settings.has_tavily = False
-            runtime_state.model_name = None
-
-            await run_non_interactive(message="test", quiet=quiet)
-
-        mock_console_cls.assert_called_once_with(**expected_kwargs)
-
     async def test_quiet_stdout_contains_only_agent_text(self) -> None:
         """In quiet mode, stdout should have only agent text."""
         # Build a fake AI message with a text block followed by a tool-call block
@@ -836,19 +559,11 @@ class TestQuietMode:
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
 
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter(stream_chunks))
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -896,7 +611,7 @@ class TestQuietMode:
             {"type": "text", "text": "answer"},
             {"type": "reasoning", "reasoning": "thinking"},
         ]
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(
             return_value=_async_iter([("", "messages", (ai_msg, {}))])
         )
@@ -904,14 +619,6 @@ class TestQuietMode:
         stderr = io.StringIO()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -942,7 +649,7 @@ class TestQuietMode:
             )
 
         assert stdout.getvalue() == "answer\n"
-        assert stderr.getvalue() == "\nReasoning:\nthinking\n"
+        assert stderr.getvalue() == "Thread: test-thread\n\nReasoning:\nthinking\n"
 
 
 class TestQuietFileOpNotification:
@@ -988,12 +695,6 @@ class TestQuietFileOpNotification:
             tracker,
         )
         return stderr_buf.getvalue()
-
-    def test_quiet_suppresses_file_op_notification(self) -> None:
-        assert self._run(quiet=True) == ""
-
-    def test_non_quiet_emits_file_op_notification(self) -> None:
-        assert "foo.py" in self._run(quiet=False)
 
     def test_a_lost_pre_image_is_reported_without_a_diff(self) -> None:
         """Headless output must not stay silent about a change it cannot verify.
@@ -1090,19 +791,11 @@ class TestNoStreamMode:
 
         stdout_buf = TrackingStringIO()
 
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter(stream_chunks))
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -1159,19 +852,11 @@ class TestNoStreamMode:
 
         stdout_buf = TrackingStringIO()
 
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter(stream_chunks))
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -1218,7 +903,7 @@ class TestFastFollowLangsmithLink:
             "https://smith.langchain.com/o/org/projects/p/proj/t/test-thread"
         )
 
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter([]))
         mock_server_proc = MagicMock()
 
@@ -1226,14 +911,6 @@ class TestFastFollowLangsmithLink:
             patch(
                 "deepagents_code.client.non_interactive.Console",
                 return_value=mock_console,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
             ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
@@ -1271,7 +948,7 @@ class TestFastFollowLangsmithLink:
             "https://smith.langchain.com/o/org/projects/p/proj/t/test-thread"
         )
 
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter([]))
         mock_server_proc = MagicMock()
 
@@ -1279,14 +956,6 @@ class TestFastFollowLangsmithLink:
             patch(
                 "deepagents_code.client.non_interactive.Console",
                 return_value=mock_console,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
             ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
@@ -1316,60 +985,9 @@ class TestFastFollowLangsmithLink:
         ]
         assert not any("View in LangSmith:" in line for line in printed)
 
-    async def test_skips_link_when_lookup_done_but_url_none(self) -> None:
-        """Should not print link when lookup completed but URL is None."""
-        mock_console = MagicMock(spec=Console)
-        done_no_url = ThreadUrlLookupState()
-        done_no_url.done.set()
-
-        mock_agent = MagicMock()
-        mock_agent.astream = MagicMock(return_value=_async_iter([]))
-        mock_server_proc = MagicMock()
-
-        with (
-            patch(
-                "deepagents_code.client.non_interactive.Console",
-                return_value=mock_console,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.generate_thread_id",
-                return_value="test-thread",
-            ),
-            patch(
-                "deepagents_code.client.non_interactive._resolve_shell_allow_list",
-            ) as mock_settings,
-            patch(
-                "deepagents_code.client.non_interactive._start_langsmith_thread_url_lookup",
-                return_value=done_no_url,
-            ),
-            patch(
-                "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
-                new_callable=AsyncMock,
-                return_value=(mock_agent, mock_server_proc, None),
-            ),
-        ):
-            mock_settings.return_value = None
-            mock_settings.has_tavily = False
-            runtime_state.model_name = None
-
-            await run_non_interactive(message="test", quiet=False)
-
-        printed = [
-            str(call.args[0]) for call in mock_console.print.call_args_list if call.args
-        ]
-        assert not any("View in LangSmith:" in line for line in printed)
-
     async def test_quiet_mode_skips_thread_url_lookup(self) -> None:
         """Should not start LangSmith URL lookup when quiet=True."""
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter([]))
         mock_server_proc = MagicMock()
 
@@ -1377,14 +995,6 @@ class TestFastFollowLangsmithLink:
             patch(
                 "deepagents_code.client.non_interactive.Console",
                 return_value=MagicMock(spec=Console),
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
             ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
@@ -1413,37 +1023,6 @@ class TestFastFollowLangsmithLink:
 
 class TestStartLangsmithThreadUrlLookup:
     """Tests for _start_langsmith_thread_url_lookup."""
-
-    def test_sets_url_on_success(self) -> None:
-        """Should populate state.url when build succeeds."""
-        url = "https://smith.langchain.com/o/org/projects/p/proj/t/tid"
-        with patch(
-            "deepagents_code.client.non_interactive.build_langsmith_thread_url",
-            return_value=url,
-        ):
-            state = _start_langsmith_thread_url_lookup("tid")
-            assert state.done.wait(timeout=2.0)
-        assert state.url == url
-
-    def test_signals_done_on_exception(self) -> None:
-        """Should signal done and leave url as None when build raises."""
-        with patch(
-            "deepagents_code.client.non_interactive.build_langsmith_thread_url",
-            side_effect=RuntimeError("boom"),
-        ):
-            state = _start_langsmith_thread_url_lookup("tid")
-            assert state.done.wait(timeout=2.0)
-        assert state.url is None
-
-    def test_signals_done_when_url_is_none(self) -> None:
-        """Should signal done when build returns None."""
-        with patch(
-            "deepagents_code.client.non_interactive.build_langsmith_thread_url",
-            return_value=None,
-        ):
-            state = _start_langsmith_thread_url_lookup("tid")
-            assert state.done.wait(timeout=2.0)
-        assert state.url is None
 
 
 class TestShellAllowListDecisionLogic:
@@ -1488,19 +1067,11 @@ class TestShellAllowListDecisionLogic:
         expected_allow_list: list[str] | None,
     ) -> None:
         """Verify start_server_and_get_agent receives correct flags."""
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter([]))
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -1544,19 +1115,11 @@ class TestNonInteractivePrompt:
     """Tests that run_non_interactive passes interactive=False."""
 
     async def test_passes_interactive_false(self) -> None:
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter([]))
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -1583,31 +1146,13 @@ class TestNonInteractivePrompt:
         _, kwargs = mock_start_server.call_args
         assert kwargs["interactive"] is False
 
-    async def test_initial_skill_wraps_prompt_and_metadata(self) -> None:
-        """Headless skill execution should send wrapped prompt + `__skill`."""
-        mock_agent = MagicMock()
+    async def test_initial_skill_pins_instructions_and_keeps_metadata(self) -> None:
+        """Headless execution leaves reading the skill to the server."""
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter([]))
         mock_server_proc = MagicMock()
-        skill = {
-            "name": "code-review",
-            "description": "Review code changes",
-            "path": "/skills/code-review/SKILL.md",
-            "license": None,
-            "compatibility": None,
-            "metadata": {},
-            "allowed_tools": [],
-            "source": "user",
-        }
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -1619,14 +1164,7 @@ class TestNonInteractivePrompt:
                 "deepagents_code.client.non_interactive.build_langsmith_thread_url",
                 return_value=None,
             ),
-            patch(
-                "deepagents_code.skills.invocation.discover_skills_and_roots",
-                return_value=([skill], []),
-            ),
-            patch(
-                "deepagents_code.skills.load.load_skill_content",
-                return_value="# Instructions\nDo stuff",
-            ),
+            patch("deepagents_code.skills.load.load_skill_content") as mock_load,
             patch(
                 "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
                 new_callable=AsyncMock,
@@ -1643,112 +1181,63 @@ class TestNonInteractivePrompt:
                 quiet=True,
             )
 
+        mock_load.assert_not_called()
         stream_input = mock_agent.astream.call_args.args[0]
         user_msg = stream_input["messages"][0]
+        assert stream_input["pinned_skills"] == ["code-review"]
         assert "I'm invoking the skill `code-review`." in user_msg["content"]
         assert "**User request:** review this patch" in user_msg["content"]
         assert user_msg["additional_kwargs"]["__skill"]["name"] == "code-review"
         assert user_msg["additional_kwargs"]["__skill"]["args"] == "review this patch"
-        assert (
-            mock_agent.astream.call_args.kwargs["config"]["metadata"]["ls_skill_name"]
-            == "code-review"
-        )
 
-    async def test_initial_skill_missing_returns_error_without_starting_server(
-        self,
-    ) -> None:
-        """Missing headless skill should fail before the server starts."""
+    async def test_skill_trust_request_is_denied_on_resume(self) -> None:
+        """Headless mode cannot ask, so it resumes a trust request with a deny."""
+        from langgraph.types import Command, Interrupt
+
+        from deepagents_code.client.non_interactive import _process_interrupts
+
+        inputs: list[object] = []
+
+        async def staged_stream(  # noqa: RUF029  # replaces the async _stream_agent seam
+            _agent: object,
+            stream_input: object,
+            _config: object,
+            state: StreamState,
+            console: Console,
+            _file_op_tracker: object,
+            _context: object,
+        ) -> None:
+            inputs.append(stream_input)
+            if len(inputs) == 1:
+                request = {"type": "skill_trust", "skill": "review", "directory": "/x"}
+                _process_interrupts(
+                    {"__interrupt__": [Interrupt(value=request, id="trust-1")]},
+                    state,
+                    console,
+                )
+
         with (
             patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
+                "deepagents_code.client.non_interactive._stream_agent",
+                new=staged_stream,
             ),
             patch(
-                "deepagents_code.client.non_interactive._resolve_shell_allow_list",
-            ) as mock_settings,
-            patch(
-                "deepagents_code.skills.invocation.discover_skills_and_roots",
-                return_value=([], []),
-            ),
-            patch(
-                "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
+                "deepagents_code.client.non_interactive.dispatch_hook",
                 new_callable=AsyncMock,
-            ) as mock_start_server,
+            ),
         ):
-            mock_settings.return_value = None
-            mock_settings.has_tavily = False
-            runtime_state.model_name = None
-
-            result = await run_non_interactive(
-                message="review this patch",
-                initial_skill="missing-skill",
+            await _run_agent_loop(
+                MagicMock(),
+                "run a skill",
+                {"configurable": {"thread_id": "t"}},
+                Console(quiet=True),
+                MagicMock(),
                 quiet=True,
             )
 
-        assert result == 1
-        mock_start_server.assert_not_awaited()
-
-    async def test_initial_skill_containment_failure_hard_fails(self) -> None:
-        """A skill resolving outside trusted roots hard-fails headlessly.
-
-        The non-interactive path has no TUI to prompt on, so it must never try
-        to grant trust: it fails closed with the containment error and never
-        starts the server.
-        """
-        skill = {
-            "name": "evil-skill",
-            "description": "Resolves outside trusted roots",
-            "path": "/skills/evil-skill/SKILL.md",
-            "license": None,
-            "compatibility": None,
-            "metadata": {},
-            "allowed_tools": [],
-            "source": "user",
-        }
-        with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
-            patch(
-                "deepagents_code.client.non_interactive._resolve_shell_allow_list",
-            ) as mock_settings,
-            patch(
-                "deepagents_code.skills.invocation.discover_skills_and_roots",
-                return_value=([skill], []),
-            ),
-            patch(
-                "deepagents_code.skills.load.load_skill_content",
-                side_effect=PermissionError(
-                    "Skill path /tmp/evil resolves outside all allowed skill "
-                    "directories."
-                ),
-            ),
-            patch(
-                "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
-                new_callable=AsyncMock,
-            ) as mock_start_server,
-        ):
-            mock_settings.return_value = None
-            mock_settings.has_tavily = False
-            runtime_state.model_name = None
-
-            result = await run_non_interactive(
-                message="review this patch",
-                initial_skill="evil-skill",
-                quiet=True,
-            )
-
-        assert result == 1
-        mock_start_server.assert_not_awaited()
+        resume = inputs[1]
+        assert isinstance(resume, Command)
+        assert resume.resume == {"trust-1": {"approved": False}}
 
 
 def _make_interrupt_chunk(interrupt_id: str = "i1") -> tuple:
@@ -1770,7 +1259,7 @@ def _make_interrupt_chunk(interrupt_id: str = "i1") -> tuple:
 def _make_looping_agent() -> MagicMock:
     """Return a mock agent whose astream always yields one interrupt chunk."""
     chunk = _make_interrupt_chunk()
-    mock_agent = MagicMock()
+    mock_agent = _headless_agent()
     mock_agent.astream = MagicMock(side_effect=lambda *_, **__: _async_iter([chunk]))
     return mock_agent
 
@@ -1897,75 +1386,6 @@ async def test_headless_compact_permission_uses_live_context() -> None:
 class TestMaxTurns:
     """Tests for max_turns parameter in _run_agent_loop."""
 
-    async def test_run_agent_loop_passes_thread_id_context(self) -> None:
-        """Non-interactive runs mirror `configurable.thread_id` into context."""
-        agent = MagicMock()
-        agent.astream = MagicMock(return_value=_async_iter([]))
-        console = Console(quiet=True)
-        file_op_tracker = MagicMock()
-        config: RunnableConfig = {"configurable": {"thread_id": "t1"}}
-
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook",
-            new_callable=AsyncMock,
-        ):
-            await _run_agent_loop(
-                agent,
-                "task",
-                config,
-                console,
-                file_op_tracker,
-                quiet=True,
-                summarization_model="openai:summary-model",
-            )
-
-        _, kwargs = agent.astream.call_args
-        assert kwargs["context"]["thread_id"] == "t1"
-        assert kwargs["context"]["summarization_model"] == "openai:summary-model"
-
-    async def test_user_prompt_hook_suppresses_legacy_duplicate_and_prompt(
-        self,
-        lifecycle_runtime: MagicMock,
-    ) -> None:
-        runtime = lifecycle_runtime
-        runtime.configured_events.return_value = frozenset(
-            {HookEvent.USER_PROMPT_SUBMIT}
-        )
-        runtime.invoke = AsyncMock(
-            return_value=UserPromptSubmitDecision(
-                event=HookEvent.USER_PROMPT_SUBMIT,
-                context=["replacement"],
-                suppress_original_prompt=True,
-            )
-        )
-        agent = MagicMock()
-        agent.astream = MagicMock(return_value=_async_iter([]))
-        config: RunnableConfig = {"configurable": {"thread_id": "t1"}}
-
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook",
-            new_callable=AsyncMock,
-        ) as legacy:
-            await _run_agent_loop(
-                agent,
-                "secret",
-                config,
-                Console(quiet=True),
-                MagicMock(),
-                quiet=True,
-                hooks=_manager(runtime),
-            )
-
-        stream_input = agent.astream.call_args.args[0]
-        assert stream_input["messages"] == [
-            {"role": "system", "content": "replacement"}
-        ]
-        assert not any(
-            call.args and call.args[0] in {"session.start", "user.prompt"}
-            for call in legacy.await_args_list
-        )
-        runtime.append_messages.assert_called_once()
-
     async def test_user_prompt_stop_ends_headless_session_once(
         self,
         lifecycle_runtime: MagicMock,
@@ -2010,9 +1430,64 @@ class TestMaxTurns:
         ]
         agent.astream.assert_not_called()
 
+    async def test_suppressed_prompt_does_not_pin_skill(
+        self,
+        lifecycle_runtime: MagicMock,
+    ) -> None:
+        """A hook that drops the prompt also drops the skill it requested."""
+        runtime = lifecycle_runtime
+        runtime.configured_events.return_value = frozenset(
+            {HookEvent.SESSION_START, HookEvent.USER_PROMPT_SUBMIT}
+        )
+        runtime.invoke = AsyncMock(
+            side_effect=[
+                SessionStartDecision(event=HookEvent.SESSION_START),
+                UserPromptSubmitDecision(
+                    event=HookEvent.USER_PROMPT_SUBMIT,
+                    context=["Replacement context"],
+                    suppress_original_prompt=True,
+                ),
+            ]
+        )
+        agent = _headless_agent()
+        agent.astream = MagicMock(return_value=_async_iter([]))
+
+        await _run_agent_loop(
+            agent,
+            "I'm invoking the skill `code-review`.",
+            {"configurable": {"thread_id": "t1"}},
+            Console(quiet=True),
+            MagicMock(),
+            quiet=True,
+            hooks=_manager(runtime),
+            skill_name="code-review",
+        )
+
+        stream_input = agent.astream.call_args.args[0]
+        assert "pinned_skills" not in stream_input
+        assert stream_input["messages"] == [
+            {"role": "system", "content": "Replacement context"}
+        ]
+
+    @pytest.mark.parametrize(
+        "summary_chunk",
+        [
+            (
+                (),
+                "messages",
+                (
+                    AIMessage(id="summary", content="summary"),
+                    {"lc_source": "summarization"},
+                ),
+            ),
+            ((), "custom", {"type": "summarization_started"}),
+        ],
+        ids=["streamed-summary", "nostream-start-event"],
+    )
     async def test_compact_session_start_uses_active_model_before_continuation(
         self,
         lifecycle_runtime: MagicMock,
+        summary_chunk: tuple[object, ...],
     ) -> None:
         runtime = lifecycle_runtime
         runtime.configured_events.return_value = frozenset(
@@ -2025,14 +1500,7 @@ class TestMaxTurns:
             ]
         )
         chunks = [
-            (
-                (),
-                "messages",
-                (
-                    AIMessage(id="summary", content="summary"),
-                    {"lc_source": "summarization"},
-                ),
-            ),
+            summary_chunk,
             (
                 (),
                 "messages",
@@ -2255,53 +1723,6 @@ class TestMaxTurns:
         assert "--max-turns 2" in msg
         assert "Increase --max-turns" in msg
 
-    async def test_max_turns_above_default_is_honored(self) -> None:
-        """User's --max-turns overrides the internal safety default (no clamp)."""
-        # Pin the no-clamp invariant: with _MAX_HITL_ITERATIONS patched to 2
-        # and max_turns=4, the loop must run 4 astream calls (1 initial + 3
-        # HITL resumes) before the guard trips. If max_turns were clamped by
-        # the internal default, we'd see only 2 calls.
-        agent = _make_looping_agent()
-        console = Console(quiet=True)
-        file_op_tracker = MagicMock()
-        file_op_tracker.complete_with_message.return_value = None
-        config: RunnableConfig = {"configurable": {"thread_id": "t1"}}
-
-        with (
-            patch(
-                "deepagents_code.client.non_interactive.dispatch_hook",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-            ),
-            patch(
-                "deepagents_code.client.non_interactive._resolve_shell_allow_list"
-            ) as mock_settings,
-            patch(
-                "deepagents_code.client.non_interactive._HITL_REQUEST_ADAPTER"
-            ) as mock_adapter,
-            patch("deepagents_code.client.non_interactive._MAX_HITL_ITERATIONS", 2),
-        ):
-            mock_settings.return_value = None
-            runtime_state.model_name = ""
-            mock_adapter.validate_python.side_effect = lambda v: v
-            with pytest.raises(HITLIterationLimitError) as exc_info:
-                await _run_agent_loop(
-                    agent,
-                    "task",
-                    config,
-                    console,
-                    file_op_tracker,
-                    quiet=True,
-                    max_turns=4,
-                )
-        msg = str(exc_info.value)
-        assert "Exceeded 4 agentic turns" in msg
-        assert "--max-turns 4" in msg
-        assert "internal safety default" not in msg
-        assert agent.astream.call_count == 4
-
     async def test_no_max_turns_uses_internal_default(self) -> None:
         """Omitting max_turns falls back to the internal safety default."""
         agent = _make_looping_agent()
@@ -2344,19 +1765,11 @@ class TestMaxTurns:
 
     async def test_max_turns_forwarded_from_run_non_interactive(self) -> None:
         """run_non_interactive passes max_turns through to _run_agent_loop."""
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter([]))
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -2386,51 +1799,6 @@ class TestMaxTurns:
 
         _, kwargs = mock_loop.call_args
         assert kwargs.get("max_turns") == 7
-
-    async def test_max_turns_none_forwarded_by_default(self) -> None:
-        """run_non_interactive forwards max_turns=None when not supplied."""
-        mock_agent = MagicMock()
-        mock_agent.astream = MagicMock(return_value=_async_iter([]))
-        mock_server_proc = MagicMock()
-
-        with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.generate_thread_id",
-                return_value="test-thread",
-            ),
-            patch(
-                "deepagents_code.client.non_interactive._resolve_shell_allow_list"
-            ) as mock_settings,
-            patch(
-                "deepagents_code.client.non_interactive.build_langsmith_thread_url",
-                return_value=None,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive._run_agent_loop",
-                new_callable=AsyncMock,
-            ) as mock_loop,
-            patch(
-                "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
-                new_callable=AsyncMock,
-                return_value=(mock_agent, mock_server_proc, None),
-            ),
-        ):
-            mock_settings.return_value = None
-            mock_settings.has_tavily = False
-            runtime_state.model_name = None
-
-            await run_non_interactive(message="task")
-
-        _, kwargs = mock_loop.call_args
-        assert kwargs.get("max_turns") is None
 
     async def test_honors_full_user_budget_before_raising(self) -> None:
         """With max_turns=N, exactly N agentic turns run before the guard trips.
@@ -2542,14 +1910,6 @@ class TestMaxTurns:
 
         with (
             patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
-            patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
             ),
@@ -2582,105 +1942,51 @@ class TestMaxTurns:
 class TestRunStartupCommand:
     """Tests for `_run_startup_command` (`--startup-cmd`)."""
 
-    async def test_successful_command_prints_stdout(self) -> None:
-        """Exit 0 with stdout — output should be routed through the console."""
-        buf = io.StringIO()
-        console = Console(file=buf, width=200, highlight=False)
+    async def test_uses_project_langsmith_environment_when_launch_value_absent(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Headless startup commands receive project values, not dcode values."""
+        import json
 
-        await _run_startup_command("echo hello-startup", console, quiet=False)
+        import deepagents_code.config as config_mod
 
-        output = buf.getvalue()
-        assert "Running startup command: echo hello-startup" in output
-        assert "hello-startup" in output
-        assert "Warning" not in output
-
-    @pytest.mark.skipif(sys.platform == "win32", reason="`false` is POSIX-only")
-    async def test_non_zero_exit_warns_but_does_not_raise(self) -> None:
-        """Non-zero exit emits a yellow warning and keeps the session alive."""
-        buf = io.StringIO()
-        console = Console(file=buf, width=200, highlight=False)
-
-        # `false` is guaranteed to exit 1 on POSIX.
-        await _run_startup_command("false", console, quiet=False)
-
-        output = buf.getvalue()
-        assert "Warning" in output
-        assert "exited with code 1" in output
-
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell redirection")
-    async def test_stderr_routed_through_console(self) -> None:
-        """Commands that write to stderr should render under the dim stream."""
-        buf = io.StringIO()
-        console = Console(file=buf, width=200, highlight=False)
-
-        await _run_startup_command("sh -c 'echo oops 1>&2'", console, quiet=False)
-
-        output = buf.getvalue()
-        assert "oops" in output
-
-    async def test_stdout_with_brackets_does_not_raise(self) -> None:
-        """Shell output with `[...]` must not be parsed as Rich markup."""
-        buf = io.StringIO()
-        console = Console(file=buf, width=200, highlight=False)
-
-        # Unbalanced/unknown markup would raise `MarkupError` if parsed.
-        await _run_startup_command(
-            "printf '[INFO] starting [1/3]\\n'", console, quiet=False
+        (tmp_path / ".env").write_text("LANGSMITH_API_KEY=project-key\n")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            config_mod,
+            "_GLOBAL_DOTENV_PATH",
+            tmp_path / "missing-global.env",
         )
-
-        output = buf.getvalue()
-        assert "[INFO] starting [1/3]" in output
-        assert "Warning" not in output
-
-    async def test_quiet_mode_suppresses_header(self) -> None:
-        """In quiet mode, the "Running" header should not appear."""
-        buf = io.StringIO()
-        console = Console(file=buf, width=200, highlight=False)
-
-        await _run_startup_command("echo hi", console, quiet=True)
-
-        output = buf.getvalue()
-        assert "Running startup command" not in output
-        assert "hi" in output
-
-    async def test_launch_failure_warns(self) -> None:
-        """Unlaunchable commands warn instead of crashing."""
+        launch = dict.fromkeys(config_mod._USER_LANGSMITH_ENV_VARS)
+        carrier = json.dumps({"launch": launch, "user": dict(launch)})
+        monkeypatch.setenv("LANGSMITH_API_KEY", "dcode-key")
+        monkeypatch.setenv("DEEPAGENTS_CODE_LANGSMITH_API_KEY", "prefixed-key")
+        monkeypatch.setenv(config_mod._USER_LANGSMITH_ENV_CARRIER, carrier)
+        monkeypatch.setenv("STARTUP_TEST_UNRELATED", "preserved")
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"startup-output\n", b""))
+        mock_proc.returncode = 0
+        mock_proc.pid = 12345
         buf = io.StringIO()
         console = Console(file=buf, width=200, highlight=False)
 
         with patch(
             "asyncio.create_subprocess_shell",
-            side_effect=OSError("boom"),
-        ):
-            await _run_startup_command("whatever", console, quiet=False)
+            return_value=mock_proc,
+        ) as create_shell:
+            await _run_startup_command("echo startup-output", console, quiet=False)
 
-        output = buf.getvalue()
-        assert "Warning" in output
-        assert "failed to launch" in output
-
-    async def test_timeout_kills_process_group_on_posix(self) -> None:
-        """Timeouts should terminate the whole POSIX process group."""
-        buf = io.StringIO()
-        console = Console(file=buf, width=200, highlight=False)
-
-        mock_proc = AsyncMock()
-        mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
-        mock_proc.wait = AsyncMock()
-        mock_proc.returncode = None
-        mock_proc.pid = 12345
-        mock_proc.kill = MagicMock()
-
-        with (
-            patch("asyncio.create_subprocess_shell", return_value=mock_proc),
-            patch.object(sys, "platform", "darwin"),
-            patch("os.getpgid", return_value=12345),
-            patch("os.killpg") as mock_killpg,
-        ):
-            await _run_startup_command("sleep 999", console, quiet=False)
-
-        mock_killpg.assert_called_once_with(12345, signal.SIGTERM)
-        mock_proc.kill.assert_not_called()
-        assert "timed out" in buf.getvalue()
+        child_env = create_shell.call_args.kwargs["env"]
+        assert child_env["LANGSMITH_API_KEY"] == "project-key"
+        assert child_env["STARTUP_TEST_UNRELATED"] == "preserved"
+        assert config_mod._USER_LANGSMITH_ENV_CARRIER not in child_env
+        assert not any(
+            key.startswith("DEEPAGENTS_CODE_LANGSMITH_") for key in child_env
+        )
+        assert os.environ["LANGSMITH_API_KEY"] == "dcode-key"
+        assert "startup-output" in buf.getvalue()
 
     async def test_cancellation_kills_process_group_on_posix(self) -> None:
         """Outer cancellation should still clean up the startup process group."""
@@ -2736,47 +2042,6 @@ class TestRunStartupCommand:
         ]
         mock_proc.kill.assert_not_called()
         assert "timed out" in buf.getvalue()
-
-    async def test_timeout_uses_proc_kill_on_windows(self) -> None:
-        """Windows has no process groups; fall back to `proc.kill()`."""
-        buf = io.StringIO()
-        console = Console(file=buf, width=200, highlight=False)
-
-        mock_proc = AsyncMock()
-        mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
-        mock_proc.wait = AsyncMock()
-        mock_proc.returncode = None
-        mock_proc.pid = 12345
-        mock_proc.kill = MagicMock()
-
-        with (
-            patch("asyncio.create_subprocess_shell", return_value=mock_proc),
-            patch.object(sys, "platform", "win32"),
-            patch("os.killpg") as mock_killpg,
-        ):
-            await _run_startup_command("sleep 999", console, quiet=False)
-
-        mock_proc.kill.assert_called_once()
-        mock_killpg.assert_not_called()
-        assert "timed out" in buf.getvalue()
-
-    async def test_empty_command_is_not_executed(self) -> None:
-        """Whitespace-only `--startup-cmd` should be treated as unset."""
-        buf = io.StringIO()
-        console = Console(file=buf, width=200, highlight=False)
-
-        with patch(
-            "asyncio.create_subprocess_shell",
-            new=AsyncMock(),
-        ) as mock_spawn:
-            # `run_non_interactive` strips and skips when empty; replicate
-            # that contract here by not calling through when stripped empty.
-            command = "   "
-            if command.strip():
-                await _run_startup_command(command.strip(), console, quiet=False)
-
-        mock_spawn.assert_not_called()
-        assert buf.getvalue() == ""
 
 
 class TestRecordUsageFromMessageStats:
@@ -2900,125 +2165,6 @@ async def _async_iter(items: Sequence[object]) -> AsyncIterator[object]:  # noqa
     """Create an async iterator from a list for testing."""
     for item in items:
         yield item
-
-
-class TestMakeStdioEncodingSafe:
-    """Tests for `_make_stdio_encoding_safe`."""
-
-    def test_cp1252_stream_survives_unicode_glyphs(self):
-        """Unencodable glyphs degrade to "?" instead of raising."""
-        buffer = io.BytesIO()
-        stream = io.TextIOWrapper(buffer, encoding="cp1252")
-        with patch.object(sys, "stdout", stream), patch.object(sys, "stderr", stream):
-            _make_stdio_encoding_safe()
-            sys.stdout.write("✓ Server ready")
-            sys.stdout.flush()
-
-        assert buffer.getvalue() == b"? Server ready"
-
-    def test_stream_encoding_is_preserved(self):
-        """Only the error handler changes; the encoding stays untouched."""
-        buffer = io.BytesIO()
-        stream = io.TextIOWrapper(buffer, encoding="cp1252")
-        with patch.object(sys, "stdout", stream), patch.object(sys, "stderr", stream):
-            _make_stdio_encoding_safe()
-
-        assert stream.encoding == "cp1252"
-        assert stream.errors == "replace"
-
-    def test_non_reconfigurable_stream_is_left_alone(self):
-        """Streams without `reconfigure` (e.g. StringIO) do not raise."""
-        stream = io.StringIO()
-        with patch.object(sys, "stdout", stream), patch.object(sys, "stderr", stream):
-            _make_stdio_encoding_safe()
-
-        assert not stream.closed
-
-    def test_streams_handled_independently(self):
-        """A non-reconfigurable stdout must not stop stderr from being hardened.
-
-        In quiet mode `run_non_interactive` routes glyph-emitting output to
-        stderr, so a per-stream `continue` (not `break`/`return`) is
-        load-bearing: skipping stdout must still leave stderr reconfigured.
-        """
-        stdout = io.StringIO()  # no `reconfigure` -> skipped
-        stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
-        with patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
-            _make_stdio_encoding_safe()
-
-        assert stderr.errors == "replace"
-        assert not stdout.closed
-
-    def test_closed_stream_is_swallowed(self):
-        """A closed stream raises `ValueError` on reconfigure; swallowed, no crash."""
-        stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
-        stream.close()
-        with (
-            patch.object(sys, "stdout", stream),
-            patch.object(sys, "stderr", io.StringIO()),
-        ):
-            _make_stdio_encoding_safe()  # must not raise
-
-        assert stream.closed
-
-    def test_duck_typed_reconfigure_typeerror_is_swallowed(self):
-        """A `reconfigure` with an incompatible signature must not crash the run."""
-        # This `reconfigure` takes no args, so calling it with `errors=` raises
-        # `TypeError` — the failure mode a non-stdlib stream wrapper (e.g. a
-        # capture/tee library) could exhibit. The guard must not propagate it.
-        stream = SimpleNamespace(reconfigure=lambda: None)
-        with patch.object(sys, "stdout", stream), patch.object(sys, "stderr", stream):
-            _make_stdio_encoding_safe()  # must not raise
-
-        assert hasattr(stream, "reconfigure")
-
-    async def test_run_non_interactive_invokes_helper(self):
-        """`run_non_interactive` must call `_make_stdio_encoding_safe` at entry.
-
-        Guards against a silent revert: the fix only protects users if the
-        helper is actually invoked. Server-mocked tests run under pytest's
-        UTF-8 capture, so nothing else would fail if the call were removed.
-        """
-        mock_agent = MagicMock()
-        mock_agent.astream = MagicMock(return_value=_async_iter([]))
-        mock_server_proc = MagicMock()
-
-        with (
-            patch(
-                "deepagents_code.client.non_interactive._make_stdio_encoding_safe",
-            ) as mock_helper,
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.generate_thread_id",
-                return_value="test-thread",
-            ),
-            patch(
-                "deepagents_code.client.non_interactive._resolve_shell_allow_list"
-            ) as mock_settings,
-            patch(
-                "deepagents_code.client.non_interactive.build_langsmith_thread_url",
-                return_value=None,
-            ),
-            patch(
-                "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
-                new_callable=AsyncMock,
-                return_value=(mock_agent, mock_server_proc, None),
-            ),
-        ):
-            mock_settings.return_value = None
-            mock_settings.has_tavily = False
-            runtime_state.model_name = None
-
-            await run_non_interactive(message="test task")
-
-        mock_helper.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------
@@ -3461,110 +2607,6 @@ class TestProcessAIMessageHooks:
 class TestProcessMessageChunkHooks:
     """Tests for tool.result hook dispatch in _process_message_chunk."""
 
-    def test_tool_result_dispatched_for_tool_message(self) -> None:
-        """tool.result fires with correct fields when a ToolMessage is processed."""
-        from langchain_core.messages import ToolMessage
-
-        tool_msg = ToolMessage(
-            content="File read successfully",
-            tool_call_id="call-1",
-            name="read_file",
-            status="success",
-        )
-        state = StreamState()
-        console = Console(quiet=True)
-        file_op_tracker = MagicMock()
-        file_op_tracker.complete_with_message.return_value = None
-
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-        ) as mock_dispatch:
-            _process_message_chunk((tool_msg, {}), state, console, file_op_tracker)
-
-        mock_dispatch.assert_called_once_with(
-            "tool.result",
-            {
-                "tool_name": "read_file",
-                "tool_id": "call-1",
-                "tool_args": {},
-                "tool_status": "success",
-                "tool_output": "File read successfully",
-            },
-        )
-
-    def test_tool_result_includes_tool_args_from_matching_use(self) -> None:
-        """tool.result includes the args from the matching tool.use event."""
-        from langchain_core.messages import ToolMessage
-
-        tool_msg = ToolMessage(
-            content="File read successfully",
-            tool_call_id="call-1",
-            name="read_file",
-            status="success",
-        )
-        state = StreamState(
-            in_flight_tool_calls={
-                "call-1": InFlightToolCall("read_file", {"path": "foo.py"})
-            }
-        )
-        console = Console(quiet=True)
-        file_op_tracker = MagicMock()
-        file_op_tracker.complete_with_message.return_value = None
-
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-        ) as mock_dispatch:
-            _process_message_chunk((tool_msg, {}), state, console, file_op_tracker)
-
-        mock_dispatch.assert_called_once_with(
-            "tool.result",
-            {
-                "tool_name": "read_file",
-                "tool_id": "call-1",
-                "tool_args": {"path": "foo.py"},
-                "tool_status": "success",
-                "tool_output": "File read successfully",
-            },
-        )
-        assert state.in_flight_tool_calls == {}
-
-    def test_tool_result_uses_correlated_name_when_message_name_missing(
-        self,
-    ) -> None:
-        """tool.result uses the matching tool.use name when ToolMessage omits it."""
-        from langchain_core.messages import ToolMessage
-
-        tool_msg = ToolMessage(
-            content="File read successfully",
-            tool_call_id="call-1",
-            status="success",
-        )
-        state = StreamState(
-            in_flight_tool_calls={
-                "call-1": InFlightToolCall("read_file", {"path": "foo.py"})
-            }
-        )
-        console = Console(quiet=True)
-        file_op_tracker = MagicMock()
-        file_op_tracker.complete_with_message.return_value = None
-
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-        ) as mock_dispatch:
-            _process_message_chunk((tool_msg, {}), state, console, file_op_tracker)
-
-        mock_dispatch.assert_called_once_with(
-            "tool.result",
-            {
-                "tool_name": "read_file",
-                "tool_id": "call-1",
-                "tool_args": {"path": "foo.py"},
-                "tool_status": "success",
-                "tool_output": "File read successfully",
-            },
-        )
-        assert state.in_flight_tool_calls == {}
-
     def test_tool_result_dispatched_for_error_status(self) -> None:
         """tool.error and tool.result fire when a tool call failed."""
         from langchain_core.messages import ToolMessage
@@ -3598,74 +2640,6 @@ class TestProcessMessageChunkHooks:
                 },
             ),
         ]
-
-    def test_tool_result_output_truncated_to_2000_chars(self) -> None:
-        """tool_output in the payload is at most 2000 characters."""
-        from langchain_core.messages import ToolMessage
-
-        long_content = "x" * 5000
-        tool_msg = ToolMessage(
-            content=long_content,
-            tool_call_id="call-3",
-            name="execute",
-            status="success",
-        )
-        state = StreamState()
-        console = Console(quiet=True)
-        file_op_tracker = MagicMock()
-        file_op_tracker.complete_with_message.return_value = None
-
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-        ) as mock_dispatch:
-            _process_message_chunk((tool_msg, {}), state, console, file_op_tracker)
-
-        payload = mock_dispatch.call_args[0][1]
-        assert len(payload["tool_output"]) == 2000
-        # A capped output ends with the marker so a consumer can tell a
-        # truncated result from a genuinely short one.
-        assert payload["tool_output"].endswith(TOOL_OUTPUT_TRUNCATION_MARKER)
-
-    def test_tool_result_sentinel_when_formatter_raises(self) -> None:
-        """A formatter error still dispatches tool.result with the sentinel.
-
-        The content-formatting guard must keep the terminal dispatch
-        unconditional; otherwise a formatter (or pathological `__str__`) error
-        would drop the tool.result for this tool and every later tool.
-        """
-        from langchain_core.messages import ToolMessage
-
-        tool_msg = ToolMessage(
-            content="unformattable",
-            tool_call_id="call-boom",
-            name="read_file",
-            status="success",
-        )
-        state = StreamState()
-        console = Console(quiet=True)
-        file_op_tracker = MagicMock()
-        file_op_tracker.complete_with_message.return_value = None
-
-        def boom(_content: object) -> str:
-            msg = "formatter boom"
-            raise RuntimeError(msg)
-
-        with (
-            patch(
-                "deepagents_code.client.non_interactive.format_tool_message_content",
-                side_effect=boom,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-            ) as mock_dispatch,
-        ):
-            _process_message_chunk((tool_msg, {}), state, console, file_op_tracker)
-
-        result_calls = [
-            c for c in mock_dispatch.call_args_list if c[0][0] == "tool.result"
-        ]
-        assert len(result_calls) == 1
-        assert result_calls[0][0][1]["tool_output"] == UNRENDERABLE_TOOL_OUTPUT
 
     def test_tool_output_uses_formatter_for_structured_content(self) -> None:
         """tool_output is the formatted content, not a raw list repr.
@@ -3702,44 +2676,6 @@ class TestProcessMessageChunkHooks:
         # The raw list repr is what this surface used to emit; guard against it.
         assert payload["tool_output"] != str(tool_msg.content)
 
-    def test_tool_result_uncorrelated_str_id_sends_empty_args_and_logs(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A str tool_id with no stored tool.use args sends {} and logs the miss.
-
-        Distinguishes a lost correlation (logged) from a tool that genuinely
-        took no arguments, so a dropped pairing is not completely silent.
-        """
-        from langchain_core.messages import ToolMessage
-
-        tool_msg = ToolMessage(
-            content="ok",
-            tool_call_id="ghost-1",
-            name="read_file",
-            status="success",
-        )
-        state = StreamState()  # no entry for "ghost-1"
-        console = Console(quiet=True)
-        file_op_tracker = MagicMock()
-        file_op_tracker.complete_with_message.return_value = None
-
-        with (
-            patch(
-                "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-            ) as mock_dispatch,
-            caplog.at_level("WARNING", logger="deepagents_code.client.non_interactive"),
-        ):
-            _process_message_chunk((tool_msg, {}), state, console, file_op_tracker)
-
-        payload = mock_dispatch.call_args[0][1]
-        assert payload["tool_args"] == {}
-        # Warning level: an executed tool reported with empty args is degraded
-        # audit fidelity worth surfacing at default log levels.
-        assert any(
-            "no correlated tool.use args" in r.message and r.levelname == "WARNING"
-            for r in caplog.records
-        )
-
     def test_tool_result_not_dispatched_for_ai_message(self) -> None:
         """tool.result must not fire when the message is an AIMessage."""
         ai_msg = MagicMock(spec=AIMessage)
@@ -3757,38 +2693,6 @@ class TestProcessMessageChunkHooks:
             c for c in mock_dispatch.call_args_list if c[0][0] == "tool.result"
         ]
         assert not tool_result_calls
-
-    def test_tool_result_none_id_sends_empty_args(self) -> None:
-        """An id-less ToolMessage still emits tool.result with `{}` args, id None.
-
-        Mirrors the interactive surface so audit hooks observe every executed
-        tool even when the call carried no id to correlate on.
-        """
-        tool_msg = MagicMock(spec=ToolMessage)
-        tool_msg.tool_call_id = None
-        tool_msg.name = "read_file"
-        tool_msg.status = "success"
-        tool_msg.content = "ok"
-        state = StreamState()
-        console = Console(quiet=True)
-        file_op_tracker = MagicMock()
-        file_op_tracker.complete_with_message.return_value = None
-
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-        ) as mock_dispatch:
-            _process_message_chunk((tool_msg, {}), state, console, file_op_tracker)
-
-        mock_dispatch.assert_called_once_with(
-            "tool.result",
-            {
-                "tool_name": "read_file",
-                "tool_id": None,
-                "tool_args": {},
-                "tool_status": "success",
-                "tool_output": "ok",
-            },
-        )
 
     def test_unexpected_status_fails_closed_to_error(
         self, caplog: pytest.LogCaptureFixture
@@ -3831,56 +2735,6 @@ class TestProcessMessageChunkHooks:
         ]
         assert any("Unexpected ToolMessage.status" in r.message for r in caplog.records)
 
-    def test_malformed_args_emit_result_without_use(self) -> None:
-        """A malformed-complete call emits tool.result but never tool.use.
-
-        End-to-end guard: when streamed args are complete-looking but
-        unparseable, no tool.use fires (the args can't be trusted), yet the
-        executed tool's tool.result still fires — with `{}` args, since none
-        were correlated.
-        """
-        malformed = MagicMock(spec=AIMessage)
-        malformed.content_blocks = [
-            {
-                "type": "tool_call_chunk",
-                "name": "read_file",
-                "id": "call-1",
-                "index": 0,
-                "args": "{bad json}",
-            }
-        ]
-        tool_msg = ToolMessage(
-            content="ok", tool_call_id="call-1", name="read_file", status="success"
-        )
-        state = StreamState(quiet=True)
-        console = Console(quiet=True)
-        file_op_tracker = MagicMock()
-        file_op_tracker.complete_with_message.return_value = None
-
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-        ) as mock_dispatch:
-            _process_ai_message(malformed, state, console)
-            _process_message_chunk((tool_msg, {}), state, console, file_op_tracker)
-
-        events = [c[0][0] for c in mock_dispatch.call_args_list]
-        assert "tool.use" not in events
-        result_calls = [
-            c for c in mock_dispatch.call_args_list if c[0][0] == "tool.result"
-        ]
-        assert result_calls == [
-            call(
-                "tool.result",
-                {
-                    "tool_name": "read_file",
-                    "tool_id": "call-1",
-                    "tool_args": {},
-                    "tool_status": "success",
-                    "tool_output": "ok",
-                },
-            )
-        ]
-
 
 class TestOrphanedToolResultHooks:
     """`_dispatch_orphaned_tool_result_hooks` closes tool.use with no result.
@@ -3889,123 +2743,6 @@ class TestOrphanedToolResultHooks:
     never arrives (e.g. a provider error mid-tool) must still be closed with a
     terminal `tool.error`/`tool.result`, matching the TUI's cleanup paths.
     """
-
-    def test_dispatches_terminal_hooks_and_clears_state(self) -> None:
-        """Each in-flight id gets a named error result, then the maps are drained."""
-        state = StreamState()
-        state.in_flight_tool_calls = {
-            "tool-1": InFlightToolCall("execute", {"command": "sleep 100"})
-        }
-
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-        ) as mock_dispatch:
-            _dispatch_orphaned_tool_result_hooks(
-                state, "Stream ended before tool result"
-            )
-
-        events = [(c[0][0], c[0][1]) for c in mock_dispatch.call_args_list]
-        assert ("tool.error", {"tool_names": ["execute"]}) in events
-        result_payloads = [p for e, p in events if e == "tool.result"]
-        assert result_payloads == [
-            {
-                "tool_name": "execute",
-                "tool_id": "tool-1",
-                "tool_args": {"command": "sleep 100"},
-                "tool_status": "error",
-                "tool_output": "Stream ended before tool result",
-            }
-        ]
-        assert state.in_flight_tool_calls == {}
-
-    def test_dispatches_terminal_hooks_for_every_orphan(self) -> None:
-        """Multiple in-flight ids are each closed, not just the first.
-
-        Guards the `for ... in list(...)` loop: an aborted stream can leave more
-        than one dangling `tool.use`, and every one must get a terminal
-        error/result so no invocation is left unterminated.
-        """
-        state = StreamState()
-        state.in_flight_tool_calls = {
-            "tool-1": InFlightToolCall("read_file", {"path": "a.py"}),
-            "tool-2": InFlightToolCall("execute", {"command": "ls"}),
-        }
-
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-        ) as mock_dispatch:
-            _dispatch_orphaned_tool_result_hooks(
-                state, "Stream ended before tool result"
-            )
-
-        events = [(c[0][0], c[0][1]) for c in mock_dispatch.call_args_list]
-        error_names = [p["tool_names"][0] for e, p in events if e == "tool.error"]
-        assert error_names == ["read_file", "execute"]
-        result_ids = [p["tool_id"] for e, p in events if e == "tool.result"]
-        assert result_ids == ["tool-1", "tool-2"]
-        assert all(p["tool_status"] == "error" for e, p in events if e == "tool.result")
-        assert state.in_flight_tool_calls == {}
-
-    def test_noop_when_no_orphans(self) -> None:
-        """A clean run (every id already drained) dispatches nothing."""
-        state = StreamState()
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-        ) as mock_dispatch:
-            _dispatch_orphaned_tool_result_hooks(state, "x")
-        mock_dispatch.assert_not_called()
-
-    async def test_run_agent_loop_drains_orphans_on_stream_error(self) -> None:
-        """A mid-stream error closes the in-flight tool.use before propagating."""
-
-        async def boom(  # noqa: RUF029  # replaces the async _stream_agent seam
-            _agent: object,
-            _stream_input: object,
-            _config: object,
-            state: StreamState,
-            _console: object,
-            _file_op_tracker: object,
-            _context: object,
-        ) -> None:
-            # Simulate a tool.use having fired just before the stream dies.
-            state.in_flight_tool_calls["tool-1"] = InFlightToolCall(
-                "execute", {"command": "x"}
-            )
-            msg = "provider blew up"
-            raise RuntimeError(msg)
-
-        with (
-            patch("deepagents_code.client.non_interactive._stream_agent", new=boom),
-            patch(
-                "deepagents_code.client.non_interactive.dispatch_hook",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-            ) as mock_dispatch,
-            pytest.raises(RuntimeError, match="provider blew up"),
-        ):
-            await _run_agent_loop(
-                MagicMock(),
-                "hi",
-                {"configurable": {"thread_id": "t"}},
-                Console(quiet=True),
-                MagicMock(),
-                quiet=True,
-            )
-
-        result_payloads = [
-            c[0][1] for c in mock_dispatch.call_args_list if c[0][0] == "tool.result"
-        ]
-        assert result_payloads == [
-            {
-                "tool_name": "execute",
-                "tool_id": "tool-1",
-                "tool_args": {"command": "x"},
-                "tool_status": "error",
-                "tool_output": "Stream ended before tool result",
-            }
-        ]
 
     async def test_run_agent_loop_logs_unemitted_buffers_at_stream_end(
         self, caplog
@@ -4175,20 +2912,11 @@ class TestDrainWiring:
 
     async def test_drains_pending_hooks_on_success(self) -> None:
         """The success path (exit 0) still awaits the drain."""
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter([]))
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive._make_stdio_encoding_safe",
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(), model_name="test-model", provider="test"
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -4221,16 +2949,10 @@ class TestDrainWiring:
 
     async def test_drains_pending_hooks_on_error_and_preserves_exit_code(self) -> None:
         """An error return (exit 1) still awaits the drain, exit code intact."""
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(), model_name="test-model", provider="test"
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -4273,16 +2995,10 @@ class TestDrainWiring:
         not only success/OSError, so the final `tool.result` is not dropped when a
         user interrupts a headless run.
         """
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(), model_name="test-model", provider="test"
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -4320,16 +3036,10 @@ class TestDrainWiring:
 
     async def test_drains_pending_hooks_on_iteration_limit_124(self) -> None:
         """A turn-budget hit (exit 124) still awaits the drain, exit code intact."""
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_server_proc = MagicMock()
 
         with (
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(), model_name="test-model", provider="test"
-                ),
-            ),
             patch(
                 "deepagents_code.client.non_interactive.generate_thread_id",
                 return_value="test-thread",
@@ -4401,7 +3111,7 @@ class TestHeadlessUsageStats:
             "deepagents_code.model_config.DEFAULT_CONFIG_PATH", config_path
         )
 
-        mock_agent = MagicMock()
+        mock_agent = _headless_agent()
         mock_agent.astream = MagicMock(return_value=_async_iter([]))
         mock_console = MagicMock(spec=Console)
 
@@ -4409,14 +3119,6 @@ class TestHeadlessUsageStats:
             patch(
                 "deepagents_code.client.non_interactive.Console",
                 return_value=mock_console,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.create_model",
-                return_value=ModelResult(
-                    model=MagicMock(),
-                    model_name="test-model",
-                    provider="test",
-                ),
             ),
             patch(
                 "deepagents_code.client.non_interactive.print_usage_table"
@@ -4444,32 +3146,6 @@ class TestHeadlessUsageStats:
         )
         return mock_table.call_count, printed
 
-    async def test_shown_by_default(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """An absent preference keeps the headless usage table."""
-        count, printed = await self._run_headless("", tmp_path, monkeypatch)
-        assert count == 1
-        assert "Task completed" in printed
-
-    async def test_suppressed_when_disabled(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """`show_usage_stats = false` suppresses the headless table too.
-
-        The key names the preference, not the surface, so a user who turns it
-        off must not still get the table after every `dcode -x` run.
-        """
-        count, printed = await self._run_headless(
-            "[ui]\nshow_usage_stats = false\n", tmp_path, monkeypatch
-        )
-        assert count == 0
-        # The rest of teardown must survive the suppression. A gate written as
-        # an early `return` instead of an `if` would keep the return code at 0
-        # and the count at 0 while silently dropping the completion line, the
-        # `AGENT_COMPLETED` notification, and the `session.end` hooks below it.
-        assert "Task completed" in printed
-
     async def test_quiet_suppresses_the_table_even_when_enabled(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -4488,63 +3164,362 @@ class TestHeadlessUsageStats:
         # expected outcome rather than a broken teardown.
         assert "Task completed" not in printed
 
-    async def test_env_var_suppresses_the_table(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """`DEEPAGENTS_CODE_SHOW_USAGE_STATS` outranks an opt-in config file.
 
-        This is the headless case the env var exists for: a CI runner can set
-        one but usually has no `~/.deepagents/config.toml` to edit.
-        """
-        monkeypatch.setenv("DEEPAGENTS_CODE_SHOW_USAGE_STATS", "0")
-
-        count, printed = await self._run_headless(
-            "[ui]\nshow_usage_stats = true\n", tmp_path, monkeypatch
-        )
-        assert count == 0
-        assert "Task completed" in printed
-
-
-def _attempt_event(call_id: str, attempt: int, *, phase: str) -> dict[str, Any]:
-    """Build a model_attempt custom-stream payload."""
-    return {
-        "type": "model_attempt",
-        "phase": phase,
-        "call_id": call_id,
-        "attempt": attempt,
-    }
-
-
-def _retry_event(
-    call_id: str | None,
-    failed_attempt: int | None,
-    *,
-    output_may_have_started: bool = False,
-) -> dict[str, Any]:
-    """Build a model_retry custom-stream payload."""
-    from deepagents_code.model_retry import build_retry_event
-
-    if call_id is None:
-        return build_retry_event(1, 5)
-    return build_retry_event(
-        1,
-        5,
-        call_id=call_id,
-        failed_attempt=failed_attempt,
-        output_may_have_started=output_may_have_started,
+def test_ascii_headless_status_uses_ascii_glyphs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    monkeypatch.setattr(
+        "deepagents_code.client.non_interactive.get_glyphs", lambda: ASCII_GLYPHS
     )
+    monkeypatch.setattr(
+        "deepagents_code.client.non_interactive.is_ascii_mode", lambda: True
+    )
+
+    _process_rubric_event(
+        {"type": "rubric_evaluation_start", "iteration": 0},
+        StreamState(thread_id="thread-1"),
+        console,
+    )
+    spinner = _ConsoleSpinner._build_spinner("Working...")
+
+    assert output.getvalue().isascii()
+    assert ASCII_GLYPHS.hourglass in output.getvalue()
+    assert spinner.frames == list(ASCII_GLYPHS.spinner_frames)
+
+
+def test_reasoning_after_streamed_text_starts_on_a_new_terminal_line(
+    console: Console, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    terminal = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", terminal)
+    monkeypatch.setattr(sys, "stderr", terminal)
+    state = StreamState(show_reasoning=True)
+
+    _process_ai_message(
+        AIMessage(
+            content=[
+                {"type": "text", "text": "answer"},
+                {"type": "reasoning", "reasoning": "follow-up"},
+            ]
+        ),
+        state,
+        console,
+    )
+
+    assert terminal.getvalue() == "answer\nReasoning:\nfollow-up"
+
+
+async def test_reasoning_only_stream_ends_with_newline(
+    console: Console, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ReasoningOnlyAgent:
+        async def astream(self, *_args: Any, **_kwargs: Any) -> AsyncIterator[object]:
+            yield (
+                (),
+                "messages",
+                (AIMessage(content=[{"type": "reasoning", "reasoning": "solo"}]), {}),
+            )
+
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+    state = StreamState(show_reasoning=True)
+
+    await _stream_agent(
+        ReasoningOnlyAgent(),
+        {"messages": []},
+        {},
+        state,
+        console,
+        FileOpTracker(assistant_id="assistant"),
+        {},
+    )
+
+    assert stderr.getvalue() == "Reasoning:\nsolo\n"
+    assert state.reasoning_active is False
+
+
+def test_reasoning_separator_stays_out_of_streamed_stdout(
+    console: Console, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    state = StreamState(show_reasoning=True)
+
+    _process_ai_message(
+        AIMessage(
+            content=[
+                {"type": "text", "text": "first"},
+                {"type": "reasoning", "reasoning": "thinking"},
+                {"type": "text", "text": "second"},
+            ]
+        ),
+        state,
+        console,
+    )
+
+    assert stdout.getvalue() == "firstsecond"
+    assert stderr.getvalue() == "\nReasoning:\nthinking\n"
+
+
+def test_visible_reasoning_defaults_off(
+    console: Console, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    _process_ai_message(
+        AIMessage(content=[{"type": "reasoning", "reasoning": "hidden"}]),
+        StreamState(),
+        console,
+    )
+
+    assert stderr.getvalue() == ""
+
+
+def test_visible_reasoning_is_opt_in_and_stays_out_of_final_answer(
+    console: Console, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    state = StreamState(show_reasoning=True)
+    message = AIMessage(
+        content=[
+            {"type": "reasoning", "reasoning": "first"},
+            {"type": "reasoning", "reasoning": " "},
+            {"type": "reasoning", "reasoning": "second"},
+            {"type": "reasoning", "reasoning": "\n"},
+            {"type": "text", "text": "answer"},
+            {"type": "reasoning", "reasoning": "third"},
+            {"type": "non_standard", "value": {"type": "redacted_thinking"}},
+            {"type": "tool_call", "name": "search", "args": {}, "id": None},
+        ]
+    )
+
+    _process_ai_message(message, state, console)
+
+    assert stdout.getvalue() == "answer\n"
+    assert stderr.getvalue() == "Reasoning:\nfirst second\n\n\nReasoning:\nthird\n"
+    assert state.reasoning_active is False
+    assert state.full_response == ["answer"]
+
+
+class TestRunAgentLoopRetryTeardown:
+    """End-to-end reconciliation through `_run_agent_loop`."""
+
+    async def test_clean_teardown_commits_attempt_with_lost_completion(
+        self, tmp_path: Path
+    ) -> None:
+        """A successful stream preserves output when its completion event is lost."""
+        transcripts = TranscriptStore(tmp_path / "transcripts")
+        recorder = TranscriptRecorder(transcripts, "thread-1")
+
+        async def staged_stream(  # noqa: RUF029  # replaces the async _stream_agent seam
+            _agent: object,
+            _stream_input: object,
+            _config: object,
+            state: StreamState,
+            console: Console,
+            file_op_tracker: FileOpTracker,
+            _context: object,
+        ) -> None:
+            state.transcript = recorder
+            _process_stream_chunk(
+                ((), "custom", _attempt_event("call-1", 0, phase="start")),
+                state,
+                console,
+                file_op_tracker,
+            )
+            _process_stream_chunk(
+                ((), "messages", (AIMessage(id="m-1", content="kept"), {})),
+                state,
+                console,
+                file_op_tracker,
+            )
+
+        file_op_tracker = MagicMock()
+        file_op_tracker.complete_with_message.return_value = None
+
+        with (
+            patch(
+                "deepagents_code.client.non_interactive._stream_agent",
+                new=staged_stream,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.dispatch_hook",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
+            ),
+        ):
+            await _run_agent_loop(
+                MagicMock(),
+                "task",
+                {"configurable": {"thread_id": "thread-1"}},
+                Console(quiet=True),
+                file_op_tracker,
+                quiet=True,
+            )
+
+        assert recorder._attempts == {}
+        main = transcripts.materialize("thread-1").path.read_text(encoding="utf-8")
+        assert '"content":"kept"' in main
+
+    async def test_no_stream_run_flushes_completed_tool_status_before_text(
+        self,
+    ) -> None:
+        """A full no-stream run prints staged tool status ahead of the text."""
+        stdout_buf = io.StringIO()
+        console_output = io.StringIO()
+        console = Console(file=console_output, force_terminal=False, color_system=None)
+
+        ai_msg = MagicMock(spec=AIMessage)
+        ai_msg.content_blocks = [
+            {"type": "text", "text": "done"},
+            {
+                "type": "tool_call",
+                "name": "read_file",
+                "id": "call-1",
+                "index": 0,
+                "args": {"path": "a.py"},
+            },
+        ]
+
+        async def staged_stream(  # noqa: RUF029  # replaces the async _stream_agent seam
+            _agent: object,
+            _stream_input: object,
+            _config: object,
+            state: StreamState,
+            stream_console: Console,
+            _file_op_tracker: FileOpTracker,
+            _context: object,
+        ) -> None:
+            tracker = FileOpTracker(assistant_id="assistant")
+            _process_stream_chunk(
+                ((), "custom", _attempt_event("call-1", 0, phase="start")),
+                state,
+                stream_console,
+                tracker,
+            )
+            with patch(
+                "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
+            ):
+                _process_stream_chunk(
+                    ((), "messages", (ai_msg, {})), state, stream_console, tracker
+                )
+            _process_stream_chunk(
+                ((), "custom", _attempt_event("call-1", 0, phase="complete")),
+                state,
+                stream_console,
+                tracker,
+            )
+
+        file_op_tracker = MagicMock()
+        file_op_tracker.complete_with_message.return_value = None
+
+        with (
+            patch(
+                "deepagents_code.client.non_interactive._stream_agent",
+                new=staged_stream,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.dispatch_hook",
+                new_callable=AsyncMock,
+            ),
+            patch.object(sys, "stdout", stdout_buf),
+        ):
+            await _run_agent_loop(
+                MagicMock(),
+                "task",
+                {"configurable": {"thread_id": "t"}},
+                console,
+                file_op_tracker,
+                quiet=False,
+                stream=False,
+            )
+
+        # The completed attempt's status flushed at completion; the buffered
+        # text flushed at end of run on stdout.
+        assert (
+            f"{get_glyphs().tool} Calling tool: read_file" in console_output.getvalue()
+        )
+        assert "done" in stdout_buf.getvalue()
+
+    async def test_terminal_teardown_drops_uncommitted_transcript_scopes(
+        self, tmp_path: Path
+    ) -> None:
+        """An attempt that never completes leaves no transcript records."""
+        transcripts = TranscriptStore(tmp_path / "transcripts")
+        recorder = TranscriptRecorder(transcripts, "thread-1")
+
+        async def staged_stream(  # noqa: RUF029  # replaces the async _stream_agent seam
+            _agent: object,
+            _stream_input: object,
+            _config: object,
+            state: StreamState,
+            console: Console,
+            file_op_tracker: FileOpTracker,
+            _context: object,
+        ) -> None:
+            state.transcript = recorder
+            # An attempt opens, streams one message, then the stream aborts
+            # (a terminal provider error after the retry budget is spent).
+            _process_stream_chunk(
+                ((), "custom", _attempt_event("call-1", 0, phase="start")),
+                state,
+                console,
+                file_op_tracker,
+            )
+            ai_msg = MagicMock(spec=AIMessage)
+            ai_msg.content_blocks = [{"type": "text", "text": "partial"}]
+            _process_stream_chunk(
+                ((), "messages", (ai_msg, {})), state, console, file_op_tracker
+            )
+            abort = "stream aborted"
+            raise RuntimeError(abort)
+
+        file_op_tracker = MagicMock()
+        file_op_tracker.complete_with_message.return_value = None
+
+        with (
+            patch(
+                "deepagents_code.client.non_interactive._stream_agent",
+                new=staged_stream,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.dispatch_hook",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
+            ),
+            pytest.raises(RuntimeError, match="stream aborted"),
+        ):
+            await _run_agent_loop(
+                MagicMock(),
+                "task",
+                {"configurable": {"thread_id": "thread-1"}},
+                Console(quiet=True),
+                file_op_tracker,
+                quiet=True,
+            )
+
+        # drop_uncommitted ran: the aborted attempt's staged message is gone.
+        assert recorder._attempts == {}
+        assert recorder._chunks == {}
+        assert (
+            transcripts.materialize("thread-1").path.read_text(encoding="utf-8") == ""
+        )
 
 
 class TestAttemptLifecycle:
     """Headless reconciliation of model_attempt/model_retry lifecycle events."""
-
-    def _lifecycle_state(self, tmp_path: Path, **kwargs: Any) -> StreamState:
-        transcripts = TranscriptStore(tmp_path / "transcripts")
-        return StreamState(
-            thread_id="thread-1",
-            transcript=TranscriptRecorder(transcripts, "thread-1"),
-            **kwargs,
-        )
 
     def test_attempt_lifecycle_stages_and_commits_root_transcript(
         self, tmp_path: Path
@@ -4632,7 +3607,9 @@ class TestAttemptLifecycle:
             )
             # tool.use fired; the status line is staged, not printed.
             assert any(c[0][0] == "tool.use" for c in mock_dispatch.call_args_list)
-            assert state.pending_tool_status_lines == ["🔧 Calling tool: execute"]
+            assert state.pending_tool_status_lines == [
+                f"{get_glyphs().tool} Calling tool: execute"
+            ]
             assert state.tool_call_buffers == {}  # parsed buffer popped
             assert "call-x" in state.in_flight_tool_calls
 
@@ -4677,26 +3654,58 @@ class TestAttemptLifecycle:
         # The staged failed message never reached the transcript.
         assert store.materialize("thread-1").path.read_text(encoding="utf-8") == ""
 
-    def test_retry_boundary_printed_when_streaming(self, tmp_path: Path) -> None:
-        """Streaming mode marks the supersession instead of truncating."""
+    def test_duplicate_lifecycle_events_are_idempotent(self, tmp_path: Path) -> None:
+        """Duplicate start/complete events neither restage nor double-commit."""
+        console = Console(quiet=True)
+        state = self._lifecycle_state(tmp_path)
+        tracker = FileOpTracker(assistant_id="assistant")
+        store = cast(
+            "TranscriptStore", cast("TranscriptRecorder", state.transcript).runtime
+        )
+
+        start = ((), "custom", _attempt_event("call-1", 0, phase="start"))
+        _process_stream_chunk(start, state, console, tracker)
+        _process_stream_chunk(start, state, console, tracker)
+        scope = state.active_attempts[()]
+        assert (scope.call_id, scope.attempt) == ("call-1", 0)
+
+        _process_stream_chunk(
+            ((), "messages", (AIMessage(id="m-1", content="hi"), {})),
+            state,
+            console,
+            tracker,
+        )
+        complete = ((), "custom", _attempt_event("call-1", 0, phase="complete"))
+        _process_stream_chunk(complete, state, console, tracker)
+        _process_stream_chunk(complete, state, console, tracker)
+
+        records = (
+            store.materialize("thread-1").path.read_text(encoding="utf-8").splitlines()
+        )
+        assert len([line for line in records if line]) == 1
+
+    def test_duplicate_retry_event_is_a_no_op(self, tmp_path: Path) -> None:
+        """Reconciling without a scope match must stay idempotent.
+
+        The first retry deletes the scope, so a redelivered copy no longer
+        matches one — and reconciliation is deliberately not gated on a match.
+        Identity is tracked instead, so the duplicate changes nothing.
+        """
         output = io.StringIO()
         console = Console(file=output, force_terminal=False, color_system=None)
-        stdout_buf = io.StringIO()
-        state = self._lifecycle_state(tmp_path, stream=True)
+        state = self._lifecycle_state(tmp_path, stream=False)
         tracker = FileOpTracker(assistant_id="assistant")
 
-        with patch.object(sys, "stdout", stdout_buf):
-            _process_stream_chunk(
-                ((), "custom", _attempt_event("call-1", 0, phase="start")),
-                state,
-                console,
-                tracker,
-            )
-            ai_msg = MagicMock(spec=AIMessage)
-            ai_msg.content_blocks = [{"type": "text", "text": "partial"}]
-            _process_stream_chunk(
-                ((), "messages", (ai_msg, {})), state, console, tracker
-            )
+        _process_stream_chunk(
+            ((), "custom", _attempt_event("call-1", 0, phase="start")),
+            state,
+            console,
+            tracker,
+        )
+        ai_msg = MagicMock(spec=AIMessage)
+        ai_msg.content_blocks = [{"type": "text", "text": "partial"}]
+        _process_stream_chunk(((), "messages", (ai_msg, {})), state, console, tracker)
+        for _ in range(3):
             _process_stream_chunk(
                 (
                     (),
@@ -4708,79 +3717,8 @@ class TestAttemptLifecycle:
                 tracker,
             )
 
-        # Streaming output is irreversible, so the text stays and an explicit
-        # boundary separates it from the replay. The trailing newline terminates
-        # the partial line: response text goes to raw stdout with no newline of
-        # its own, so without it Rich welds the boundary onto the last sentence.
-        assert stdout_buf.getvalue() == "partial\n"
-        assert state.full_response == ["partial"]
-        printed = output.getvalue()
-        assert "the output above is incomplete" in printed
-        # The status line comes after the boundary, so "the output above" refers
-        # to the model's text rather than to the status line itself.
-        assert printed.index("the output above is incomplete") < printed.index(
-            "Retrying model request 1/5"
-        )
-
-    def test_retry_without_output_discards_buffered_text(self, tmp_path: Path) -> None:
-        """Buffered mode discards failed text even when no output escaped."""
-        output = io.StringIO()
-        console = Console(file=output, force_terminal=False, color_system=None)
-        state = self._lifecycle_state(tmp_path, stream=False)
-        tracker = FileOpTracker(assistant_id="assistant")
-
-        _process_stream_chunk(
-            ((), "custom", _attempt_event("call-1", 0, phase="start")),
-            state,
-            console,
-            tracker,
-        )
-        ai_msg = MagicMock(spec=AIMessage)
-        ai_msg.content_blocks = [{"type": "text", "text": "partial"}]
-        _process_stream_chunk(((), "messages", (ai_msg, {})), state, console, tracker)
-        _process_stream_chunk(
-            ((), "custom", _retry_event("call-1", 0, output_may_have_started=False)),
-            state,
-            console,
-            tracker,
-        )
-
-        # No output escaped, so the failed attempt is silently discarded.
         assert state.full_response == []
-        assert "incomplete" not in output.getvalue()
-
-    def test_uncorrelated_retry_marks_the_buffer_it_cannot_truncate(
-        self, tmp_path: Path
-    ) -> None:
-        """An unknown failed attempt has no offset, so it marks the seam."""
-        output = io.StringIO()
-        console = Console(file=output, force_terminal=False, color_system=None)
-        state = self._lifecycle_state(tmp_path, stream=False)
-        tracker = FileOpTracker(assistant_id="assistant")
-
-        _process_stream_chunk(
-            ((), "custom", _attempt_event("call-1", 0, phase="start")),
-            state,
-            console,
-            tracker,
-        )
-        ai_msg = MagicMock(spec=AIMessage)
-        ai_msg.content_blocks = [{"type": "text", "text": "partial"}]
-        _process_stream_chunk(((), "messages", (ai_msg, {})), state, console, tracker)
-        # A retry naming a different failed attempt than the active one.
-        _process_stream_chunk(
-            ((), "custom", _retry_event("call-1", 7, output_may_have_started=True)),
-            state,
-            console,
-            tracker,
-        )
-
-        # No scope match means no recorded offset, so the failed text cannot be
-        # found and removed. Carry the boundary into the buffer rather than
-        # splicing partial and replayed text together with no marker at all.
-        assert state.full_response == ["partial", f"\n{RETRY_BOUNDARY_LINE}\n"]
-        assert "Retrying model request 1/5" in output.getvalue()
-        assert () in state.active_attempts  # scope untouched
+        assert state.settled_attempts == {((), "call-1", 0)}
 
     def test_legacy_pre_output_retry_preserves_prior_model_output(self) -> None:
         """An old server's retry cannot have emitted text from the failed call."""
@@ -4800,43 +3738,6 @@ class TestAttemptLifecycle:
         # to an earlier successful model step and must not receive a boundary.
         assert state.full_response == ["complete step"]
         assert "Retrying model request 1/5" in output.getvalue()
-
-    def test_no_stream_truncation_keeps_earlier_model_steps(
-        self, tmp_path: Path
-    ) -> None:
-        """Truncation cuts to the attempt offset, not to the whole buffer.
-
-        Every other buffered-mode test starts the attempt with an empty
-        `full_response`, so the recorded offset is always 0 and
-        `del full_response[offset:]` is indistinguishable from `clear()`. A
-        multi-step turn makes them differ: the first step's text must survive
-        the second step's retry.
-        """
-        output = io.StringIO()
-        console = Console(file=output, force_terminal=False, color_system=None)
-        state = self._lifecycle_state(tmp_path, stream=False)
-        tracker = FileOpTracker(assistant_id="assistant")
-
-        # An earlier, already-completed model step.
-        first = MagicMock(spec=AIMessage)
-        first.content_blocks = [{"type": "text", "text": "KEEP-ME"}]
-        _process_stream_chunk(((), "messages", (first, {})), state, console, tracker)
-
-        _process_stream_chunk(
-            ((), "custom", _attempt_event("call-2", 0, phase="start")),
-            state,
-            console,
-            tracker,
-        )
-        assert state.attempt_buffer_offsets[(), "call-2", 0] == 1
-        second = MagicMock(spec=AIMessage)
-        second.content_blocks = [{"type": "text", "text": "DROP-ME"}]
-        _process_stream_chunk(((), "messages", (second, {})), state, console, tracker)
-        _process_stream_chunk(
-            ((), "custom", _retry_event("call-2", 0)), state, console, tracker
-        )
-
-        assert state.full_response == ["KEEP-ME"]
 
     def test_lost_retry_event_still_reconciles_the_superseded_attempt(
         self, tmp_path: Path
@@ -4895,232 +3796,6 @@ class TestAttemptLifecycle:
         assert "tool.error" in events
         assert state.active_attempts[()].attempt == 1
 
-    def test_new_call_commits_attempt_with_lost_completion(
-        self, tmp_path: Path
-    ) -> None:
-        """A different call preserves output when only completion was lost."""
-        output = io.StringIO()
-        console = Console(file=output, force_terminal=False, color_system=None)
-        state = self._lifecycle_state(tmp_path, stream=False)
-        tracker = FileOpTracker(assistant_id="assistant")
-        store = cast(
-            "TranscriptStore", cast("TranscriptRecorder", state.transcript).runtime
-        )
-
-        _process_stream_chunk(
-            ((), "custom", _attempt_event("call-1", 0, phase="start")),
-            state,
-            console,
-            tracker,
-        )
-        _process_stream_chunk(
-            ((), "messages", (AIMessage(id="m-1", content="first"), {})),
-            state,
-            console,
-            tracker,
-        )
-        state.pending_tool_status_lines.append("Calling tool from first call")
-
-        # The completion for call-1 is lost, then a distinct model call starts.
-        _process_stream_chunk(
-            ((), "custom", _attempt_event("call-2", 0, phase="start")),
-            state,
-            console,
-            tracker,
-        )
-
-        assert state.full_response == ["first"]
-        assert state.pending_tool_status_lines == []
-        assert "Calling tool from first call" in output.getvalue()
-        assert "first" in store.materialize("thread-1").path.read_text(encoding="utf-8")
-        assert state.active_attempts[()].call_id == "call-2"
-
-    def test_reused_tool_id_after_retry_fires_one_terminal_each(
-        self, tmp_path: Path
-    ) -> None:
-        """A replay reusing the tool-call id gets its own use/result pair.
-
-        The settled ids are retired from the monotonic sets, so the replay is a
-        genuinely new call: one `tool.use` and one real `tool.result`, rather
-        than a suppressed `tool.use` and a second terminal event for the id
-        that was already closed as interrupted.
-        """
-        output = io.StringIO()
-        console = Console(file=output, force_terminal=False, color_system=None)
-        state = self._lifecycle_state(tmp_path, stream=False)
-        tracker = FileOpTracker(assistant_id="assistant")
-
-        def _tool_call_message() -> MagicMock:
-            msg = MagicMock(spec=AIMessage)
-            msg.content_blocks = [
-                {
-                    "type": "tool_call",
-                    "name": "execute",
-                    "id": "call-x",
-                    "index": 0,
-                    "args": '{"command": "ls"}',
-                }
-            ]
-            return msg
-
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-        ) as mock_dispatch:
-            _process_stream_chunk(
-                ((), "custom", _attempt_event("call-1", 0, phase="start")),
-                state,
-                console,
-                tracker,
-            )
-            _process_stream_chunk(
-                ((), "messages", (_tool_call_message(), {})), state, console, tracker
-            )
-            _process_stream_chunk(
-                ((), "custom", _retry_event("call-1", 0)), state, console, tracker
-            )
-            # The replay reuses the provider's tool-call id.
-            _process_stream_chunk(
-                ((), "custom", _attempt_event("call-1", 1, phase="start")),
-                state,
-                console,
-                tracker,
-            )
-            _process_stream_chunk(
-                ((), "messages", (_tool_call_message(), {})), state, console, tracker
-            )
-            _process_stream_chunk(
-                (
-                    (),
-                    "messages",
-                    (
-                        ToolMessage(
-                            content="listing", tool_call_id="call-x", name="execute"
-                        ),
-                        {},
-                    ),
-                ),
-                state,
-                console,
-                tracker,
-            )
-            calls = [(c[0][0], c[0][1]) for c in mock_dispatch.call_args_list]
-
-        uses = [payload for name, payload in calls if name == "tool.use"]
-        results = [payload for name, payload in calls if name == "tool.result"]
-        # Two attempts, so two `tool.use` — not one suppressed by a stale id.
-        assert len(uses) == 2
-        assert len(results) == 2
-        assert results[0]["tool_status"] == "error"
-        # The replay's real result carries its parsed args, not `{}`.
-        assert results[1]["tool_status"] == "success"
-        assert results[1]["tool_args"] == {"command": "ls"}
-
-    def test_reused_id_from_incomplete_tool_buffer_displays_replay(
-        self, tmp_path: Path
-    ) -> None:
-        """Discarded partial args do not suppress the replay's tool line."""
-        output = io.StringIO()
-        console = Console(file=output, force_terminal=False, color_system=None)
-        state = self._lifecycle_state(tmp_path, stream=False)
-        tracker = FileOpTracker(assistant_id="assistant")
-
-        def _tool_call_message(args: str) -> MagicMock:
-            msg = MagicMock(spec=AIMessage)
-            msg.content_blocks = [
-                {
-                    "type": "tool_call_chunk",
-                    "name": "execute",
-                    "id": "call-x",
-                    "index": 0,
-                    "args": args,
-                }
-            ]
-            return msg
-
-        _process_stream_chunk(
-            ((), "custom", _attempt_event("call-1", 0, phase="start")),
-            state,
-            console,
-            tracker,
-        )
-        _process_stream_chunk(
-            ((), "messages", (_tool_call_message('{"command":'), {})),
-            state,
-            console,
-            tracker,
-        )
-        assert state.displayed_tool_call_ids == {"call-x"}
-        assert state.in_flight_tool_calls == {}
-
-        _process_stream_chunk(
-            ((), "custom", _retry_event("call-1", 0)), state, console, tracker
-        )
-        assert state.displayed_tool_call_ids == set()
-
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-        ) as mock_dispatch:
-            _process_stream_chunk(
-                ((), "custom", _attempt_event("call-1", 1, phase="start")),
-                state,
-                console,
-                tracker,
-            )
-            _process_stream_chunk(
-                ((), "messages", (_tool_call_message('{"command":"ls"}'), {})),
-                state,
-                console,
-                tracker,
-            )
-            _process_stream_chunk(
-                ((), "custom", _attempt_event("call-1", 1, phase="complete")),
-                state,
-                console,
-                tracker,
-            )
-
-        assert output.getvalue().count("Calling tool: execute") == 1
-        uses = [
-            call for call in mock_dispatch.call_args_list if call.args[0] == "tool.use"
-        ]
-        assert len(uses) == 1
-
-    def test_duplicate_retry_event_is_a_no_op(self, tmp_path: Path) -> None:
-        """Reconciling without a scope match must stay idempotent.
-
-        The first retry deletes the scope, so a redelivered copy no longer
-        matches one — and reconciliation is deliberately not gated on a match.
-        Identity is tracked instead, so the duplicate changes nothing.
-        """
-        output = io.StringIO()
-        console = Console(file=output, force_terminal=False, color_system=None)
-        state = self._lifecycle_state(tmp_path, stream=False)
-        tracker = FileOpTracker(assistant_id="assistant")
-
-        _process_stream_chunk(
-            ((), "custom", _attempt_event("call-1", 0, phase="start")),
-            state,
-            console,
-            tracker,
-        )
-        ai_msg = MagicMock(spec=AIMessage)
-        ai_msg.content_blocks = [{"type": "text", "text": "partial"}]
-        _process_stream_chunk(((), "messages", (ai_msg, {})), state, console, tracker)
-        for _ in range(3):
-            _process_stream_chunk(
-                (
-                    (),
-                    "custom",
-                    _retry_event("call-1", 0, output_may_have_started=True),
-                ),
-                state,
-                console,
-                tracker,
-            )
-
-        assert state.full_response == []
-        assert state.settled_attempts == {((), "call-1", 0)}
-
     def test_malformed_attempt_event_is_ignored(self, tmp_path: Path) -> None:
         """A malformed model_attempt opens no scope; usage stays unscoped."""
         console = Console(quiet=True)
@@ -5136,36 +3811,6 @@ class TestAttemptLifecycle:
 
         assert state.active_attempts == {}
         assert state.attempt_buffer_offsets == {}
-
-    def test_duplicate_lifecycle_events_are_idempotent(self, tmp_path: Path) -> None:
-        """Duplicate start/complete events neither restage nor double-commit."""
-        console = Console(quiet=True)
-        state = self._lifecycle_state(tmp_path)
-        tracker = FileOpTracker(assistant_id="assistant")
-        store = cast(
-            "TranscriptStore", cast("TranscriptRecorder", state.transcript).runtime
-        )
-
-        start = ((), "custom", _attempt_event("call-1", 0, phase="start"))
-        _process_stream_chunk(start, state, console, tracker)
-        _process_stream_chunk(start, state, console, tracker)
-        scope = state.active_attempts[()]
-        assert (scope.call_id, scope.attempt) == ("call-1", 0)
-
-        _process_stream_chunk(
-            ((), "messages", (AIMessage(id="m-1", content="hi"), {})),
-            state,
-            console,
-            tracker,
-        )
-        complete = ((), "custom", _attempt_event("call-1", 0, phase="complete"))
-        _process_stream_chunk(complete, state, console, tracker)
-        _process_stream_chunk(complete, state, console, tracker)
-
-        records = (
-            store.materialize("thread-1").path.read_text(encoding="utf-8").splitlines()
-        )
-        assert len([line for line in records if line]) == 1
 
     def test_nested_lifecycle_stages_without_root_mutation(
         self, tmp_path: Path
@@ -5253,6 +3898,400 @@ class TestAttemptLifecycle:
         nested_records = store.materialize("thread-1", agent_id="agent-1").path
         assert "nested final" in nested_records.read_text(encoding="utf-8")
 
+    def test_new_call_commits_attempt_with_lost_completion(
+        self, tmp_path: Path
+    ) -> None:
+        """A different call preserves output when only completion was lost."""
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        state = self._lifecycle_state(tmp_path, stream=False)
+        tracker = FileOpTracker(assistant_id="assistant")
+        store = cast(
+            "TranscriptStore", cast("TranscriptRecorder", state.transcript).runtime
+        )
+
+        _process_stream_chunk(
+            ((), "custom", _attempt_event("call-1", 0, phase="start")),
+            state,
+            console,
+            tracker,
+        )
+        _process_stream_chunk(
+            ((), "messages", (AIMessage(id="m-1", content="first"), {})),
+            state,
+            console,
+            tracker,
+        )
+        state.pending_tool_status_lines.append("Calling tool from first call")
+
+        # The completion for call-1 is lost, then a distinct model call starts.
+        _process_stream_chunk(
+            ((), "custom", _attempt_event("call-2", 0, phase="start")),
+            state,
+            console,
+            tracker,
+        )
+
+        assert state.full_response == ["first"]
+        assert state.pending_tool_status_lines == []
+        assert "Calling tool from first call" in output.getvalue()
+        assert "first" in store.materialize("thread-1").path.read_text(encoding="utf-8")
+        assert state.active_attempts[()].call_id == "call-2"
+
+    def test_no_stream_tool_status_flushes_on_attempt_complete(
+        self, tmp_path: Path
+    ) -> None:
+        """Buffered mode prints tool status only after its attempt completes."""
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        state = self._lifecycle_state(tmp_path, stream=False)
+        tracker = FileOpTracker(assistant_id="assistant")
+
+        _process_stream_chunk(
+            ((), "custom", _attempt_event("call-1", 0, phase="start")),
+            state,
+            console,
+            tracker,
+        )
+        ai_msg = MagicMock(spec=AIMessage)
+        ai_msg.content_blocks = [
+            {
+                "type": "tool_call",
+                "name": "read_file",
+                "id": "call-9",
+                "index": 0,
+                "args": {"path": "a.py"},
+            }
+        ]
+        with patch(
+            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
+        ):
+            _process_stream_chunk(
+                ((), "messages", (ai_msg, {})), state, console, tracker
+            )
+        assert "Calling tool" not in output.getvalue()
+
+        _process_stream_chunk(
+            ((), "custom", _attempt_event("call-1", 0, phase="complete")),
+            state,
+            console,
+            tracker,
+        )
+        assert f"{get_glyphs().tool} Calling tool: read_file" in output.getvalue()
+        assert state.pending_tool_status_lines == []
+
+    def test_no_stream_truncation_keeps_earlier_model_steps(
+        self, tmp_path: Path
+    ) -> None:
+        """Truncation cuts to the attempt offset, not to the whole buffer.
+
+        Every other buffered-mode test starts the attempt with an empty
+        `full_response`, so the recorded offset is always 0 and
+        `del full_response[offset:]` is indistinguishable from `clear()`. A
+        multi-step turn makes them differ: the first step's text must survive
+        the second step's retry.
+        """
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        state = self._lifecycle_state(tmp_path, stream=False)
+        tracker = FileOpTracker(assistant_id="assistant")
+
+        # An earlier, already-completed model step.
+        first = MagicMock(spec=AIMessage)
+        first.content_blocks = [{"type": "text", "text": "KEEP-ME"}]
+        _process_stream_chunk(((), "messages", (first, {})), state, console, tracker)
+
+        _process_stream_chunk(
+            ((), "custom", _attempt_event("call-2", 0, phase="start")),
+            state,
+            console,
+            tracker,
+        )
+        assert state.attempt_buffer_offsets[(), "call-2", 0] == 1
+        second = MagicMock(spec=AIMessage)
+        second.content_blocks = [{"type": "text", "text": "DROP-ME"}]
+        _process_stream_chunk(((), "messages", (second, {})), state, console, tracker)
+        _process_stream_chunk(
+            ((), "custom", _retry_event("call-2", 0)), state, console, tracker
+        )
+
+        assert state.full_response == ["KEEP-ME"]
+
+    def test_retry_boundary_printed_when_streaming(self, tmp_path: Path) -> None:
+        """Streaming mode marks the supersession instead of truncating."""
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        stdout_buf = io.StringIO()
+        state = self._lifecycle_state(tmp_path, stream=True)
+        tracker = FileOpTracker(assistant_id="assistant")
+
+        with patch.object(sys, "stdout", stdout_buf):
+            _process_stream_chunk(
+                ((), "custom", _attempt_event("call-1", 0, phase="start")),
+                state,
+                console,
+                tracker,
+            )
+            ai_msg = MagicMock(spec=AIMessage)
+            ai_msg.content_blocks = [{"type": "text", "text": "partial"}]
+            _process_stream_chunk(
+                ((), "messages", (ai_msg, {})), state, console, tracker
+            )
+            _process_stream_chunk(
+                (
+                    (),
+                    "custom",
+                    _retry_event("call-1", 0, output_may_have_started=True),
+                ),
+                state,
+                console,
+                tracker,
+            )
+
+        # Streaming output is irreversible, so the text stays and an explicit
+        # boundary separates it from the replay. The trailing newline terminates
+        # the partial line: response text goes to raw stdout with no newline of
+        # its own, so without it Rich welds the boundary onto the last sentence.
+        assert stdout_buf.getvalue() == "partial\n"
+        assert state.full_response == ["partial"]
+        printed = output.getvalue()
+        assert "the output above is incomplete" in printed
+        # The status line comes after the boundary, so "the output above" refers
+        # to the model's text rather than to the status line itself.
+        assert printed.index("the output above is incomplete") < printed.index(
+            "Retrying model request 1/5"
+        )
+
+    def test_retry_without_output_discards_buffered_text(self, tmp_path: Path) -> None:
+        """Buffered mode discards failed text even when no output escaped."""
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        state = self._lifecycle_state(tmp_path, stream=False)
+        tracker = FileOpTracker(assistant_id="assistant")
+
+        _process_stream_chunk(
+            ((), "custom", _attempt_event("call-1", 0, phase="start")),
+            state,
+            console,
+            tracker,
+        )
+        ai_msg = MagicMock(spec=AIMessage)
+        ai_msg.content_blocks = [{"type": "text", "text": "partial"}]
+        _process_stream_chunk(((), "messages", (ai_msg, {})), state, console, tracker)
+        _process_stream_chunk(
+            ((), "custom", _retry_event("call-1", 0, output_may_have_started=False)),
+            state,
+            console,
+            tracker,
+        )
+
+        # No output escaped, so the failed attempt is silently discarded.
+        assert state.full_response == []
+        assert "incomplete" not in output.getvalue()
+
+    def test_reused_id_from_incomplete_tool_buffer_displays_replay(
+        self, tmp_path: Path
+    ) -> None:
+        """Discarded partial args do not suppress the replay's tool line."""
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        state = self._lifecycle_state(tmp_path, stream=False)
+        tracker = FileOpTracker(assistant_id="assistant")
+
+        def _tool_call_message(args: str) -> MagicMock:
+            msg = MagicMock(spec=AIMessage)
+            msg.content_blocks = [
+                {
+                    "type": "tool_call_chunk",
+                    "name": "execute",
+                    "id": "call-x",
+                    "index": 0,
+                    "args": args,
+                }
+            ]
+            return msg
+
+        _process_stream_chunk(
+            ((), "custom", _attempt_event("call-1", 0, phase="start")),
+            state,
+            console,
+            tracker,
+        )
+        _process_stream_chunk(
+            ((), "messages", (_tool_call_message('{"command":'), {})),
+            state,
+            console,
+            tracker,
+        )
+        assert state.displayed_tool_call_ids == {"call-x"}
+        assert state.in_flight_tool_calls == {}
+
+        _process_stream_chunk(
+            ((), "custom", _retry_event("call-1", 0)), state, console, tracker
+        )
+        assert state.displayed_tool_call_ids == set()
+
+        with patch(
+            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
+        ) as mock_dispatch:
+            _process_stream_chunk(
+                ((), "custom", _attempt_event("call-1", 1, phase="start")),
+                state,
+                console,
+                tracker,
+            )
+            _process_stream_chunk(
+                ((), "messages", (_tool_call_message('{"command":"ls"}'), {})),
+                state,
+                console,
+                tracker,
+            )
+            _process_stream_chunk(
+                ((), "custom", _attempt_event("call-1", 1, phase="complete")),
+                state,
+                console,
+                tracker,
+            )
+
+        assert output.getvalue().count("Calling tool: execute") == 1
+        uses = [
+            call for call in mock_dispatch.call_args_list if call.args[0] == "tool.use"
+        ]
+        assert len(uses) == 1
+
+    def test_reused_tool_id_after_retry_fires_one_terminal_each(
+        self, tmp_path: Path
+    ) -> None:
+        """A replay reusing the tool-call id gets its own use/result pair.
+
+        The settled ids are retired from the monotonic sets, so the replay is a
+        genuinely new call: one `tool.use` and one real `tool.result`, rather
+        than a suppressed `tool.use` and a second terminal event for the id
+        that was already closed as interrupted.
+        """
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        state = self._lifecycle_state(tmp_path, stream=False)
+        tracker = FileOpTracker(assistant_id="assistant")
+
+        def _tool_call_message() -> MagicMock:
+            msg = MagicMock(spec=AIMessage)
+            msg.content_blocks = [
+                {
+                    "type": "tool_call",
+                    "name": "execute",
+                    "id": "call-x",
+                    "index": 0,
+                    "args": '{"command": "ls"}',
+                }
+            ]
+            return msg
+
+        with patch(
+            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
+        ) as mock_dispatch:
+            _process_stream_chunk(
+                ((), "custom", _attempt_event("call-1", 0, phase="start")),
+                state,
+                console,
+                tracker,
+            )
+            _process_stream_chunk(
+                ((), "messages", (_tool_call_message(), {})), state, console, tracker
+            )
+            _process_stream_chunk(
+                ((), "custom", _retry_event("call-1", 0)), state, console, tracker
+            )
+            # The replay reuses the provider's tool-call id.
+            _process_stream_chunk(
+                ((), "custom", _attempt_event("call-1", 1, phase="start")),
+                state,
+                console,
+                tracker,
+            )
+            _process_stream_chunk(
+                ((), "messages", (_tool_call_message(), {})), state, console, tracker
+            )
+            _process_stream_chunk(
+                (
+                    (),
+                    "messages",
+                    (
+                        ToolMessage(
+                            content="listing", tool_call_id="call-x", name="execute"
+                        ),
+                        {},
+                    ),
+                ),
+                state,
+                console,
+                tracker,
+            )
+            calls = [(c[0][0], c[0][1]) for c in mock_dispatch.call_args_list]
+
+        uses = [payload for name, payload in calls if name == "tool.use"]
+        results = [payload for name, payload in calls if name == "tool.result"]
+        # Two attempts, so two `tool.use` — not one suppressed by a stale id.
+        assert len(uses) == 2
+        assert len(results) == 2
+        assert results[0]["tool_status"] == "error"
+        # The replay's real result carries its parsed args, not `{}`.
+        assert results[1]["tool_status"] == "success"
+        assert results[1]["tool_args"] == {"command": "ls"}
+
+    def test_uncorrelated_retry_marks_the_buffer_it_cannot_truncate(
+        self, tmp_path: Path
+    ) -> None:
+        """An unknown failed attempt has no offset, so it marks the seam."""
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        state = self._lifecycle_state(tmp_path, stream=False)
+        tracker = FileOpTracker(assistant_id="assistant")
+
+        _process_stream_chunk(
+            ((), "custom", _attempt_event("call-1", 0, phase="start")),
+            state,
+            console,
+            tracker,
+        )
+        ai_msg = MagicMock(spec=AIMessage)
+        ai_msg.content_blocks = [{"type": "text", "text": "partial"}]
+        _process_stream_chunk(((), "messages", (ai_msg, {})), state, console, tracker)
+        # A retry naming a different failed attempt than the active one.
+        _process_stream_chunk(
+            ((), "custom", _retry_event("call-1", 7, output_may_have_started=True)),
+            state,
+            console,
+            tracker,
+        )
+
+        # No scope match means no recorded offset, so the failed text cannot be
+        # found and removed. Carry the boundary into the buffer rather than
+        # splicing partial and replayed text together with no marker at all.
+        assert state.full_response == ["partial", f"\n{RETRY_BOUNDARY_LINE}\n"]
+        assert "Retrying model request 1/5" in output.getvalue()
+        assert () in state.active_attempts  # scope untouched
+
+    def test_unscoped_usage_deduplicates_replayed_messages(self) -> None:
+        """Without a lifecycle scope, replayed messages still count only once."""
+        console = Console(quiet=True)
+        state = StreamState(thread_id="thread-1")
+        tracker = FileOpTracker(assistant_id="assistant")
+        msg = AIMessage(
+            id="msg-1",
+            content="",
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            response_metadata={"model_name": "m", "model_provider": "p"},
+        )
+
+        _process_stream_chunk(((), "messages", (msg, {})), state, console, tracker)
+
+        _process_stream_chunk(((), "messages", (msg, {})), state, console, tracker)
+
+        assert state.stats.request_count == 1
+        assert state.stats.input_tokens == 1
+        assert state.stats.output_tokens == 1
+
     def test_usage_is_scoped_per_attempt(self) -> None:
         """A retry reusing the provider message ID records both attempts."""
         console = Console(quiet=True)
@@ -5299,270 +4338,299 @@ class TestAttemptLifecycle:
         # The same provider message ID under a new attempt scope counts again
         # rather than being deduped as a replay.
         assert state.stats.request_count == 2
-        assert len(state.recorded_usage_requests) == 2
-        assert all(isinstance(key, tuple) for key in state.recorded_usage_requests)
 
-    def test_unscoped_usage_remains_legacy(self) -> None:
-        """Without a lifecycle scope, message usage keys stay bare IDs."""
-        console = Console(quiet=True)
-        state = StreamState(thread_id="thread-1")
-        tracker = FileOpTracker(assistant_id="assistant")
-        msg = AIMessage(
-            id="msg-1",
-            content="",
-            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-            response_metadata={"model_name": "m", "model_provider": "p"},
-        )
-
-        _process_stream_chunk(((), "messages", (msg, {})), state, console, tracker)
-
-        assert list(state.recorded_usage_requests) == ["msg-1"]
-
-    def test_no_stream_tool_status_flushes_on_attempt_complete(
-        self, tmp_path: Path
-    ) -> None:
-        """Buffered mode prints tool status only after its attempt completes."""
-        output = io.StringIO()
-        console = Console(file=output, force_terminal=False, color_system=None)
-        state = self._lifecycle_state(tmp_path, stream=False)
-        tracker = FileOpTracker(assistant_id="assistant")
-
-        _process_stream_chunk(
-            ((), "custom", _attempt_event("call-1", 0, phase="start")),
-            state,
-            console,
-            tracker,
-        )
-        ai_msg = MagicMock(spec=AIMessage)
-        ai_msg.content_blocks = [
-            {
-                "type": "tool_call",
-                "name": "read_file",
-                "id": "call-9",
-                "index": 0,
-                "args": {"path": "a.py"},
-            }
-        ]
-        with patch(
-            "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-        ):
-            _process_stream_chunk(
-                ((), "messages", (ai_msg, {})), state, console, tracker
-            )
-        assert "Calling tool" not in output.getvalue()
-
-        _process_stream_chunk(
-            ((), "custom", _attempt_event("call-1", 0, phase="complete")),
-            state,
-            console,
-            tracker,
-        )
-        assert "🔧 Calling tool: read_file" in output.getvalue()
-        assert state.pending_tool_status_lines == []
-
-
-class TestRunAgentLoopRetryTeardown:
-    """End-to-end reconciliation through `_run_agent_loop`."""
-
-    async def test_clean_teardown_commits_attempt_with_lost_completion(
-        self, tmp_path: Path
-    ) -> None:
-        """A successful stream preserves output when its completion event is lost."""
+    def _lifecycle_state(self, tmp_path: Path, **kwargs: Any) -> StreamState:
         transcripts = TranscriptStore(tmp_path / "transcripts")
-        recorder = TranscriptRecorder(transcripts, "thread-1")
-
-        async def staged_stream(  # noqa: RUF029  # replaces the async _stream_agent seam
-            _agent: object,
-            _stream_input: object,
-            _config: object,
-            state: StreamState,
-            console: Console,
-            file_op_tracker: FileOpTracker,
-            _context: object,
-        ) -> None:
-            state.transcript = recorder
-            _process_stream_chunk(
-                ((), "custom", _attempt_event("call-1", 0, phase="start")),
-                state,
-                console,
-                file_op_tracker,
-            )
-            _process_stream_chunk(
-                ((), "messages", (AIMessage(id="m-1", content="kept"), {})),
-                state,
-                console,
-                file_op_tracker,
-            )
-
-        file_op_tracker = MagicMock()
-        file_op_tracker.complete_with_message.return_value = None
-
-        with (
-            patch(
-                "deepagents_code.client.non_interactive._stream_agent",
-                new=staged_stream,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.dispatch_hook",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-            ),
-        ):
-            await _run_agent_loop(
-                MagicMock(),
-                "task",
-                {"configurable": {"thread_id": "thread-1"}},
-                Console(quiet=True),
-                file_op_tracker,
-                quiet=True,
-            )
-
-        assert recorder._attempts == {}
-        main = transcripts.materialize("thread-1").path.read_text(encoding="utf-8")
-        assert '"content":"kept"' in main
-
-    async def test_terminal_teardown_drops_uncommitted_transcript_scopes(
-        self, tmp_path: Path
-    ) -> None:
-        """An attempt that never completes leaves no transcript records."""
-        transcripts = TranscriptStore(tmp_path / "transcripts")
-        recorder = TranscriptRecorder(transcripts, "thread-1")
-
-        async def staged_stream(  # noqa: RUF029  # replaces the async _stream_agent seam
-            _agent: object,
-            _stream_input: object,
-            _config: object,
-            state: StreamState,
-            console: Console,
-            file_op_tracker: FileOpTracker,
-            _context: object,
-        ) -> None:
-            state.transcript = recorder
-            # An attempt opens, streams one message, then the stream aborts
-            # (a terminal provider error after the retry budget is spent).
-            _process_stream_chunk(
-                ((), "custom", _attempt_event("call-1", 0, phase="start")),
-                state,
-                console,
-                file_op_tracker,
-            )
-            ai_msg = MagicMock(spec=AIMessage)
-            ai_msg.content_blocks = [{"type": "text", "text": "partial"}]
-            _process_stream_chunk(
-                ((), "messages", (ai_msg, {})), state, console, file_op_tracker
-            )
-            abort = "stream aborted"
-            raise RuntimeError(abort)
-
-        file_op_tracker = MagicMock()
-        file_op_tracker.complete_with_message.return_value = None
-
-        with (
-            patch(
-                "deepagents_code.client.non_interactive._stream_agent",
-                new=staged_stream,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.dispatch_hook",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-            ),
-            pytest.raises(RuntimeError, match="stream aborted"),
-        ):
-            await _run_agent_loop(
-                MagicMock(),
-                "task",
-                {"configurable": {"thread_id": "thread-1"}},
-                Console(quiet=True),
-                file_op_tracker,
-                quiet=True,
-            )
-
-        # drop_uncommitted ran: the aborted attempt's staged message is gone.
-        assert recorder._attempts == {}
-        assert recorder._chunks == {}
-        assert (
-            transcripts.materialize("thread-1").path.read_text(encoding="utf-8") == ""
+        return StreamState(
+            thread_id="thread-1",
+            transcript=TranscriptRecorder(transcripts, "thread-1"),
+            **kwargs,
         )
 
-    async def test_no_stream_run_flushes_completed_tool_status_before_text(
+
+def _attempt_event(call_id: str, attempt: int, *, phase: str) -> dict[str, Any]:
+    """Build a model_attempt custom-stream payload."""
+    return {
+        "type": "model_attempt",
+        "phase": phase,
+        "call_id": call_id,
+        "attempt": attempt,
+    }
+
+
+def _retry_event(
+    call_id: str | None,
+    failed_attempt: int | None,
+    *,
+    output_may_have_started: bool = False,
+) -> dict[str, Any]:
+    """Build a model_retry custom-stream payload."""
+    from deepagents_code.model_retry import build_retry_event
+
+    if call_id is None:
+        return build_retry_event(1, 5)
+    return build_retry_event(
+        1,
+        5,
+        call_id=call_id,
+        failed_attempt=failed_attempt,
+        output_may_have_started=output_may_have_started,
+    )
+
+
+@pytest.mark.parametrize("metadata_fails", [False, True])
+async def test_headless_uses_server_metadata_before_inference(
+    metadata_fails: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _headless_agent()
+    metadata = ModelMetadata("remote-model", "remote-provider", 12345)
+    agent.aget_model_metadata = AsyncMock(
+        return_value=metadata,
+        side_effect=RuntimeError("Metadata unavailable") if metadata_fails else None,
+    )
+    server = MagicMock()
+    monkeypatch.setattr(
+        "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
+        AsyncMock(return_value=(agent, server, None)),
+    )
+    monkeypatch.setattr(
+        "deepagents_code.config.create_model",
+        Mock(
+            side_effect=AssertionError("Headless client constructed a provider model")
+        ),
+    )
+    monkeypatch.setattr(
+        "deepagents_code.client.non_interactive._resolve_shell_allow_list", lambda: None
+    )
+    monkeypatch.setattr(
+        "deepagents_code.client.non_interactive.generate_thread_id", lambda: "thread"
+    )
+
+    def run_loop(*_args: object, **_kwargs: object) -> None:
+        assert runtime_state.model_name == "remote-model"
+        assert runtime_state.model_provider == "remote-provider"
+        assert runtime_state.model_context_limit == 12345
+
+    run = AsyncMock(side_effect=run_loop)
+    monkeypatch.setattr("deepagents_code.client.non_interactive._run_agent_loop", run)
+    code = await run_non_interactive(message="test", quiet=True, no_mcp=True)
+    assert code == (1 if metadata_fails else 0)
+    assert run.await_count == (0 if metadata_fails else 1)
+    server.stop.assert_called_once()
+
+
+class TestHeadlessResume:
+    """`run_non_interactive(resume=...)` continues an existing thread or exits 1."""
+
+    @pytest.fixture
+    def start_server(self, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+        monkeypatch.setattr(
+            "deepagents_code.client.headless_resume.resume_launch_model",
+            AsyncMock(return_value="openai:thread-model"),
+        )
+        agent = _headless_agent()
+        agent.aensure_thread = AsyncMock()
+        agent.aget_state = AsyncMock(return_value=SimpleNamespace(values={}))
+        agent.aresolve_model = AsyncMock(
+            return_value=ModelMetadata("thread-model", "openai", context_limit=999)
+        )
+        agent.astream = MagicMock(return_value=_async_iter([]))
+        start = AsyncMock(return_value=(agent, MagicMock(), None))
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
+            start,
+        )
+        monkeypatch.setattr(
+            "deepagents_code.client.non_interactive._resolve_shell_allow_list",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            "deepagents_code.client.non_interactive.build_langsmith_thread_url",
+            lambda _thread_id: None,
+        )
+        monkeypatch.setattr("deepagents_code.thread_ownership.ensure_owned", Mock())
+        monkeypatch.setattr(
+            "deepagents_code.sessions.thread_exists", AsyncMock(return_value=True)
+        )
+        return start
+
+    @staticmethod
+    def _target(monkeypatch: pytest.MonkeyPatch, **overrides: object) -> AsyncMock:
+        fields: dict[str, Any] = {
+            "thread_id": "t-1",
+            "agent_name": "coder",
+            "cwd": None,
+            **overrides,
+        }
+        resolve = AsyncMock(return_value=ResumeTarget(**fields))
+        monkeypatch.setattr(
+            "deepagents_code.client.headless_resume.resolve_resume_target", resolve
+        )
+        return resolve
+
+    @staticmethod
+    def _request(
+        *, adopt_agent: bool = True, adopt_model: bool = True
+    ) -> ResumeRequest:
+        return ResumeRequest("t-1", adopt_agent=adopt_agent, adopt_model=adopt_model)
+
+    async def _run(self, **kwargs: Any) -> tuple[int, str, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
+            code = await run_non_interactive(
+                message="next step", quiet=True, no_mcp=True, **kwargs
+            )
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    async def test_missing_thread_exits_before_server_start(
+        self, monkeypatch: pytest.MonkeyPatch, start_server: AsyncMock
+    ) -> None:
+        monkeypatch.setattr(
+            "deepagents_code.client.headless_resume.resolve_resume_target",
+            AsyncMock(side_effect=ResumeError("Thread 't-1' not found.")),
+        )
+
+        code, stdout, stderr = await self._run(resume=self._request())
+
+        assert code == 1
+        assert "Thread 't-1' not found." in stderr
+        assert "Thread: " not in stderr
+        assert stdout == ""
+        start_server.assert_not_awaited()
+
+    async def test_cancelled_startup_command_leaves_thread_unreserved(
         self,
+        monkeypatch: pytest.MonkeyPatch,
+        start_server: AsyncMock,
+        tmp_path: Path,
     ) -> None:
-        """A full no-stream run prints staged tool status ahead of the text."""
-        stdout_buf = io.StringIO()
-        console_output = io.StringIO()
-        console = Console(file=console_output, force_terminal=False, color_system=None)
+        db = tmp_path / "sessions.db"
+        monkeypatch.setattr("deepagents_code.sessions.get_db_path", lambda: db)
+        monkeypatch.setattr(
+            "deepagents_code.thread_ownership.ensure_owned", ensure_owned
+        )
+        monkeypatch.setattr(
+            "deepagents_code.client.non_interactive._run_startup_command",
+            AsyncMock(side_effect=asyncio.CancelledError),
+        )
+        self._target(monkeypatch)
 
-        ai_msg = MagicMock(spec=AIMessage)
-        ai_msg.content_blocks = [
-            {"type": "text", "text": "done"},
-            {
-                "type": "tool_call",
-                "name": "read_file",
-                "id": "call-1",
-                "index": 0,
-                "args": {"path": "a.py"},
-            },
-        ]
+        with pytest.raises(asyncio.CancelledError):
+            await self._run(resume=self._request(), startup_cmd="sleep 60")
 
-        async def staged_stream(  # noqa: RUF029  # replaces the async _stream_agent seam
-            _agent: object,
-            _stream_input: object,
-            _config: object,
-            state: StreamState,
-            stream_console: Console,
-            _file_op_tracker: FileOpTracker,
-            _context: object,
-        ) -> None:
-            tracker = FileOpTracker(assistant_id="assistant")
-            _process_stream_chunk(
-                ((), "custom", _attempt_event("call-1", 0, phase="start")),
-                state,
-                stream_console,
-                tracker,
-            )
-            with patch(
-                "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
-            ):
-                _process_stream_chunk(
-                    ((), "messages", (ai_msg, {})), state, stream_console, tracker
-                )
-            _process_stream_chunk(
-                ((), "custom", _attempt_event("call-1", 0, phase="complete")),
-                state,
-                stream_console,
-                tracker,
-            )
+        assert held_lease("t-1", db_path=db) is None
+        start_server.assert_not_awaited()
 
-        file_op_tracker = MagicMock()
-        file_op_tracker.complete_with_message.return_value = None
+    async def test_resumed_run_releases_its_reservation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        start_server: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        db = tmp_path / "sessions.db"
+        monkeypatch.setattr("deepagents_code.sessions.get_db_path", lambda: db)
+        monkeypatch.setattr(
+            "deepagents_code.thread_ownership.ensure_owned", ensure_owned
+        )
+        self._target(monkeypatch)
+        held_during_run: list[bool] = []
+        start_server.side_effect = lambda **_kwargs: (
+            held_during_run.append(held_lease("t-1", db_path=db) is not None),
+            start_server.return_value,
+        )[1]
 
-        with (
-            patch(
-                "deepagents_code.client.non_interactive._stream_agent",
-                new=staged_stream,
-            ),
-            patch(
-                "deepagents_code.client.non_interactive.dispatch_hook",
-                new_callable=AsyncMock,
-            ),
-            patch.object(sys, "stdout", stdout_buf),
-        ):
-            await _run_agent_loop(
-                MagicMock(),
-                "task",
-                {"configurable": {"thread_id": "t"}},
-                console,
-                file_op_tracker,
-                quiet=False,
-                stream=False,
-            )
+        code, _stdout, _stderr = await self._run(resume=self._request())
 
-        # The completed attempt's status flushed at completion; the buffered
-        # text flushed at end of run on stdout.
-        assert "🔧 Calling tool: read_file" in console_output.getvalue()
-        assert "done" in stdout_buf.getvalue()
+        assert code == 0
+        assert held_during_run == [True]
+        assert held_lease("t-1", db_path=db) is None
+
+    async def test_other_directory_exits_1(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        start_server: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        origin, here = tmp_path / "origin", tmp_path / "here"
+        origin.mkdir()
+        here.mkdir()
+        monkeypatch.chdir(here)
+        self._target(monkeypatch, cwd=str(origin))
+
+        code, _stdout, stderr = await self._run(resume=self._request())
+
+        assert code == 1
+        assert "Run from that directory" in stderr
+        start_server.assert_not_awaited()
+
+    async def test_resumed_turn_continues_thread_with_its_agent_and_model(
+        self, monkeypatch: pytest.MonkeyPatch, start_server: AsyncMock
+    ) -> None:
+        self._target(monkeypatch)
+        agent = start_server.return_value[0]
+        agent.aget_state.return_value = SimpleNamespace(
+            values={
+                "_model_spec": "openai:thread-model",
+                "_model_params": {"temperature": 0},
+                "rubric": "criteria from an earlier run",
+            }
+        )
+        session_start = AsyncMock(
+            return_value=SimpleNamespace(ok=True, stop_reason=None)
+        )
+        monkeypatch.setattr(HooksManager, "on_session_start", session_start)
+
+        code, _stdout, stderr = await self._run(
+            resume=self._request(), profile_override={"max_input_tokens": 10}
+        )
+
+        assert code == 0
+        assert stderr.startswith("Thread: t-1\n")
+        assert start_server.call_args.kwargs["assistant_id"] == "coder"
+        stream_input = agent.astream.call_args.args[0]
+        kwargs = agent.astream.call_args.kwargs
+        assert kwargs["config"]["configurable"]["thread_id"] == "t-1"
+        assert stream_input["rubric"] is None
+        assert kwargs["context"]["model"] == "openai:thread-model"
+        assert kwargs["context"]["model_params"] == {"temperature": 0}
+        assert kwargs["context"]["profile_overrides"] == {"max_input_tokens": 10}
+        assert kwargs["context"]["model_context_limit"] == 999
+        from deepagents_code.hooks.models.domain import SessionStartCause
+
+        assert session_start.call_args.args[0] is SessionStartCause.RESUME
+
+    async def test_explicit_agent_and_model_win(
+        self, monkeypatch: pytest.MonkeyPatch, start_server: AsyncMock
+    ) -> None:
+        self._target(monkeypatch, agent_name="coder")
+        agent = start_server.return_value[0]
+        agent.aget_state.return_value = SimpleNamespace(
+            values={"_model_spec": "openai:thread-model"}
+        )
+
+        code, _stdout, _stderr = await self._run(
+            resume=self._request(adopt_agent=False, adopt_model=False),
+            assistant_id="reviewer",
+        )
+
+        assert code == 0
+        assert start_server.call_args.kwargs["assistant_id"] == "reviewer"
+        agent.aresolve_model.assert_not_awaited()
+        assert "model" not in agent.astream.call_args.kwargs["context"]
+
+    async def test_unrestorable_model_warns_and_uses_launch_model(
+        self, monkeypatch: pytest.MonkeyPatch, start_server: AsyncMock
+    ) -> None:
+        self._target(monkeypatch)
+        agent = start_server.return_value[0]
+        agent.aget_state.return_value = SimpleNamespace(
+            values={"_model_spec": "gone:model"}
+        )
+        agent.aresolve_model.side_effect = RuntimeError("unknown provider")
+
+        code, _stdout, stderr = await self._run(resume=self._request())
+
+        assert code == 0
+        assert "could not restore this thread's model gone:model" in stderr
+        assert "model" not in agent.astream.call_args.kwargs["context"]

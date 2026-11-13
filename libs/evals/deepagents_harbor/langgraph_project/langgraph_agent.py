@@ -19,7 +19,7 @@ from deepagents_code.agent import create_cli_agent
 from deepagents_code.config import detect_provider, runtime_state
 from deepagents_code.model_config import ModelSpec
 from langchain.chat_models import init_chat_model
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain.mcp import MCPAdapter
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -169,6 +169,22 @@ def _build_model(configurable: dict[str, object]) -> BaseChatModel:
         kwargs["use_responses_api"] = True
     _apply_glm_5_2_reasoning_default(name, kwargs)
     return init_chat_model(name, **kwargs)
+
+
+def _skills(configurable: dict[str, object]) -> list[str] | None:
+    """Return the task's skills source, forwarded by `DeepAgentsLangGraph`.
+
+    Raises:
+        ValueError: If `skills_dir` is not an absolute path without `..`.
+    """
+    value = configurable.get("skills_dir")
+    if value is None:
+        return None
+    path = Path(value) if isinstance(value, str) else None
+    if path is None or not path.is_absolute() or ".." in path.parts:
+        msg = "`configurable.skills_dir` must be an absolute path without `..`"
+        raise ValueError(msg)
+    return [path.as_posix()]
 
 
 def _workdir(configurable: dict[str, object]) -> Path:
@@ -422,14 +438,15 @@ def make_bare_graph(config: dict[str, object] | None = None) -> object:
     Args:
         config: LangGraph runtime config. Harbor passes the selected model in
             `configurable.model` and optional provider kwargs in
-            `configurable.model_kwargs`.
+            `configurable.model_kwargs`, plus the task's `skills_dir` when
+            run through `DeepAgentsLangGraph`.
 
     Returns:
         A compiled LangGraph graph invokable by Harbor's LangGraph runner.
 
     Raises:
         TypeError: If configurable values have unexpected types.
-        ValueError: If no model name is provided.
+        ValueError: If no model name is provided or `skills_dir` is invalid.
     """
     configurable = _configurable(config)
     model = _build_model(configurable)
@@ -448,11 +465,12 @@ def make_bare_graph(config: dict[str, object] | None = None) -> object:
         model=model,
         backend=backend,
         tools=[search_tool] if search_tool is not None else None,
+        skills=_skills(configurable),
     )
 
 
 def _mcp_connections(configurable: dict[str, object]) -> dict[str, Any]:
-    """Build langchain-mcp-adapters connections from Harbor-forwarded servers.
+    """Build FastMCP connections from Harbor-forwarded servers.
 
     Harbor's LangGraph agent forwards the task environment's declared MCP servers
     via `configurable["mcp_servers"]` (a list of dicts shaped like Harbor's
@@ -461,7 +479,7 @@ def _mcp_connections(configurable: dict[str, object]) -> dict[str, Any]:
     transports.
 
     `stdio` servers are rejected on purpose: they carry a local `command`/
-    `args` that `MultiServerMCPClient` would execute inside the agent sandbox.
+    `args` that `MCPAdapter` would execute inside the agent sandbox.
     Since the dataset (selectable via the workflow's `dataset_override`) controls
     this config, honoring `stdio` would let an untrusted dataset run arbitrary
     commands in CI. tau3-runtime is a remote `streamable-http` server, so only
@@ -471,7 +489,7 @@ def _mcp_connections(configurable: dict[str, object]) -> dict[str, Any]:
         configurable: The graph's `configurable` mapping.
 
     Returns:
-        A mapping of server name to a langchain-mcp-adapters connection dict.
+        A mapping of server name to a FastMCP connection dict.
 
     Raises:
         ValueError: If no MCP servers were forwarded, a server uses an
@@ -501,9 +519,9 @@ def _mcp_connections(configurable: dict[str, object]) -> dict[str, Any]:
         server = cast("dict[str, Any]", raw)
         name = str(server["name"])
         transport = server.get("transport", "sse")
-        if transport in ("streamable-http", "http"):
-            transport = "streamable_http"
-        if transport not in ("streamable_http", "sse"):
+        if transport in ("streamable-http", "streamable_http"):
+            transport = "http"
+        if transport not in ("http", "sse"):
             msg = (
                 f"MCP server {name!r} uses unsupported transport {transport!r}; the "
                 "tau3 graph only allows remote transports (streamable-http, sse). "
@@ -542,8 +560,10 @@ async def make_tau3_graph(config: dict[str, object] | None = None) -> object:
     """
     configurable = _configurable(config)
     model = _build_model(configurable)
-    client = MultiServerMCPClient(_mcp_connections(configurable))
-    tools = await client.get_tools()
+    tools = []
+    for name, connection in _mcp_connections(configurable).items():
+        adapter = MCPAdapter({"mcpServers": {name: connection}})
+        tools.extend(await adapter.list_tools())
     # No `system_prompt`: the tau3-runtime conversation protocol comes from the
     # MCP tools' server-advertised descriptions, without adding an authored base
     # prompt.

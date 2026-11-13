@@ -34,7 +34,7 @@ INHERIT_SUMMARIZATION_MODEL = "__dcode_inherit_summarization__"
 """Per-run `summarization_model` value meaning "use the main agent model".
 
 An absent (or `None`) `summarization_model` leaves the graph's startup summary
-model in effect. `/summarization-model clear` needs the stronger statement that
+model in effect. `/offload model clear` needs the stronger statement that
 summaries go back to the main agent model, which this sentinel carries across
 the remote JSON boundary without being mistaken for a model spec.
 """
@@ -86,6 +86,8 @@ class CLIContextSchema:
     hooks_server_events: list[str] = field(default_factory=list)
 
     prompt_id: str | None = None
+
+    workspace: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_payload(cls, payload: object) -> CLIContextSchema | None:
@@ -159,6 +161,7 @@ class CLIContextSchema:
             hooks_snapshot_id=_str("hooks_snapshot_id"),
             hooks_server_events=events,
             prompt_id=_str("prompt_id"),
+            workspace=_mapping("workspace"),
         )
 
 
@@ -249,3 +252,6 @@ class CLIContext(TypedDict, total=False):
 
     prompt_id: str | None
     """Optional per-turn prompt id projected into hook context."""
+
+    workspace: dict[str, Any]
+    """Server-validated workspace binding for the active thread."""

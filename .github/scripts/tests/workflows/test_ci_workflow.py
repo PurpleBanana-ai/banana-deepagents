@@ -3,8 +3,8 @@
 Mostly static assertions over workflow YAML. The parts that can silently
 disable a gate are executed instead of grepped: every ripgrep install step
 (`_test.yml`'s soft and strict steps, and `release.yml`'s) has its real `run:`
-body driven through `_run_install_script` against stubbed
-`sudo`/`timeout`/`dpkg`/`rg`/`apt-get` binaries, and the label step that arms
+body driven through `_run_install_script` against stubbed `sudo`/`timeout`/`rg`
+binaries and a stubbed installer script, and the label step that arms
 the strict step's bypass runs against a stubbed `gh` in
 `test_ripgrep_bypass_step_behaviour`.
 """
@@ -12,6 +12,7 @@ the strict step's bypass runs against a stubbed `gh` in
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -39,7 +40,7 @@ RESOLVE_STEP = "🏷️ Resolve ripgrep bypass"
 # the JS predicate in `ripgrep_timeout_comment.yml`, which decides whether the
 # posted comment describes a timeout or a bypass.
 RELEASE_PR_PREDICATES = ("release-please--", "release(")
-APT_INSTALL = "apt-get update && sudo apt-get install -y ripgrep"
+INSTALLER = ".github/scripts/release/install_ripgrep.sh"
 # Shared by the shell producer in `_test.yml` and the JS consumer in
 # `ripgrep_timeout_comment.yml`; nothing else couples the two files.
 ARTIFACT_PREFIX = "ripgrep-timeout-"
@@ -63,17 +64,15 @@ def _find_step(workflow: dict[str, Any], *, job: str, name: str) -> dict[str, An
 
 
 def _assert_install_is_unbounded(run: str) -> None:
-    """No `timeout` may wrap the apt install itself.
+    """No `timeout` may wrap the ripgrep install itself.
 
-    Both strict steps legitimately contain a `timeout` — the bounded
-    `dpkg --configure -a` unwind on the failure path — so the absence of any
-    one literal spelling proves nothing. Everything before `status=$?` is the
-    install; that region must have no `timeout` at all, whatever the duration.
+    Everything before `status=$?` is the install; that region must have no
+    `timeout` at all, whatever the duration.
     """
     install, separator, _ = run.partition("status=$?")
     assert separator, "expected the install to capture its status in `status=$?`"
     assert "timeout" not in install, (
-        f"the apt install is bounded by a timeout:\n{install}"
+        f"the ripgrep install is bounded by a timeout:\n{install}"
     )
 
 
@@ -86,6 +85,7 @@ def _starts_with(value: Any, prefix: str) -> bool:
 _CONTEXT_PATHS = sorted(
     (
         "github.event.pull_request.title",
+        "inputs.working-directory",
         "github.event_name",
         "github.head_ref",
         "runner.os",
@@ -118,11 +118,13 @@ def _context(
     head_ref: str | None = None,
     title: str | None = None,
     runner_os: str = "Linux",
+    working_directory: str = "libs/deepagents",
 ) -> dict[str, Any]:
     return {
         "github.event_name": event_name,
         "github.head_ref": head_ref,
         "github.event.pull_request.title": title,
+        "inputs.working-directory": working_directory,
         "runner.os": runner_os,
     }
 
@@ -168,16 +170,110 @@ SELECTION_CASES = [
         ),
         None,
     ),
+    (
+        "non-SDK package PR",
+        _context(
+            event_name="pull_request",
+            head_ref="mdrxy/ci/soft-timeout-ripgrep",
+            title="fix(code): tighten grep bounds",
+            working_directory="libs/code",
+        ),
+        None,
+    ),
+    (
+        "non-SDK package push",
+        _context(event_name="push", working_directory="libs/code"),
+        None,
+    ),
 ]
 
 
-def test_deepagents_code_collects_coverage_on_python_3_14() -> None:
-    """Keep all supported runtimes while collecting coverage on Python 3.14."""
+@pytest.mark.parametrize("event", ["pull_request", "push"])
+@pytest.mark.parametrize("curated", ["true", "false"])
+@pytest.mark.parametrize("gated", ["LOCKFILES_RESULT", "HYGIENE_RESULT"])
+@pytest.mark.parametrize("result", ["success", "failure", "cancelled", "skipped", ""])
+def test_lockfiles_gate_merges_even_with_inherited_ci(
+    tmp_path: Path, event: str, curated: str, gated: str, result: str
+) -> None:
     workflow = _load_workflow(CI_WORKFLOW)
-    config = workflow["jobs"]["test-code"]["with"]
+    job = workflow["jobs"]["check-lockfiles"]
+    assert "if" not in job
+    assert job["uses"] == "./.github/workflows/check_lockfiles.yml"
+    assert "check-lockfiles" in workflow["jobs"]["ci_success"]["needs"]
+    step = _find_step(workflow, job="ci_success", name="🎉 All Checks Passed")
+    assert step["env"]["LOCKFILES_RESULT"] == "${{ needs.check-lockfiles.result }}"
+    assert step["env"]["HYGIENE_RESULT"] == "${{ needs.text-hygiene.result }}"
+    gate = tmp_path / ".ci-gate-base/.github/scripts/checks/ci_gate.py"
+    gate.parent.mkdir(parents=True)
+    gate.write_text((ROOT / ".github/scripts/checks/ci_gate.py").read_text())
+    completed = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "EVENT_NAME": event,
+            "LOCKFILES_RESULT": "success",
+            "HYGIENE_RESULT": "success",
+            gated: result,
+            "CURATED_APPLY_ONLY": curated,
+            "CURATED_APPLY_PARENT_CONCLUSION": "success",
+            "TALON_CHANGED": "false",
+            "NEEDS": json.dumps({"check-lockfiles": {"result": "success"}}),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # Text hygiene does not run on push, so only there is a skip a pass.
+    passes = result == "success" or (
+        gated == "HYGIENE_RESULT" and event == "push" and result == "skipped"
+    )
+    assert completed.returncode == (0 if passes else 1)
 
-    assert json.loads(config["python-versions"]) == ["3.12", "3.13", "3.14"]
-    assert config["coverage-python-version"] == "3.14"
+
+def test_lockfile_workflow_checks_every_package() -> None:
+    workflow = _load_workflow(WORKFLOWS / "check_lockfiles.yml")
+    assert set(workflow["on"]) == {"workflow_call"}
+    step = _find_step(workflow, job="check-lockfiles", name="🔍 Check all lockfiles")
+    assert step["run"] == "python3 .github/scripts/checks/check_lockfiles_pre_commit.py"
+
+
+@pytest.mark.parametrize("hygiene", [0, 1])
+def test_text_hygiene_job_annotates_and_propagates_failure(
+    tmp_path: Path, hygiene: int
+) -> None:
+    """A hygiene failure fails its own job and annotates each fixed hunk."""
+    workflow = _load_workflow(CI_WORKFLOW)
+    job = workflow["jobs"]["text-hygiene"]
+    assert job["if"] == "github.event_name != 'push'"
+    assert "text-hygiene" in workflow["jobs"]["ci_success"]["needs"]
+    step = _find_step(
+        workflow, job="text-hygiene", name="📝 Run hygiene hooks on changed files"
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = ["git", "-c", "user.email=ci@example.com", "-c", "user.name=ci"]
+    (repo / "notes.md").write_text("one\ntwo\n")
+    subprocess.run([*git, "init", "-q"], cwd=repo, check=True)
+    subprocess.run([*git, "add", "."], cwd=repo, check=True)
+    subprocess.run([*git, "commit", "-qm", "init"], cwd=repo, check=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    make = bin_dir / "make"
+    # Stand in for the fixing hooks: rewrite line two, then report the result.
+    make.write_text(f"#!/bin/sh\nprintf 'one\\nfixed\\n' > notes.md\nexit {hygiene}\n")
+    make.chmod(0o755)
+    completed = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        cwd=repo,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert completed.returncode == hygiene
+    assert ("::error file=notes.md,line=2," in completed.stdout) == bool(hygiene)
 
 
 def test_ci_success_builds_named_results_from_needs_object() -> None:
@@ -200,6 +296,60 @@ def test_ci_success_builds_named_results_from_needs_object() -> None:
     advisory = workflow["jobs"]["talon-failure-advisory"]
     assert sorted(advisory["needs"]) == ["changes", "lint-talon", "test-talon"]
     assert "talon-failure-advisory" not in workflow["jobs"]["ci_success"]["needs"]
+
+
+def test_curated_apply_only_requires_bot_commit_and_green_parent_ci() -> None:
+    workflow = _load_workflow(CI_WORKFLOW)
+    changes = workflow["jobs"]["changes"]
+    step = _find_step(
+        workflow,
+        job="changes",
+        name="📝 Detect a changelog-only curated-notes apply",
+    )
+
+    assert changes["outputs"]["curated-apply-only"] == (
+        "${{ steps.curated-apply.outputs.only || 'false' }}"
+    )
+    cancellation = workflow["concurrency"]["cancel-in-progress"]
+    assert "github.event_name != 'pull_request'" in cancellation
+    assert "github.actor != vars.RELEASE_BOT_LOGIN" in cancellation
+    assert "head.repo.full_name != github.repository" in cancellation
+    assert "!startsWith(github.head_ref" in cancellation
+    assert "github.actor == vars.RELEASE_BOT_LOGIN" in step["if"]
+    assert "head.repo.full_name == github.repository" in step["if"]
+
+    checkout = _find_step(
+        workflow, job="changes", name="📋 Checkout detector from trusted base ref"
+    )
+    assert checkout["with"]["ref"] == "${{ github.base_ref }}"
+    assert checkout["with"]["path"] == ".curated-apply-base"
+    assert checkout["with"]["persist-credentials"] is False
+    assert (
+        ".github/scripts/checks/curated_apply_only.py"
+        in checkout["with"]["sparse-checkout"]
+    )
+    assert "release-please-config.json" in checkout["with"]["sparse-checkout"]
+    assert (
+        ".curated-apply-base/.github/scripts/checks/curated_apply_only.py"
+        in step["run"]
+    )
+    assert '--repo "$GITHUB_WORKSPACE"' in step["run"]
+    assert "--config .curated-apply-base/release-please-config.json" in step["run"]
+    assert "commits/$parent/check-runs" in step["run"]
+    assert "✅ CI Success" in step["run"]
+    assert "success|failure" in step["run"]
+
+    gate = _find_step(workflow, job="ci_success", name="🎉 All Checks Passed")
+    assert gate["env"]["CURATED_APPLY_ONLY"] == (
+        "${{ needs.changes.outputs.curated-apply-only }}"
+    )
+    assert 'if [ "$CURATED_APPLY_ONLY" = true ]' in gate["run"]
+    assert 'if [ "$CURATED_APPLY_PARENT_CONCLUSION" = success ]' in gate["run"]
+
+    helper_job = workflow["jobs"]["check-release-options"]
+    assert helper_job["needs"] == "changes"
+    assert helper_job["if"] == "needs.changes.outputs.curated-apply-only != 'true'"
+    assert workflow["jobs"]["ci_success"]["if"] == "always()"
 
 
 def test_ci_success_runs_gate_script_from_trusted_base_ref() -> None:
@@ -225,7 +375,7 @@ def test_ci_success_runs_gate_script_from_trusted_base_ref() -> None:
 
     step = _find_step(workflow, job="ci_success", name="🎉 All Checks Passed")
     # The base copy is preferred; the PR copy is only a bootstrap fallback.
-    assert '.ci-gate-base' in step["run"]
+    assert ".ci-gate-base" in step["run"]
     assert step["run"].index(".ci-gate-base") < step["run"].index(".ci-gate-pr")
     # No step may execute the helper from the default (untrusted) checkout.
     for s in steps:
@@ -273,7 +423,7 @@ def test_non_release_pr_ripgrep_install_has_two_minute_timeout() -> None:
     # would resolve to an empty string and silently disable the whole warning.
     assert step["id"] == "ripgrep-install"
     # `timeout` must run under `sudo`, or it cannot signal the root-owned
-    # `apt-get` and the bound silently does nothing.
+    # installer and the bound silently does nothing.
     assert "sudo timeout --signal=TERM --kill-after=10s 120s" in step["run"]
     assert "continue-on-error" not in step
     assert "timeout-minutes" not in step
@@ -295,7 +445,7 @@ def test_only_two_ripgrep_install_steps_exist() -> None:
     installs = [
         step
         for step in workflow["jobs"]["build"]["steps"]
-        if "apt-get install -y ripgrep" in str(step.get("run", ""))
+        if INSTALLER in str(step.get("run", ""))
     ]
 
     assert [step["name"] for step in installs] == [STRICT_STEP, SOFT_STEP]
@@ -312,16 +462,16 @@ def _run_install_script(
     *,
     timeout_status: int,
     rg_available: bool = False,
-    apt_status: int | None = None,
+    install_status: int = 0,
     bypass: str = "",
     skip_ripgrep_check: str = "",
 ) -> tuple[subprocess.CompletedProcess[str], list[str], list[str]]:
     """Execute the install step's `run:` body against stubbed binaries.
 
-    The soft step routes apt through `sudo timeout ... bash -c '...apt-get...'`,
-    so `timeout_status` drives its outcome. The strict step calls
-    `sudo apt-get ...` directly, so `apt_status` (when set) stubs `apt-get`
-    itself; `bypass` feeds the step's `BYPASS` env (the resolved PR label).
+    The soft step routes the installer through `sudo timeout ...`, so
+    `timeout_status` drives its outcome. The strict step runs the installer
+    directly, so `install_status` is the stubbed installer's exit status;
+    `bypass` feeds the step's `BYPASS` env (the resolved PR label).
     `release.yml`'s step is the same shape, driven by `SKIP_RIPGREP_CHECK`
     instead; its step-summary writes land in `summary_path`.
     """
@@ -333,15 +483,18 @@ def _run_install_script(
         path.write_text(f"#!/usr/bin/env bash\n{body}\n")
         path.chmod(0o755)
 
-    # `sudo` execs its arguments so the stubbed `timeout`/`dpkg` are reached.
-    # A real `sudo` must never run here: it would hit a password prompt, or
-    # actually touch the developer's package manager.
+    # `sudo` execs its arguments so the stubbed `timeout` is reached. A real
+    # `sudo` must never run here: it would hit a password prompt, or actually
+    # install a binary on the developer's machine.
     stub("sudo", 'exec "$@"')
     stub("timeout", f"exit {timeout_status}")
-    stub("dpkg", "exit 0")
     stub("rg", "exit 0" if rg_available else "exit 127")
-    if apt_status is not None:
-        stub("apt-get", f"exit {apt_status}")
+    # The real installer downloads ripgrep. Stub it at both locations the
+    # steps use: the CI checkout root, and `release.yml`'s `_workflow/` copy.
+    workspace = tmp_path / "workspace"
+    for installer in (workspace / INSTALLER, workspace / "_workflow" / INSTALLER):
+        installer.parent.mkdir(parents=True)
+        installer.write_text(f"exit {install_status}\n")
 
     output = tmp_path / "github-output"
     output.touch()
@@ -364,6 +517,7 @@ def _run_install_script(
             "GITHUB_ENV": str(env_file),
             "GITHUB_OUTPUT": str(output),
             "GITHUB_STEP_SUMMARY": str(summary),
+            "GITHUB_WORKSPACE": str(workspace),
             "MATRIX_OS": "ubuntu-latest",
             "MATRIX_PYTHON": "3.14",
             "PATH": f"{bin_dir}:/usr/bin:/bin",
@@ -382,8 +536,8 @@ def _run_install_script(
         (0, 0, False),
         (42, 42, False),
         (124, 0, True),
-        # `--kill-after` escalates to SIGKILL when apt defers the TERM, which
-        # coreutils reports as 137 rather than 124. Softening only 124 would
+        # `--kill-after` escalates to SIGKILL when the installer ignores the
+        # TERM, which coreutils reports as 137 rather than 124. Softening only 124 would
         # hard-fail on exactly the wedged install this bound exists to absorb.
         (137, 0, True),
     ],
@@ -451,7 +605,7 @@ def test_timeout_with_usable_ripgrep_is_not_reported(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     (
         "bypass",
-        "apt_status",
+        "install_status",
         "rg_available",
         "expected_status",
         "expect_env",
@@ -460,11 +614,11 @@ def test_timeout_with_usable_ripgrep_is_not_reported(tmp_path: Path) -> None:
     ),
     [
         # The overwhelmingly common case, and the one that arms the rg-gated
-        # tests for every release and merge-queue run: apt succeeds, the tests
+        # tests for every release and merge-queue run: the install succeeds, the tests
         # are promised ripgrep, and nothing is reported.
         ("", 0, False, 0, True, False, None),
         ("true", 0, False, 0, True, False, None),
-        # Unlabeled: any apt failure fails the job, ripgrep never promised.
+        # Unlabeled: any install failure fails the job, ripgrep never promised.
         ("", 1, False, 1, False, False, "::error::"),
         ("", 100, False, 100, False, False, "::error::"),
         # An empty `BYPASS` is what `push`/`merge_group` see, because the label
@@ -493,14 +647,14 @@ def test_timeout_with_usable_ripgrep_is_not_reported(tmp_path: Path) -> None:
 def test_strict_ripgrep_install_bypass(
     tmp_path: Path,
     bypass: str,
-    apt_status: int,
+    install_status: int,
     rg_available: bool,
     expected_status: int,
     expect_env: bool,
     expect_artifact: bool,
     expect_annotation: str | None,
 ) -> None:
-    """The strict step fails on apt errors unless the PR carries the bypass label.
+    """The strict step fails on install errors unless the PR carries the bypass label.
 
     Every row asserts the full outcome — exit status, whether ripgrep is
     promised to the tests, whether the leg is reported to the comment workflow,
@@ -512,7 +666,7 @@ def test_strict_ripgrep_install_bypass(
         step["run"],
         tmp_path,
         timeout_status=0,
-        apt_status=apt_status,
+        install_status=install_status,
         rg_available=rg_available,
         bypass=bypass,
     )
@@ -540,10 +694,10 @@ def test_strict_ripgrep_install_bypass(
 def test_ripgrep_bypass_step_runs_only_where_the_strict_step_does() -> None:
     """The label step must not annotate legs that have no strict install.
 
-    Its `if:` is the intersection of `pull_request` and the strict step's own
-    condition. Widen it and every ordinary PR collects a per-leg `::error::`
-    about a check that is not enforced there; narrow it and a release PR
-    silently loses the bypass.
+    Its `if:` is the SDK package's `pull_request` intersection with the strict
+    step's own condition. Widen it and every ordinary PR collects a per-leg
+    `::error::` about a check that is not enforced there; narrow it and a release
+    PR silently loses the bypass.
     """
     workflow = _load_workflow(TEST_WORKFLOW)
     resolve = _find_step(workflow, job="build", name=RESOLVE_STEP)
@@ -551,6 +705,7 @@ def test_ripgrep_bypass_step_runs_only_where_the_strict_step_does() -> None:
 
     condition = " ".join(resolve["if"].split())
     assert condition == (
+        "inputs.working-directory == 'libs/deepagents' && "
         "runner.os == 'Linux' && github.event_name == 'pull_request' && "
         "(startsWith(github.head_ref, 'release-please--') || "
         "startsWith(github.event.pull_request.title, 'release('))"
@@ -565,16 +720,16 @@ def test_ripgrep_bypass_step_runs_only_where_the_strict_step_does() -> None:
 @pytest.mark.parametrize(
     ("labels", "gh_exit", "expected_bypass", "expect_error"),
     [
-        ("bypass-ripgrep-check", 0, "true", False),
+        ("ci:skip-ripgrep", 0, "true", False),
         ("dependencies\nlgtm", 0, "false", False),
         ("", 0, "false", False),
         # Neither a superstring nor a prefixed variant may arm the bypass.
-        ("bypass-ripgrep-check-v2", 0, "false", False),
-        ("no-bypass-ripgrep-check", 0, "false", False),
+        ("ci:skip-ripgrep-v2", 0, "false", False),
+        ("no-ci:skip-ripgrep", 0, "false", False),
         # Fail closed and say so. Stdout carrying the label is deliberately
         # ignored when the call itself failed: a partial read must never arm a
         # bypass, and a silent enforce is indistinguishable from "label absent".
-        ("bypass-ripgrep-check", 1, "false", True),
+        ("ci:skip-ripgrep", 1, "false", True),
     ],
     ids=[
         "label-present",
@@ -635,15 +790,14 @@ def test_ripgrep_bypass_step_behaviour(
 def test_release_and_non_pr_ripgrep_install_is_strict() -> None:
     """Release runs install ripgrep with no soft timeout, and only bypass on a label.
 
-    The install itself is unbounded — the only `timeout` in the step is the
-    dpkg unwind that runs *after* a bypassed failure, never around the install.
-    The bypass is read from the live PR label, and the tests are promised
-    ripgrep only when a usable `rg` is present, whether or not apt said so.
+    The install itself is unbounded. The bypass is read from the live PR
+    label, and the tests are promised ripgrep only when a usable `rg` is
+    present, whether or not the installer said so.
     """
     workflow = _load_workflow(TEST_WORKFLOW)
     step = _find_step(workflow, job="build", name=STRICT_STEP)
 
-    assert APT_INSTALL in step["run"]
+    assert INSTALLER in step["run"]
     assert "continue-on-error" not in step
     assert "timeout-minutes" not in step
     _assert_install_is_unbounded(step["run"])
@@ -653,8 +807,8 @@ def test_release_and_non_pr_ripgrep_install_is_strict() -> None:
     # instead of a silent skip. Asserted on the *success* branch specifically:
     # the step sets it twice, so a bare `in step["run"]` is satisfied by the
     # bypass branch alone and would not notice the success branch losing it.
-    success_branch, separator, _ = step["run"].partition("# apt failed.")
-    assert separator, "expected the success branch to precede the apt-failure comment"
+    success_branch, separator, _ = step["run"].partition("# The install failed.")
+    assert separator, "expected the success branch to precede the failure comment"
     assert EXPECTED_ENV in success_branch
 
 
@@ -666,7 +820,7 @@ def test_release_workflow_requires_ripgrep_before_unit_tests() -> None:
     tests = _find_step(workflow, job="pre-release-checks", name="Run unit tests")
 
     assert steps.index(install) < steps.index(tests)
-    assert APT_INSTALL in install["run"]
+    assert INSTALLER in install["run"]
     _assert_install_is_unbounded(install["run"])
     assert "continue-on-error" not in install
     assert "timeout-minutes" not in install
@@ -684,7 +838,7 @@ def test_release_workflow_requires_ripgrep_before_unit_tests() -> None:
 @pytest.mark.parametrize(
     (
         "skip",
-        "apt_status",
+        "install_status",
         "rg_available",
         "expected_status",
         "expect_env",
@@ -692,10 +846,10 @@ def test_release_workflow_requires_ripgrep_before_unit_tests() -> None:
         "expect_annotation",
     ),
     [
-        # apt succeeds: the artifact tests are held to the real binary.
+        # The install succeeds: the artifact tests are held to the real binary.
         ("false", 0, False, 0, True, False, None),
         ("true", 0, False, 0, True, False, None),
-        # No dispatch flag: an apt failure fails the publish run, exit code kept.
+        # No dispatch flag: an install failure fails the publish run, exit code kept.
         ("false", 1, False, 1, False, False, "::error::"),
         ("false", 100, True, 100, False, False, "::error::"),
         # The input arrives as a string; only an exact "true" may soften.
@@ -722,14 +876,14 @@ def test_release_workflow_requires_ripgrep_before_unit_tests() -> None:
 def test_release_workflow_ripgrep_bypass(
     tmp_path: Path,
     skip: str,
-    apt_status: int,
+    install_status: int,
     rg_available: bool,
     expected_status: int,
     expect_env: bool,
     expect_summary: bool,
     expect_annotation: str | None,
 ) -> None:
-    """`release.yml`'s install tolerates apt only under the dispatch flag.
+    """`release.yml`'s install tolerates failure only under the dispatch flag.
 
     This step publishes to PyPI, so it is executed rather than grepped: a
     static check cannot tell `if [ "$SKIP_RIPGREP_CHECK" = "true" ]` from
@@ -741,7 +895,7 @@ def test_release_workflow_ripgrep_bypass(
         install["run"],
         tmp_path,
         timeout_status=0,
-        apt_status=apt_status,
+        install_status=install_status,
         rg_available=rg_available,
         skip_ripgrep_check=skip,
     )
@@ -802,7 +956,7 @@ def test_ripgrep_timeout_comment_uses_isolated_workflow_run() -> None:
     assert "listWorkflowRunArtifacts" in script
     assert ARTIFACT_PREFIX in script
     assert "listLabelsOnIssue" in script
-    assert "bypass-ripgrep-check" in script
+    assert "ci:skip-ripgrep" in script
     assert "createComment" in script
     assert "updateComment" in script
     assert "deleteComment" in script

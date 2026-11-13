@@ -52,6 +52,7 @@ jobs:
       command: ${{ steps.validate.outputs.command }}
       instructions: ${{ steps.validate.outputs.instructions }}
       number: ${{ steps.validate.outputs.number }}
+      component: ${{ steps.validate.outputs.component }}
       version: ${{ steps.validate.outputs.version }}
       head: ${{ steps.validate.outputs.head }}
       branch: ${{ steps.validate.outputs.branch }}
@@ -80,7 +81,7 @@ jobs:
               botId: process.env.BOT_ID,
             });
             core.setOutput('should-run', String(result.shouldRun === true));
-            for (const key of ['command', 'instructions', 'number', 'version', 'head', 'branch']) {
+            for (const key of ['command', 'instructions', 'number', 'component', 'version', 'head', 'branch']) {
               core.setOutput(key, result[key] ?? '');
             }
 
@@ -110,14 +111,14 @@ jobs:
     needs: validate
     if: needs.validate.outputs.should-run == 'true' && needs.validate.outputs.command == 'draft'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     environment: release-bot
     permissions:
       contents: read
     steps:
       - name: Generate release bot token
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
           client-id: ${{ vars.ORG_MEMBERSHIP_APP_CLIENT_ID }}
           private-key: ${{ secrets.ORG_MEMBERSHIP_APP_PRIVATE_KEY }}
@@ -133,123 +134,120 @@ jobs:
           path: trusted-source
           persist-credentials: false
 
-      - name: Prepare isolated drafting input
-        id: prepare
+      - name: Acknowledge manual command
+        id: acknowledge
+        if: github.event_name == 'issue_comment'
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          BOT_LOGIN: ${{ vars.RELEASE_BOT_LOGIN }}
+          BOT_ID: ${{ vars.RELEASE_BOT_ID }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          script: |
+            const { acknowledgeCommand } = require('./trusted-source/.github/scripts/release/release-notes.js');
+            const reactionId = await acknowledgeCommand({
+              github,
+              ...context.repo,
+              commentId: context.payload.comment.id,
+              appSlug: process.env.APP_SLUG,
+              login: process.env.BOT_LOGIN,
+              id: process.env.BOT_ID,
+            });
+            core.setOutput('reaction-id', reactionId);
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          node-version: "24"
+
+      - name: Draft and post curated notes with bounded head-change retries
+        id: post
+        continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PR_NUMBER: ${{ needs.validate.outputs.number }}
           PR_HEAD: ${{ needs.validate.outputs.head }}
+          RELEASE_COMPONENT: ${{ needs.validate.outputs.component }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
           INSTRUCTIONS: ${{ needs.validate.outputs.instructions }}
-        with:
-          script: |
-            const { prepareDraft } = require('./trusted-source/.github/scripts/release/release-notes.js');
-            try {
-              const result = await prepareDraft({
-                github,
-                ...context.repo,
-                number: Number(process.env.PR_NUMBER),
-                expectedHead: process.env.PR_HEAD,
-                runnerTemp: process.env.RUNNER_TEMP,
-                instructions: process.env.INSTRUCTIONS ?? '',
-              });
-              for (const [key, value] of Object.entries(result)) core.setOutput(key, value);
-            } catch (error) {
-              // Record the reason so the failure-comment step can surface it on the
-              // PR instead of the maintainer having to open the Actions logs.
-              core.setOutput('error', error instanceof Error ? error.message : String(error));
-              throw error;
-            }
-
-      # Pin Node so the drafting helper (which relies on global fetch and
-      # AbortSignal.timeout) doesn't depend on whatever the runner image
-      # preinstalls; matches the version the helper tests run under in ci.yml.
-      - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
-        with:
-          node-version: "24"
-
-      - name: Draft polished release notes without model tools
-        id: draft-model
-        continue-on-error: true
-        env:
-          # The configured model must accept an output-token limit of at least
-          # 32,768; lower-limit models are intentionally unsupported.
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          BOT_LOGIN: ${{ vars.RELEASE_BOT_LOGIN }}
+          BOT_ID: ${{ vars.RELEASE_BOT_ID }}
           MODEL_SPEC: ${{ vars.RELEASE_BOT_MODEL }}
-          # Put only the configured provider's credential in this process. The
-          # deterministic helper sends one request to a fixed provider endpoint;
-          # model output is never interpreted as a tool call or URL.
           MODEL_API_KEY: >-
             ${{ startsWith(vars.RELEASE_BOT_MODEL, 'openai:') && secrets.OPENAI_API_KEY ||
                 startsWith(vars.RELEASE_BOT_MODEL, 'anthropic:') && secrets.ANTHROPIC_API_KEY ||
                 startsWith(vars.RELEASE_BOT_MODEL, 'google_genai:') && secrets.GOOGLE_API_KEY ||
                 '' }}
-          INPUT_FILE: ${{ steps.prepare.outputs.input }}
-          OUTPUT_FILE: ${{ steps.prepare.outputs.output }}
-        # Capture the helper's stderr into a step output so its message reaches
-        # the PR comment. A `run:` step publishes no outputs of its own, and the
-        # failure-comment step can only report what it can read — so without this
-        # every failure here collapses into "the drafting step did not succeed",
-        # and the messages that name RELEASE_BOT_MODEL, the rejected model, and
-        # the remedy stay buried in the Actions log. The steps either side of this
-        # one already do the same thing via core.setOutput.
-        #
-        # Safe to publish: the helper never interpolates MODEL_API_KEY into an
-        # error (the key is sent only in request headers), and a provider error
-        # body is truncated before it is thrown.
-        run: |
-          if err="$(node ./trusted-source/.github/scripts/release/draft-release-notes.js 2>&1 >/dev/null)"; then
-            exit 0
-          fi
-          # Random delimiter: the message embeds a provider-supplied error body,
-          # so a fixed one could be closed early by the content itself.
-          delimiter="EOF_$(openssl rand -hex 16)"
-          {
-            printf 'error<<%s\n' "$delimiter"
-            printf '%s\n' "$err"
-            printf '%s\n' "$delimiter"
-          } >> "$GITHUB_OUTPUT"
-          # Also annotate, so the reason is visible in the run summary without
-          # expanding this step. Folded to one line: ::error:: takes no newlines.
-          printf '::error::%s\n' "$(printf '%s' "$err" | tr '\n' ' ')"
-          exit 1
-
-      - name: Post bot-authored curated draft
-        id: post
-        if: steps.draft-model.outcome == 'success'
-        continue-on-error: true
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          DRAFT_STATE: ${{ steps.prepare.outputs.state }}
-          DRAFT_OUTPUT: ${{ steps.prepare.outputs.output }}
-          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-          BOT_LOGIN: ${{ vars.RELEASE_BOT_LOGIN }}
-          BOT_ID: ${{ vars.RELEASE_BOT_ID }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
-            const { postDraft } = require('./trusted-source/.github/scripts/release/release-notes.js');
+            const { execFileSync } = require('node:child_process');
+            const { draftWithRetries } = require('./trusted-source/.github/scripts/release/release-notes.js');
             try {
-              await postDraft({
+              await draftWithRetries({
                 github,
                 ...context.repo,
-                stateFile: process.env.DRAFT_STATE,
-                outputFile: process.env.DRAFT_OUTPUT,
+                number: Number(process.env.PR_NUMBER),
+                expectedHead: process.env.PR_HEAD,
+                component: process.env.RELEASE_COMPONENT,
+                version: process.env.RELEASE_VERSION,
+                runnerTemp: process.env.RUNNER_TEMP,
+                instructions: process.env.INSTRUCTIONS ?? '',
                 appSlug: process.env.APP_SLUG,
                 login: process.env.BOT_LOGIN,
                 id: process.env.BOT_ID,
                 core,
+                draft: ({ input, output }) => {
+                  try {
+                    execFileSync(process.execPath, ['./trusted-source/.github/scripts/release/draft-release-notes.js'], {
+                      env: {
+                        MODEL_SPEC: process.env.MODEL_SPEC,
+                        MODEL_API_KEY: process.env.MODEL_API_KEY,
+                        INPUT_FILE: input,
+                        OUTPUT_FILE: output,
+                      },
+                      stdio: ['ignore', 'ignore', 'pipe'],
+                    });
+                  } catch (error) {
+                    throw new Error(error.stderr?.toString().trim() || 'Release-note drafting process failed');
+                  }
+                },
               });
             } catch (error) {
               core.setOutput('error', error instanceof Error ? error.message : String(error));
               throw error;
             }
 
-      # Runs for any non-success in prepare/agent/post, including a hard failure in
-      # `prepare` (which would otherwise skip a plain `success()`-gated step and
-      # leave the maintainer with no PR feedback). `!cancelled()` keeps it firing
-      # after an earlier step failed the job.
+      - name: Mark manual command complete
+        if: ${{ github.event_name == 'issue_comment' && steps.acknowledge.outcome == 'success' && steps.post.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          BOT_LOGIN: ${{ vars.RELEASE_BOT_LOGIN }}
+          BOT_ID: ${{ vars.RELEASE_BOT_ID }}
+          REACTION_ID: ${{ steps.acknowledge.outputs.reaction-id }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          script: |
+            const { completeCommand } = require('./trusted-source/.github/scripts/release/release-notes.js');
+            await completeCommand({
+              github,
+              ...context.repo,
+              commentId: context.payload.comment.id,
+              reactionId: Number(process.env.REACTION_ID),
+              appSlug: process.env.APP_SLUG,
+              login: process.env.BOT_LOGIN,
+              id: process.env.BOT_ID,
+            });
+
       - name: Comment on drafting failure
-        if: ${{ !cancelled() && (steps.prepare.outcome != 'success' || steps.draft-model.outcome != 'success' || steps.post.outcome != 'success') }}
+        if: ${{ !cancelled() && steps.post.outcome != 'success' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PR_NUMBER: ${{ needs.validate.outputs.number }}
@@ -257,25 +255,16 @@ jobs:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           BOT_LOGIN: ${{ vars.RELEASE_BOT_LOGIN }}
           BOT_ID: ${{ vars.RELEASE_BOT_ID }}
-          PREPARE_ERROR: ${{ steps.prepare.outputs.error }}
-          DRAFT_ERROR: ${{ steps.draft-model.outputs.error }}
           POST_ERROR: ${{ steps.post.outputs.error }}
-          DRAFT_OUTCOME: ${{ steps.draft-model.outcome }}
           CHECKOUT_TRUSTED_OUTCOME: ${{ steps.checkout-trusted.outcome }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const number = Number(process.env.PR_NUMBER);
-            // Causal order: prepare runs first, so its failure means drafting
-            // never ran; drafting's failure means posting never ran. Report the
-            // earliest step that actually failed, and fall back to the outcome
-            // only when no step captured a reason.
-            const details = process.env.PREPARE_ERROR
-              || process.env.DRAFT_ERROR
-              || process.env.POST_ERROR
+            const details = process.env.POST_ERROR
               || (process.env.CHECKOUT_TRUSTED_OUTCOME !== 'success'
                 ? 'Checking out the trusted automation failed; see the workflow logs.'
-                : `The drafting step did not succeed (outcome: ${process.env.DRAFT_OUTCOME || 'skipped'}); see the workflow logs.`);
+                : 'The drafting step did not succeed; see the workflow logs.');
             try {
               const { postDraftFailure } = require('./trusted-source/.github/scripts/release/release-notes.js');
               await postDraftFailure({
@@ -303,7 +292,7 @@ jobs:
             }
 
       - name: Fail when drafting or comment publication failed
-        if: ${{ !cancelled() && (steps.prepare.outcome != 'success' || steps.draft-model.outcome != 'success' || steps.post.outcome != 'success') }}
+        if: ${{ !cancelled() && steps.post.outcome != 'success' }}
         run: |
           echo "::error::Curated release-note drafting failed; see the PR comment and earlier step logs."
           exit 1
@@ -316,11 +305,16 @@ jobs:
     timeout-minutes: 10
     environment: release-bot
     permissions:
+      actions: write
       contents: read
+
+    # Applying moves the release PR head with a GitHub App token, which emits no
+    # pull_request event. Dispatch the required check explicitly so the new head
+    # never depends on a later comment event to acquire its merge gate.
     steps:
       - name: Generate release bot token
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
           client-id: ${{ vars.ORG_MEMBERSHIP_APP_CLIENT_ID }}
           private-key: ${{ secrets.ORG_MEMBERSHIP_APP_PRIVATE_KEY }}
@@ -329,11 +323,36 @@ jobs:
           permission-pull-requests: write
 
       - name: Checkout trusted automation
+        id: checkout-trusted
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           path: trusted-source
           persist-credentials: false
+
+      - name: Acknowledge manual command
+        id: acknowledge
+        if: github.event_name == 'issue_comment'
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          BOT_LOGIN: ${{ vars.RELEASE_BOT_LOGIN }}
+          BOT_ID: ${{ vars.RELEASE_BOT_ID }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          script: |
+            const { acknowledgeCommand } = require('./trusted-source/.github/scripts/release/release-notes.js');
+            const reactionId = await acknowledgeCommand({
+              github,
+              ...context.repo,
+              commentId: context.payload.comment.id,
+              appSlug: process.env.APP_SLUG,
+              login: process.env.BOT_LOGIN,
+              id: process.env.BOT_ID,
+            });
+            core.setOutput('reaction-id', reactionId);
 
       - name: Validate override and prepare changelog/body edits
         id: prepare-apply
@@ -428,11 +447,55 @@ jobs:
               throw error;
             }
 
-      # The apply steps have no continue-on-error, so any failure reds the job;
-      # this mirrors the draft job's failure comment so a maintainer who ran
-      # `apply` sees the reason on the PR instead of only a red Actions run.
+      - name: Refresh required check on the applied head
+        id: refresh-check
+        if: ${{ steps.publish.outcome == 'success' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ needs.validate.outputs.number }}
+        with:
+          script: |
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                ...context.repo,
+                workflow_id: 'release_notes_check.yml',
+                ref: 'main',
+                inputs: { pr_number: process.env.PR_NUMBER },
+              });
+            } catch (error) {
+              core.setOutput('error', error instanceof Error ? error.message : String(error));
+              throw error;
+            }
+
+      - name: Mark manual command complete
+        if: ${{ github.event_name == 'issue_comment' && steps.acknowledge.outcome == 'success' && steps.refresh-check.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          BOT_LOGIN: ${{ vars.RELEASE_BOT_LOGIN }}
+          BOT_ID: ${{ vars.RELEASE_BOT_ID }}
+          REACTION_ID: ${{ steps.acknowledge.outputs.reaction-id }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          script: |
+            const { completeCommand } = require('./trusted-source/.github/scripts/release/release-notes.js');
+            await completeCommand({
+              github,
+              ...context.repo,
+              commentId: context.payload.comment.id,
+              reactionId: Number(process.env.REACTION_ID),
+              appSlug: process.env.APP_SLUG,
+              login: process.env.BOT_LOGIN,
+              id: process.env.BOT_ID,
+            });
+
+      # Only an apply-operation failure should publish this notice. Reaction
+      # updates are best-effort and must not turn a successful apply into a
+      # misleading apply-failure comment.
       - name: Comment on apply failure
-        if: failure()
+        if: ${{ !cancelled() && (steps.prepare-apply.outcome != 'success' || steps.commit.outcome != 'success' || steps.publish.outcome != 'success' || steps.refresh-check.outcome != 'success') }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PR_NUMBER: ${{ needs.validate.outputs.number }}
@@ -443,6 +506,7 @@ jobs:
           PREPARE_ERROR: ${{ steps.prepare-apply.outputs.error }}
           COMMIT_ERROR: ${{ steps.commit.outputs.error }}
           PUBLISH_ERROR: ${{ steps.publish.outputs.error }}
+          REFRESH_ERROR: ${{ steps.refresh-check.outputs.error }}
           COMMIT_OUTCOME: ${{ steps.commit.outcome }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
@@ -453,6 +517,7 @@ jobs:
             const details = process.env.PREPARE_ERROR
               || process.env.COMMIT_ERROR
               || process.env.PUBLISH_ERROR
+              || process.env.REFRESH_ERROR
               || `commit=${process.env.COMMIT_OUTCOME || 'skipped'}; see the workflow logs.`;
             try {
               const { postApplyFailure } = require('./trusted-source/.github/scripts/release/release-notes.js');

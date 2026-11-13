@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import logging
 import re
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from time import time
+from time import monotonic, time
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, cast
 
 from textual import on
@@ -57,6 +58,7 @@ from deepagents_code.tool_display import (
     EXECUTE_HEADER_MAX_LENGTH,
     JS_EVAL_HEADER_MAX_LENGTH,
     format_tool_display,
+    is_skill_read,
 )
 from deepagents_code.tui.widgets._js_eval_display import (
     JsEvalBlock,
@@ -70,11 +72,13 @@ from deepagents_code.tui.widgets._links import (
     open_checked_url_async,
     open_style_link,
 )
+from deepagents_code.tui.widgets._static_update import update_in_place
 from deepagents_code.tui.widgets.diff import (
     compose_diff_lines,
     format_diff_stats,
     highlight_source_prefixes,
 )
+from deepagents_code.tui.widgets.final_markdown import FinalMarkdown
 from deepagents_code.unicode_security import render_with_unicode_markers
 
 if TYPE_CHECKING:
@@ -321,6 +325,23 @@ separator is exactly two spaces (current format) or a single tab (legacy
 source indentation — including leading tabs — after the gutter stays put. Kept in
 sync with the separator emitted by deepagents' `format_content_with_line_numbers`
 (the authoritative producer). See `ToolCallMessage._compact_line_gutter`.
+"""
+
+
+_MAX_READ_NOTICE_LINES = 2
+"""Most explanation lines `read_file` can place above its status header.
+
+A truncation disclosure and an offset-clamp disclosure, one line each. Bounding
+the search keeps a matching line further down in the source from being read as
+the header.
+"""
+
+
+_READ_STATUS_HEADER_RE = re.compile(r"^@@ lines (\d+)-(\d+)(?: of \d+)?(?: \| .*)? @@$")
+"""Match the status header line of a `read_file` result, capturing its range.
+
+Fields after the range vary (resume offset, truncation disclosures), so only
+the range is captured; the rest is display-only.
 """
 
 
@@ -933,7 +954,8 @@ class UserMessage(Static):
         else:
             amount = f"+{collapsed.hidden_chars:,} characters"
         return Content.styled(
-            f"{ellipsis} {amount} · click or Ctrl+O to show full message",
+            f"{ellipsis} {amount} {get_glyphs().separator} "
+            "click or Ctrl+O to show full message",
             cls._hint_style(),
         )
 
@@ -1088,7 +1110,9 @@ class QueuedUserMessage(Static):
         colors = theme.get_theme_colors(self)
         prefix, content = self._prefix_and_body()
         content = _truncate_for_display(content)
-        return Content.assemble(prefix, (content, colors.muted))
+        return _UserMessageContent.from_content(
+            Content.assemble(prefix, (content, colors.muted))
+        )
 
     def on_mouse_move(self, event: MouseMove) -> None:
         """Match the pointer shape to the cell under the mouse."""
@@ -1323,6 +1347,33 @@ class SkillMessage(Vertical):
             self._md_widget.update(body)
         self._md_rendered = True
 
+    def set_instructions(self, description: str, body: str) -> None:
+        """Show instructions that arrive after the row mounts.
+
+        The agent server reads the skill, so a live invocation learns its
+        description and body only when the pinned message streams back.
+
+        Args:
+            description: Short description of the skill.
+            body: `SKILL.md` body.
+        """
+        self._description = description
+        self._body = body
+        self._stripped_body = _strip_frontmatter(body)
+        if not self.is_mounted:
+            # `compose` and `on_mount` render the updated fields.
+            return
+        if description:
+            self.mount(
+                _SkillToggle(
+                    Content.styled(description, "dim"),
+                    classes="skill-description",
+                ),
+                after=self.query_one(".skill-header"),
+            )
+        if stripped := self._stripped_body.strip():
+            self._prepare_body(stripped)
+
     def toggle_body(self) -> None:
         """Toggle between preview and full body display."""
         if not self._stripped_body.strip():
@@ -1418,14 +1469,15 @@ class _StreamedTextParts:
 class AssistantMessage(_StreamedTextParts, Vertical):
     """Widget displaying an assistant message with markdown support.
 
-    Uses MarkdownStream for smoother streaming instead of re-rendering
-    the full content on each update. Once a stream finishes, the message
-    is re-rendered from the complete source via `Markdown.update()` to
-    work around Textualize/textual#6518: `MarkdownFence._update_from_block`
-    refreshes the visible `Label` but leaves `_highlighted_code` pinned to
-    the first chunk, so any later recompose (click, focus change, theme
-    update) re-yields the stale value and wrapped fenced-code bodies vanish.
-    A full re-parse rebuilds every fence with correct internal state.
+    A finished message renders through `FinalMarkdown`, one widget for the
+    whole reply. Textual's `Markdown` mounts a widget per block, list item,
+    and table cell, which made every relayout of a long transcript walk
+    thousands of widgets.
+
+    A streaming message mounts a `Markdown` on its first fragment and feeds
+    it through a `MarkdownStream`. `stop_stream` and `set_content` swap it
+    for a `FinalMarkdown` of the complete source in one batched update. The
+    two lay out alike (fences fold in both), so the swap keeps the height.
 
     The first streamed fragment is written immediately so the response appears
     without waiting for `_STREAM_FLUSH_INTERVAL`. Later tokens are coalesced in
@@ -1433,7 +1485,16 @@ class AssistantMessage(_StreamedTextParts, Vertical):
     Writing every token immediately forced a markdown re-parse per chunk on the
     UI event loop, which starved keyboard input while the model streamed;
     batching subsequent writes keeps typing responsive.
+
+    Each flush re-parses the last top-level block, so a long list or code fence
+    costs more per flush as it grows. The timer waits twice the last render
+    time before the next flush (bounded by `_STREAM_FLUSH_MAX_INTERVAL`), so
+    the event loop stays at least half free for input however slow rendering
+    gets.
     """
+
+    _STREAM_FLUSH_MAX_INTERVAL: ClassVar[float] = 1.0
+    """Upper bound in seconds on the render-cost-scaled flush interval."""
 
     DEFAULT_CSS = """
     AssistantMessage {
@@ -1448,9 +1509,22 @@ class AssistantMessage(_StreamedTextParts, Vertical):
     }
 
     /* Markdown blocks carry a bottom margin for inter-block spacing; drop it
-       on the final block so the message has no trailing blank row. */
-    AssistantMessage Markdown > *:last-child {
+       on the final block so the message has no trailing blank row.
+       `FinalMarkdown` drops the same margin. */
+    AssistantMessage Markdown > MarkdownBlock:last-child {
         margin-bottom: 0;
+    }
+
+    /* Fold long code lines instead of cropping them, as `FinalMarkdown`
+       does, so a fence keeps its height when the stream finishes. */
+    AssistantMessage MarkdownFence {
+        overflow-x: hidden;
+    }
+
+    AssistantMessage MarkdownFence > Label {
+        width: 1fr;
+        text-wrap: nowrap;
+        text-overflow: fold;
     }
     """
 
@@ -1471,24 +1545,20 @@ class AssistantMessage(_StreamedTextParts, Vertical):
         super().__init__(content, **kwargs)
         self._local_only = local_only
         self._markdown: Markdown | None = None
+        self._final: FinalMarkdown | None = None
         self._stream: MarkdownStream | None = None
         self._pending_append = ""
 
-    def compose(self) -> ComposeResult:  # noqa: PLR6301  # Textual widget method convention
-        """Compose the assistant message layout.
+    def compose(self) -> ComposeResult:
+        """Compose the finished reply, if the content is already complete.
 
         Yields:
-            Markdown widget for rendering assistant content.
+            A `FinalMarkdown` for initial content; nothing for a message that
+                will stream.
         """
-        from textual.widgets import Markdown
-
-        yield Markdown("", id="assistant-content", open_links=False)
-
-    def on_mount(self) -> None:
-        """Store reference to markdown widget."""
-        from textual.widgets import Markdown
-
-        self._markdown = self.query_one("#assistant-content", Markdown)
+        if self._content and self._final is None:
+            self._final = FinalMarkdown(self._content, id="assistant-content")
+            yield self._final
 
     def on_mouse_move(self, event: MouseMove) -> None:
         """Match the pointer shape to the cell under the mouse."""
@@ -1499,12 +1569,12 @@ class AssistantMessage(_StreamedTextParts, Vertical):
         self.styles.pointer = "default"
 
     async def on_markdown_link_clicked(self, event: Markdown.LinkClicked) -> None:
-        """Open Markdown links with the same toast feedback as style links."""
+        """Open streamed Markdown links with the same toast as style links."""
         event.stop()
         await open_checked_url_async(event.href, app=self.app, notify_on_success=True)
 
-    def _get_markdown(self) -> Markdown:
-        """Get the markdown widget, querying if not cached.
+    async def _ensure_markdown(self) -> Markdown:
+        """Return the streaming `Markdown`, mounting it on first use.
 
         Returns:
             The Markdown widget for this message.
@@ -1512,10 +1582,12 @@ class AssistantMessage(_StreamedTextParts, Vertical):
         if self._markdown is None:
             from textual.widgets import Markdown
 
-            self._markdown = self.query_one("#assistant-content", Markdown)
+            markdown = Markdown(id="assistant-content", open_links=False)
+            await self.mount(markdown)
+            self._markdown = markdown
         return self._markdown
 
-    def _ensure_stream(self) -> MarkdownStream:
+    async def _ensure_stream(self) -> MarkdownStream:
         """Ensure the markdown stream is initialized.
 
         Returns:
@@ -1524,15 +1596,16 @@ class AssistantMessage(_StreamedTextParts, Vertical):
         if self._stream is None:
             from textual.widgets import Markdown
 
-            self._stream = Markdown.get_stream(self._get_markdown())
+            self._stream = Markdown.get_stream(await self._ensure_markdown())
         return self._stream
 
     async def append_content(self, text: str) -> None:
         """Append streamed content, then coalesce later writes on a timer.
 
         The first fragment is written immediately. Later fragments are buffered
-        and written at most once per `_STREAM_FLUSH_INTERVAL` so the UI event
-        loop stays free to process keypresses while the model streams.
+        and written on a timer that waits at least `_STREAM_FLUSH_INTERVAL`,
+        and longer when rendering is slow, so the UI event loop stays free to
+        process keypresses while the model streams.
 
         Args:
             text: Text to append
@@ -1540,12 +1613,51 @@ class AssistantMessage(_StreamedTextParts, Vertical):
         if not text:
             return
         self._content_parts.append(text)
-        self._pending_append += text
+        if self._final is not None:
+            # Text after the reply finished: stream the whole source again.
+            await self._final.remove()
+            self._final = None
+            self._pending_append = self._content
+        else:
+            self._pending_append += text
         if self._flush_timer is None:
             await self._flush_pending_append()
-            self._flush_timer = self.set_interval(
-                self._STREAM_FLUSH_INTERVAL, self._flush_pending_append
-            )
+            self._schedule_flush(self._STREAM_FLUSH_INTERVAL)
+
+    def _schedule_flush(self, delay: float) -> None:
+        """Arm a one-shot timer for the next coalesced flush.
+
+        Args:
+            delay: Seconds to wait before the flush.
+        """
+        self._flush_timer = self.set_timer(delay, self._on_flush_timer)
+
+    async def _on_flush_timer(self) -> None:
+        """Flush buffered text, then re-arm the timer scaled to render cost.
+
+        The next delay is twice the time the markdown took to render this
+        flush, so the event loop spends at most half its time on streamed
+        markdown. `stop_stream` cancels this timer and flushes at once, so a
+        long delay never holds back the end of the message.
+        """
+        start = monotonic()
+        if self._pending_append:
+            await self._flush_pending_append()
+            await self._wait_for_render()
+        delay = max(self._STREAM_FLUSH_INTERVAL, 2 * (monotonic() - start))
+        self._schedule_flush(min(delay, self._STREAM_FLUSH_MAX_INTERVAL))
+
+    async def _wait_for_render(self) -> None:
+        """Wait until the markdown widget finishes the append in progress.
+
+        `MarkdownStream.write` only queues text; the stream's task renders it
+        under `Markdown.lock`. One loop pass lets that task take the lock, so
+        acquiring it here returns once the render is done.
+        """
+        await asyncio.sleep(0)
+        if self._markdown is not None:
+            async with self._markdown.lock:
+                pass
 
     async def _flush_pending_append(self) -> None:
         """Write any buffered streamed text to the markdown stream.
@@ -1561,44 +1673,70 @@ class AssistantMessage(_StreamedTextParts, Vertical):
         pending = self._pending_append
         self._pending_append = ""
         try:
-            stream = self._ensure_stream()
+            stream = await self._ensure_stream()
             await stream.write(pending)
         except Exception:  # a render hiccup must not crash the app
             self._pending_append = pending + self._pending_append
             logger.exception("Failed to flush streamed markdown fragment")
 
     async def write_initial_content(self) -> None:
-        """Write initial content if provided at construction time."""
-        if self._content:
-            await self._get_markdown().update(self._content)
+        """Show the initial content if `compose` has not already done so."""
+        if self._content and self._final is None and self._markdown is None:
+            await self._show_final()
 
     async def stop_stream(self) -> None:
-        """Stop the streaming and finalize the content."""
+        """Stop the streaming and show the finished reply as one widget.
+
+        Swaps the streamed `Markdown` for a `FinalMarkdown` of the full
+        source, which also repairs blocks the stream split or froze early
+        (a list cut at a flush boundary, links whose reference definition
+        arrived later).
+        """
         self._stop_flush_timer()
         await self._flush_pending_append()
-        if self._stream is not None:
-            await self._stream.stop()
-            self._stream = None
-            await self._get_markdown().update(self._content)
+        await self._stop_markdown_stream()
+        if self._markdown is not None:
+            await self._show_final()
 
     async def set_content(self, content: str) -> None:
         """Set the full message content.
 
-        Cancels any active stream and renders the new content with a
-        single `Markdown.update()` (avoiding a redundant intermediate
-        update of the in-flight content).
+        Cancels any active stream and renders the new content as one
+        `FinalMarkdown`.
 
         Args:
             content: The markdown content to display
         """
         self._stop_flush_timer()
         self._pending_append = ""
+        await self._stop_markdown_stream()
+        self._content = content
+        await self._show_final()
+
+    async def _stop_markdown_stream(self) -> None:
         if self._stream is not None:
             await self._stream.stop()
             self._stream = None
-        self._content = content
-        if self._markdown:
-            await self._markdown.update(content)
+
+    async def _show_final(self) -> None:
+        """Replace the streaming `Markdown` with a `FinalMarkdown` of `_content`.
+
+        Both changes land in one batched update, so no frame shows the
+        message without content and the transcript does not scroll. A
+        message that is not in the DOM keeps only `_content`; `compose`
+        renders it on mount.
+        """
+        if self._final is not None:
+            self._final.update(self._content)
+            return
+        if not self.is_attached:
+            return
+        markdown, self._markdown = self._markdown, None
+        self._final = FinalMarkdown(self._content, id="assistant-content")
+        with self.app.batch_update():
+            if markdown is not None:
+                await markdown.remove()
+            await self.mount(self._final)
 
 
 class _ReasoningToggle(Static):
@@ -1827,6 +1965,10 @@ class ToolCallMessage(Vertical):
         text-style: bold;
     }
 
+    ToolCallMessage.-skill-read .tool-header {
+        color: $skill;
+    }
+
     ToolCallMessage .tool-task-desc {
         color: $text-muted;
         margin-left: 3;
@@ -1968,6 +2110,7 @@ class ToolCallMessage(Vertical):
         super().__init__(**kwargs)
         self._tool_name = tool_name
         self._args = args or {}
+        self.set_class(is_skill_read(tool_name, self._args), "-skill-read")
         self._status: _ToolStatus = "pending"  # Waiting for approval or auto-approve
         self._output: str = ""
         self._expanded: bool = False
@@ -2187,8 +2330,13 @@ class ToolCallMessage(Vertical):
                 if self._status_widget:
                     self._status_widget.add_class("pending")
                     frame = get_glyphs().spinner_frames[0]
+                    color = (
+                        colors.skill
+                        if self.has_class("-skill-read")
+                        else colors.warning
+                    )
                     self._status_widget.update(
-                        Content.styled(f"{frame} Running...", colors.warning)
+                        Content.styled(f"{frame} Running...", color)
                     )
                     self._status_widget.display = True
             case _:
@@ -2216,6 +2364,11 @@ class ToolCallMessage(Vertical):
         """Update the running spinner animation."""
         if self._status != "running" or self._status_widget is None:
             return
+        if not self.display:
+            # Folded into a collapsed tool group. The group shows its own
+            # spinner; expanding the group relayouts, and the next tick
+            # repaints this row.
+            return
 
         spinner_frames = get_glyphs().spinner_frames
         frame = spinner_frames[self._spinner_position]
@@ -2228,9 +2381,9 @@ class ToolCallMessage(Vertical):
                 elapsed = f" ({format_duration(elapsed_secs)})"
 
         text = f"{frame} Running...{elapsed}"
-        self._status_widget.update(
-            Content.styled(text, theme.get_theme_colors(self).warning)
-        )
+        colors = theme.get_theme_colors(self)
+        color = colors.skill if self.has_class("-skill-read") else colors.warning
+        update_in_place(self._status_widget, Content.styled(text, color))
 
     def pause_running(self) -> None:
         """Pause the running spinner while the tool awaits a user decision.
@@ -3079,12 +3232,12 @@ class ToolCallMessage(Vertical):
         if list_match:
             try:
                 return ast.literal_eval("[" + list_match.group(1) + "]")
-            except (ValueError, SyntaxError):
+            except ValueError, SyntaxError:
                 return None
         try:
             items = ast.literal_eval(output)
             return items if isinstance(items, list) else None
-        except (ValueError, SyntaxError):
+        except ValueError, SyntaxError:
             return None
 
     def _build_todo_stats(self, items: list) -> Content:
@@ -3250,7 +3403,7 @@ class ToolCallMessage(Vertical):
                 return FormattedOutput(
                     content=Content("\n").join(lines), truncation=truncation
                 )
-        except (ValueError, SyntaxError):
+        except ValueError, SyntaxError:
             pass
 
         # Fallback: plain text
@@ -3278,6 +3431,15 @@ class ToolCallMessage(Vertical):
             The output with compacted gutters, or the original string if no
                 line-numbered content was found.
         """
+        # Only a real status header takes this path; anything else — including
+        # legacy gutter output whose source happens to contain a header-shaped
+        # line — falls through to the gutter compaction below.
+        rendered = ToolCallMessage._render_read_status_header(output)
+        if rendered is not None:
+            # Comment out this line to display the raw status header instead.
+            output = rendered
+            return output  # noqa: RET504  # Assignment kept so the line above toggles
+
         lines = output.split("\n")
         parsed: list[tuple[str, str] | None] = []
         width = 0
@@ -3301,6 +3463,40 @@ class ToolCallMessage(Vertical):
                 marker, source = row
                 compacted.append(f"{marker:>{width}}  {source}")
         return "\n".join(compacted)
+
+    @staticmethod
+    def _render_read_status_header(output: str) -> str | None:
+        r"""Re-derive a display line gutter from a `read_file` status header.
+
+        `read_file` states the line numbers once, in a header above verbatim
+        source, rather than on every row. The header is protocol scaffolding for
+        the model, so the TUI drops it and restores the gutter the rest of the
+        file output uses -- a right-justified marker, two spaces, then the source
+        line, indentation untouched.
+
+        Every line after the header is file content, so all of them are
+        numbered. A truncation explanation may precede the header, and is
+        passed through unnumbered.
+
+        Returns:
+            The rendered gutter, or `None` when line 1 is not a status header.
+        """
+        lines = output.split("\n")
+        for index, line in enumerate(lines[: _MAX_READ_NOTICE_LINES + 1]):
+            header = _READ_STATUS_HEADER_RE.match(line)
+            if header is not None:
+                notices, source = lines[:index], lines[index + 1 :]
+                break
+        else:
+            return None
+
+        start_line = int(header.group(1))
+        width = len(str(start_line + len(source) - 1)) if source else 0
+        numbered = [
+            f"{start_line + offset:>{width}}  {line}"
+            for offset, line in enumerate(source)
+        ]
+        return "\n".join([*notices, *numbered])
 
     def _format_edit_file_output(
         self, output: str, *, is_preview: bool = False
@@ -3446,7 +3642,7 @@ class ToolCallMessage(Vertical):
         # bug in `_format_search_lines` can't silently reroute to the fallback.
         try:
             items = ast.literal_eval(output.strip())
-        except (ValueError, SyntaxError):
+        except ValueError, SyntaxError:
             items = None
 
         if isinstance(items, list):
@@ -3708,7 +3904,7 @@ class ToolCallMessage(Vertical):
             if output.strip().startswith("{"):
                 return json.loads(output)
             return ast.literal_eval(output)
-        except (ValueError, SyntaxError, json.JSONDecodeError):
+        except ValueError, SyntaxError, json.JSONDecodeError:
             return None
 
     def _format_web_dict(self, data: dict, *, is_preview: bool) -> FormattedOutput:
@@ -3991,7 +4187,17 @@ class ToolCallMessage(Vertical):
         if self._expanded:
             # Show full output with formatting
             self._preview_row.display = False
-            self._full_widget.update(full.content)
+            content = full.content
+            if self._tool_name == "read_file":
+                content = Content("\n").join(
+                    (
+                        Content.styled("Arguments", "bold dim"),
+                        self._format_args_detail(),
+                        Content(""),
+                        full.content,
+                    )
+                )
+            self._full_widget.update(content)
             self._full_row.display = True
             # Only offer a collapse affordance when collapsing would actually
             # hide something. Errors are force-expanded (see `set_error`), so a
@@ -4801,8 +5007,8 @@ class ToolGroupSummary(Static):
     """Collapsed one-line stand-in for an assistant step's tool calls.
 
     Tools are hidden from the moment they start; this single line shows live
-    progress ("Running 1 shell command…") and flips to the fully past-tense
-    line ("Ran 1 shell command") once every tool finishes. While the step is
+    progress ("Running 1 shell command…") after two seconds and flips to the
+    past-tense line ("Ran 1 shell command") once every tool finishes. While the step is
     live, finished calls stay visible in the past tense next to the ones still
     running in the present tense (e.g. "Ran 2 shell commands, running 1 agent…")
     so the work already done in the step doesn't disappear. Failed, rejected,
@@ -4837,6 +5043,7 @@ class ToolGroupSummary(Static):
     """
 
     _SPINNER_INTERVAL: ClassVar[float] = 0.1
+    _PROGRESS_REVEAL_DELAY_SECONDS: ClassVar[float] = 2.0
 
     _collapsed: var[bool] = var(True)
 
@@ -4877,6 +5084,7 @@ class ToolGroupSummary(Static):
         self._accepting_members = live
         self._finalized = not live
         self._spinner_pos = 0
+        self._progress_started_at: float | None = None
         self._timer: Timer | None = None
         # Cached summary phrasing, rebuilt only when membership changes (not on
         # every spinner tick). None means "recompute on next render".
@@ -4891,8 +5099,8 @@ class ToolGroupSummary(Static):
     def on_mount(self) -> None:
         """Apply initial visibility, render, and arm the spinner if live."""
         self._apply_visibility()
-        self._render_line()
         self._sync_timer()
+        self._render_line()
 
     def _attach_accessories(self, owner: Widget, accessories: Iterable[Widget]) -> None:
         """Record `owner`'s accessories and link them to its approval hiding.
@@ -5086,9 +5294,12 @@ class ToolGroupSummary(Static):
     def _sync_timer(self) -> None:
         """Run the spinner timer only while live members are in progress."""
         if not self._finalized and self._in_progress():
+            if self._progress_started_at is None:
+                self._progress_started_at = monotonic()
             if self._timer is None:
                 self._timer = self.set_interval(self._SPINNER_INTERVAL, self._tick)
         else:
+            self._progress_started_at = None
             self._stop_timer()
 
     def _stop_timer(self) -> None:
@@ -5174,6 +5385,7 @@ class ToolGroupSummary(Static):
         if not self.is_attached:
             return
         if not self._tools:
+            self.display = False
             self.update(Content(""), layout=layout)
             return
         glyphs = get_glyphs()
@@ -5182,8 +5394,18 @@ class ToolGroupSummary(Static):
         if not self._finalized and in_progress:
             # Tallied per bucket, not across both: a file whose second read is
             # still in flight must stay visible as being read.
-            pending = [t.summary_call for t in self._tools if t.is_pending]
+            show_progress = (
+                self._progress_started_at is not None
+                and monotonic() - self._progress_started_at
+                >= self._PROGRESS_REVEAL_DELAY_SECONDS
+            )
+            pending = (
+                [t.summary_call for t in self._tools if t.is_pending]
+                if show_progress
+                else []
+            )
             completed = [t.summary_call for t in self._tools if not t.is_pending]
+            self.display = bool(completed or pending)
             key = (_summary_cache_key(completed), _summary_cache_key(pending))
             summary_changed = self._present_text is None or key != self._present_key
             if summary_changed:
@@ -5191,11 +5413,19 @@ class ToolGroupSummary(Static):
                 self._present_key = key
             frames = glyphs.spinner_frames
             spinner = frames[self._spinner_pos % len(frames)]
-            self.update(
-                Content(f"{spinner} {self._present_text}{glyphs.ellipsis}"),
-                layout=layout or summary_changed,
+            mark = (
+                glyphs.disclosure_collapsed
+                if self._collapsed
+                else glyphs.disclosure_expanded
             )
+            text = (
+                f"{spinner} {self._present_text}{glyphs.ellipsis}"
+                if show_progress
+                else f"{mark} {self._present_text}"
+            )
+            self.update(Content(text), layout=layout or summary_changed)
         else:
+            self.display = True
             mark = (
                 glyphs.disclosure_collapsed
                 if self._collapsed
@@ -5320,7 +5550,11 @@ class LazyToolGroupSummary(Vertical):
                 data.tool_expanded = widget._expanded
 
     async def _set_expanded(self, expanded: bool) -> None:
-        """Create or discard detail widgets for one explicit toggle."""
+        """Create or discard detail widgets for one explicit toggle.
+
+        Raises:
+            asyncio.CancelledError: When expansion is cancelled after cleanup.
+        """
         if expanded == self._expanded or self._transitioning:
             return
         details = self._details
@@ -5331,22 +5565,10 @@ class LazyToolGroupSummary(Vertical):
         try:
             if expanded:
                 try:
-                    entries = []
-                    for data in self._message_data:
-                        widget, footer = (
-                            self._detail_builder(data)
-                            if self._detail_builder is not None
-                            else (data.to_widget(), None)
-                        )
-                        entries.append((data, widget, footer))
-                    nodes = [
-                        node
-                        for _data, widget, footer in entries
-                        for node in (
-                            (widget, footer) if footer is not None else (widget,)
-                        )
-                    ]
-                    await details.mount(*nodes)
+                    entries = await self._mount_detail_batches(details)
+                except asyncio.CancelledError:
+                    await details.remove_children()
+                    raise
                 except Exception:
                     logger.warning("Failed to expand lazy tool group", exc_info=True)
                     try:
@@ -5389,6 +5611,31 @@ class LazyToolGroupSummary(Vertical):
             self.post_message(self.ExpansionChanged(self, expanded))
         finally:
             self._transitioning = False
+
+    async def _mount_detail_batches(
+        self, details: Vertical
+    ) -> list[tuple[MessageData, Widget, Widget | None]]:
+        """Mount bounded batches while yielding to UI work.
+
+        Returns:
+            Stored rows with their mounted detail widgets and optional footers.
+        """
+        entries: list[tuple[MessageData, Widget, Widget | None]] = []
+        for start in range(0, len(self._message_data), 8):
+            nodes: list[Widget] = []
+            for data in self._message_data[start : start + 8]:
+                widget, footer = (
+                    self._detail_builder(data)
+                    if self._detail_builder is not None
+                    else (data.to_widget(), None)
+                )
+                entries.append((data, widget, footer))
+                nodes.append(widget)
+                if footer is not None:
+                    nodes.append(footer)
+            await details.mount(*nodes)
+            await asyncio.sleep(0)
+        return entries
 
     @on(Click, ".lazy-tool-group-header")
     def _on_header_click(self, event: Click) -> None:
@@ -6134,7 +6381,9 @@ class SummarizationMessage(AppMessage):
         self._raw_message = message
         # Pass the default text to AppMessage for _content serialization;
         # render() supplies theme-aware styling at display time.
-        super().__init__(message or "✓ Conversation offloaded", **kwargs)
+        super().__init__(
+            message or f"{get_glyphs().checkmark} Conversation offloaded", **kwargs
+        )
 
     def render(self) -> Content:
         """Render with theme-aware colors.
@@ -6144,7 +6393,10 @@ class SummarizationMessage(AppMessage):
         """
         colors = theme.get_theme_colors(self)
         if self._raw_message is None:
-            return Content.styled("✓ Conversation offloaded", f"bold {colors.primary}")
+            return Content.styled(
+                f"{get_glyphs().checkmark} Conversation offloaded",
+                f"bold {colors.primary}",
+            )
         if isinstance(self._raw_message, Content):
             return self._raw_message
         return Content.styled(self._raw_message, f"bold {colors.primary}")

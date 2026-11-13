@@ -166,7 +166,7 @@ Select a model by passing `--model` (in `provider:model-name` form) to the comma
     "Deep Agents Code": {
       "type": "custom",
       "command": "dcode",
-      "args": ["--acp", "--model", "anthropic:claude-sonnet-4-5"]
+      "args": ["--acp", "--model", "anthropic:claude-sonnet-5"]
     }
   }
 }
@@ -185,9 +185,9 @@ from deepagents_acp.server import AgentServerACP, AgentSessionContext
 
 # Define available models
 models = [
-    {"value": "anthropic:claude-opus-4-6", "name": "Claude Opus 4"},
-    {"value": "anthropic:claude-sonnet-4", "name": "Claude Sonnet 4"},
-    {"value": "openai:gpt-4-turbo", "name": "GPT-4 Turbo"},
+    {"value": "anthropic:claude-opus-5", "name": "Claude Opus 5"},
+    {"value": "anthropic:claude-sonnet-5", "name": "Claude Sonnet 5"},
+    {"value": "openai:gpt-6-astra", "name": "GPT-6 Astra"},
 ]
 
 # Create an agent factory that uses the model from context
@@ -209,5 +209,6 @@ You can see a full example [here](./examples/demo_agent.py) with LangChain's mod
 
 ## Resources
 
+- [Changelog](https://github.com/langchain-ai/deepagents/blob/main/libs/acp/CHANGELOG.md) — Release history
 - [LangChain Academy](https://academy.langchain.com/) — Comprehensive, free courses on LangChain libraries and products, made by the LangChain team.
 - [Code of Conduct](https://github.com/langchain-ai/langchain/?tab=coc-ov-file) — community guidelines and standards

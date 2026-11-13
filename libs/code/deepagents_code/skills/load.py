@@ -130,7 +130,7 @@ def list_skills(
             else:
                 skills = list_skills_from_backend(backend=backend, source_path=".")
             if experimental and skills:
-                logger.info(
+                logger.debug(
                     "Discovered %d skill(s) from experimental Claude path: %s",
                     len(skills),
                     skill_dir,
@@ -216,7 +216,7 @@ def load_skill_content(
 
     try:
         return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    except OSError, UnicodeDecodeError:
         logger.warning(
             "Could not read skill content from %s", skill_path, exc_info=True
         )

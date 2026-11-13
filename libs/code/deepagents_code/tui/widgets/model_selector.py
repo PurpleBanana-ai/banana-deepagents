@@ -21,10 +21,14 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
 
     from textual.app import ComposeResult
     from textual.timer import Timer
+    from textual.worker import Worker
+
+    from deepagents_code.model_catalog import ModelCatalog
+    from deepagents_code.model_metadata import ModelMetadata
 
 from deepagents_code import _env_vars, theme
 from deepagents_code._paths import PATHS
@@ -34,20 +38,18 @@ from deepagents_code.model_config import (
     CODEX_PROVIDER,
     MANAGED_CONFIG_SOURCE,
     ModelConfig,
-    ModelNotAllowedError,
     ModelProfileEntry,
     ModelSpec,
     ProviderAuthState,
     ProviderAuthStatus,
     clear_auto_classifier_model,
     clear_default_model,
-    get_available_models,
+    clear_summarization_model,
     get_credential_env_var,
-    get_model_profiles,
-    get_provider_auth_status,
     load_recent_models,
     save_auto_classifier_model,
     save_default_model,
+    save_summarization_model,
 )
 from deepagents_code.tui.widgets._copy_spans import copy_span_style, copy_span_target
 
@@ -74,51 +76,58 @@ from the per-provider sections below.
 
 
 _RECOMMENDED_MODELS: dict[str, str] = {
-    "anthropic:claude-opus-4-8": "Claude Opus 4.8",
-    "anthropic:claude-opus-5": "Claude Opus 5",
-    "anthropic:claude-sonnet-5": "Claude Sonnet 5",
+    "anthropic:claude-fable-5-1": "Claude Fable 5.1",
+    "anthropic:claude-opus-5-5": "Claude Opus 5.5",
+    "anthropic:claude-sonnet-5-5": "Claude Sonnet 5.5",
     "baseten:deepseek-ai/DeepSeek-V4-Flash-0731": "DeepSeek V4 Flash 0731",
+    "baseten:deepseek-ai/DeepSeek-V4.1-Flash": "DeepSeek V4.1 Flash",
     "baseten:deepseek-ai/DeepSeek-V4-Pro": "DeepSeek V4 Pro",
     "baseten:deepseek-ai/DeepSeek-V4-Pro-0813": "DeepSeek V4 Pro 0813",
     "baseten:moonshotai/Kimi-K3": "Kimi K3",
     "baseten:nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B": "Nemotron 3 Ultra 550B A55B",
-    "baseten:zai-org/GLM-5.2": "GLM 5.2",
-    "baseten:zai-org/GLM-5.2-Fast": "GLM 5.2 Fast",
+    "baseten:zai-org/GLM-5.3": "GLM 5.3",
     "baseten:zai-org/GLM-5.3-Flash": "GLM 5.3 Flash",
     "fireworks:accounts/fireworks/models/deepseek-v4-flash-0731": (
         "DeepSeek V4 Flash 0731"
     ),
+    "fireworks:accounts/fireworks/models/deepseek-v4p1-flash": "DeepSeek V4.1 Flash",
     "fireworks:accounts/fireworks/models/deepseek-v4-pro": "DeepSeek V4 Pro",
     "fireworks:accounts/fireworks/models/deepseek-v4-pro-0813": "DeepSeek V4 Pro 0813",
-    "fireworks:accounts/fireworks/models/glm-5p2": "GLM 5.2",
+    "fireworks:accounts/fireworks/models/glm-5p3": "GLM 5.3",
+    "fireworks:accounts/fireworks/models/glm-5p3-flash": "GLM 5.3 Flash",
     "fireworks:accounts/fireworks/models/kimi-k3": "Kimi K3",
     "fireworks:accounts/fireworks/models/minimax-m3": "MiniMax-M3",
     "fireworks:accounts/fireworks/models/qwen3p7-plus": "Qwen 3.7 Plus",
-    "google_genai:gemini-3.7-flash": "Gemini 3.7 Flash",
+    "google_genai:gemini-3.8-flash": "Gemini 3.8 Flash",
+    "google_genai:gemini-4-argon": "Gemini 4 Argon",
     "meta:muse-spark-1.2": "Muse Spark 1.2",
     "ollama:deepseek-v4-flash:cloud": "DeepSeek V4 Flash",
+    "ollama:deepseek-v4.1-flash:cloud": "DeepSeek V4.1 Flash",
     "ollama:deepseek-v4-pro:cloud": "DeepSeek V4 Pro",
-    "ollama:glm-5.2:cloud": "GLM 5.2",
+    "ollama:glm-5.3:cloud": "GLM 5.3",
+    "ollama:glm-5.3-flash:cloud": "GLM 5.3 Flash",
     "ollama:minimax-m3:cloud": "MiniMax-M3",
-    "openai:gpt-5.6-luna": "GPT-5.6 Luna",
-    "openai:gpt-5.6-sol": "GPT-5.6 Sol",
-    "openai:gpt-5.6-terra": "GPT-5.6 Terra",
+    "openai:gpt-6-astra": "GPT-6 Astra",
+    "openai:gpt-6-luna": "GPT-6 Luna",
+    "openai:gpt-6.1-sol": "GPT-6.1 Sol",
+    "openai:gpt-6.1-terra": "GPT-6.1 Terra",
     "openai_codex:gpt-5.6-luna": "GPT-5.6 Luna",
     "openai_codex:gpt-5.6-sol": "GPT-5.6 Sol",
     "openai_codex:gpt-5.6-terra": "GPT-5.6 Terra",
-    "openrouter:anthropic/claude-opus-4.8": "Claude Opus 4.8",
-    "openrouter:anthropic/claude-sonnet-5": "Claude Sonnet 5",
+    "openrouter:anthropic/claude-opus-5.5": "Claude Opus 5.5",
+    "openrouter:anthropic/claude-sonnet-5.5": "Claude Sonnet 5.5",
     "openrouter:deepseek/deepseek-v4-flash-0731": "DeepSeek V4 Flash 0731",
     "openrouter:deepseek/deepseek-v4-flash:free": "DeepSeek V4 Flash (free)",
+    "openrouter:deepseek/deepseek-v4.1-flash": "DeepSeek V4.1 Flash",
     "openrouter:deepseek/deepseek-v4-pro": "DeepSeek V4 Pro",
     "openrouter:deepseek/deepseek-v4-pro-0813": "DeepSeek V4 Pro 0813",
-    "openrouter:google/gemini-3.7-flash": "Gemini 3.7 Flash",
+    "openrouter:google/gemini-4-argon": "Gemini 4 Argon",
     "openrouter:moonshotai/kimi-k3": "Kimi K3",
     "openrouter:nvidia/nemotron-3-ultra-550b-a55b": "Nemotron 3 Ultra 550B A55B",
     "openrouter:openrouter/fusion": "OpenRouter Fusion",
     "openrouter:qwen/qwen3.7-plus": "Qwen 3.7 Plus",
-    "openrouter:z-ai/glm-5.2": "GLM 5.2",
     "openrouter:z-ai/glm-5.3": "GLM 5.3",
+    "openrouter:z-ai/glm-5.3-flash": "GLM 5.3 Flash",
     "xai:grok-4.5": "Grok 4.5",
 }
 """Hand-curated frontier-tier models promoted across the UI, mapped to a
@@ -138,6 +147,13 @@ Same model IDs may appear under multiple providers (e.g. GLM 5.2 via
 provider intentionally so the user can pick whichever provider they have
 credentials for.
 """
+
+
+AUXILIARY_RECOMMENDED_MODELS: dict[str, str] = {
+    "anthropic:claude-haiku-5-5": "Claude Haiku 5.5",
+    **_RECOMMENDED_MODELS,
+}
+"""Sidecar recommendations without changing the main-agent recommendations."""
 
 
 class DefaultModelScope(NamedTuple):
@@ -187,8 +203,8 @@ MAIN_MODEL_DEFAULT_SCOPE = DefaultModelScope(
 )
 """Ctrl+S target for `/model`: the main agent model (`[models].default`).
 
-Persisting is validation-free, but `action_set_default` refuses rows whose
-provider integration is not installed (those can never build). `-M/--model`
+App-owned pickers validate through the inference host before persisting, and
+`action_set_default` refuses rows whose provider integration is missing. `-M/--model`
 outranks this key for a single launch.
 """
 
@@ -203,9 +219,9 @@ AUTO_CLASSIFIER_DEFAULT_SCOPE = DefaultModelScope(
 """Ctrl+S target for `/auto model`: the Auto approval classifier
 (`[models].auto_classifier`).
 
-Persisting is validation-free and, as with `/model`'s Ctrl+S,
-`action_set_default` refuses rows whose provider integration is not installed
-(those can never build). A stored classifier that cannot be built for any other
+As with `/model`, app-owned pickers validate through the inference host before
+persisting. `action_set_default` refuses rows whose provider integration is missing.
+A stored classifier that cannot be built for any other
 reason fails closed at review time — those actions are denied and repeated
 failures escalate to human approval — rather than quietly reverting to the main
 agent model.
@@ -217,6 +233,16 @@ in force. `action_set_default` says so in its success toast when the export is
 set, since otherwise a stored spec that changes nothing still renders
 `(default)`.
 """
+
+
+SUMMARIZATION_DEFAULT_SCOPE = DefaultModelScope(
+    noun="default summarization model",
+    hint="set summarization default",
+    load=lambda: ModelConfig.load().summarization_default_model,
+    save=save_summarization_model,
+    clear=clear_summarization_model,
+)
+"""Ctrl+S target for compaction summaries (`[models].summarization_default`)."""
 
 
 class _ModelData(NamedTuple):
@@ -232,6 +258,7 @@ class _ModelData(NamedTuple):
             `~/.deepagents/.state/recent_models.json`.
         install_extras: Each surfaced-but-uninstalled provider mapped to the
             extra that installs it.
+        catalog: Inference-host readiness, presentation, and policy metadata.
     """
 
     all_models: list[tuple[str, str]]
@@ -239,6 +266,7 @@ class _ModelData(NamedTuple):
     profiles: Mapping[str, ModelProfileEntry]
     recent_specs: list[str]
     install_extras: dict[str, str]
+    catalog: ModelCatalog | None = None
 
 
 class ModelOption(Static):
@@ -507,7 +535,11 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         title: str | None = None,
         description: str | Content | None = None,
         default_scope: DefaultModelScope | None,
+        check_provider_requirements: bool = True,
         result_callback: Callable[[tuple[str, str] | None], None] | None = None,
+        catalog_loader: Callable[[Sequence[str], str | None], Awaitable[ModelCatalog]]
+        | None = None,
+        resolve_model: Callable[[str], Awaitable[ModelMetadata]] | None = None,
     ) -> None:
         """Initialize the ModelSelectorScreen.
 
@@ -537,8 +569,13 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
                 Ctrl+S and drop its footer hint — for pickers whose choice has
                 no persistent config key (the `/goal model` and `/rubric model`
                 graders) and for onboarding, which advertises no Ctrl+S.
+            check_provider_requirements: Whether to require local provider packages
+                and credentials before returning a selection.
             result_callback: Optional callback for selector results when the
                 screen is displayed without a `push_screen` result callback.
+            catalog_loader: Load discovery and readiness from the inference host.
+                Without it, use the shared loader in the current process.
+            resolve_model: Validate and normalize a choice before persisting it.
         """
         super().__init__()
         self._current_model = current_model
@@ -554,11 +591,12 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         self._title = title
         self._description = description
         self._default_scope = default_scope
+        self._check_provider_requirements = check_provider_requirements
         self._result_callback = result_callback
-        # Standard /model defaults to the curated recommended subset so users
-        # face less decision fatigue; onboarding (`curated=True`) already
-        # constrains the list via `_curated`, so leaving this False there
-        # avoids double-flagging in `_apply_subset`.
+        self._catalog_loader = catalog_loader
+        self._resolve_model = resolve_model
+        self._catalog: ModelCatalog | None = None
+        self._catalog_config: ModelConfig | None = None
         self._recommended_only = not curated
         # Rows show friendly display names by default; Ctrl+N flips every row
         # to its raw `provider:model` spec (mirrors the `/theme` picker's
@@ -573,6 +611,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         # schedule no timer of their own, so this is the only handle that can
         # clobber an error.
         self._help_restore_timer: Timer | None = None
+        self._default_worker: Worker[None] | None = None
 
         self._unfiltered_models: list[tuple[str, str]] = []
         self._recent_specs: list[str] = []
@@ -590,7 +629,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         self._options_container: Container | None = None
         self._option_widgets: list[ModelOption] = []
         self._filter_text = ""
-        self._current_spec: str | None = None
+        self._current_spec: str | None = current_model
         if current_model and current_provider:
             self._current_spec = f"{current_provider}:{current_model}"
         self._default_spec: str | None = None
@@ -659,7 +698,10 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
             names_hint = "Ctrl+N names" if self._show_specs else "Ctrl+N IDs"
             if self._default_scope is not None:
                 parts.append(f"Ctrl+S {self._default_scope.hint}")
-            parts.extend(("Ctrl+R recommended", names_hint, "Esc close"))
+            recommendations_hint = (
+                "Ctrl+R all models" if self._recommended_only else "Ctrl+R recommended"
+            )
+            parts.extend((recommendations_hint, names_hint, "Esc close"))
         sep = f" {glyphs.bullet} "
         return sep.join(parts)
 
@@ -749,6 +791,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         include_uninstalled: bool = True,
         include_recent: bool = True,
         recommended_models: Mapping[str, str] | None = None,
+        current_spec: str | None = None,
         default_scope: DefaultModelScope | None,
     ) -> _ModelData:
         """Gather model discovery data synchronously.
@@ -772,6 +815,8 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
                 "Recent" entry the user never chose.
             recommended_models: Recommendation set whose missing provider models
                 should be surfaced. `None` uses the standard model shortlist.
+            current_spec: Active `provider:model` spec to keep in the list even
+                when discovery and recommendations do not include it.
             default_scope: Preference whose stored spec is read for the
                 `(default)` marker, stripped of surrounding whitespace so it can
                 match a row. `None` yields no marker.
@@ -780,71 +825,36 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
             A `_ModelData` bundle of the discovered models, default spec,
                 profiles, recent specs, and install-required provider extras.
         """
-        available = get_available_models()
-        config = ModelConfig.load()
-        all_models: list[tuple[str, str]] = [
-            (f"{provider}:{model}", provider)
-            for provider, models in available.items()
-            for model in models
-        ]
+        from deepagents_code.model_catalog import load_model_catalog
 
-        install_extras: dict[str, str] = {}
-        if include_uninstalled:
-            from deepagents_code.config_manifest import (
-                is_provider_package_installed,
-                provider_install_extra,
-            )
+        catalog = load_model_catalog(
+            profile_overrides=cli_override,
+            recommended_models=(
+                tuple(
+                    _RECOMMENDED_MODELS
+                    if recommended_models is None
+                    else recommended_models
+                )
+                if include_uninstalled
+                else ()
+            ),
+            current_spec=current_spec,
+        )
+        return ModelSelectorScreen._catalog_model_data(
+            catalog,
+            include_recent=include_recent,
+            default_scope=default_scope,
+        )
 
-            # Seeded from the discovered models; a recommended spec already
-            # surfaced here is skipped below. Recommended specs are unique (dict
-            # keys iterated once), so this entry guard is the only dedup needed
-            # and the set never has to grow inside the loop.
-            existing_specs = {spec for spec, _ in all_models}
-            installed_recommended: list[tuple[str, str]] = []
-            uninstalled_recommended: list[tuple[str, str]] = []
-            recommendations = (
-                _RECOMMENDED_MODELS
-                if recommended_models is None
-                else recommended_models
-            )
-            for spec in sorted(recommendations):
-                if spec in existing_specs or not config.is_model_allowed(spec):
-                    continue
-                provider = spec.split(":", 1)[0]
-                try:
-                    if not config.is_provider_enabled(provider):
-                        continue
-                    extra = provider_install_extra(provider)
-                    provider_installed = is_provider_package_installed(provider)
-                except Exception:
-                    # Isolate per-provider probe failures so one bad recommended
-                    # provider can't take down the entire model list (the caller
-                    # degrades any raise here to an empty selector). The append
-                    # bookkeeping below stays outside this guard so genuine logic
-                    # bugs surface instead of being silently swallowed.
-                    logger.warning(
-                        "Skipping recommended model %r while merging "
-                        "recommendations into the model list",
-                        spec,
-                        exc_info=True,
-                    )
-                    continue
-                if provider in available and provider_installed:
-                    # Provider is installed and discoverable, but its upstream
-                    # profiles don't surface this curated model (missing entry
-                    # or filtered out). Add it as a normal selectable row so the
-                    # hardcoded recommendation isn't silently dropped when the
-                    # profile list lags.
-                    installed_recommended.append((spec, provider))
-                    continue
-                if extra is None or provider_installed:
-                    continue
-                install_extras[provider] = extra
-                uninstalled_recommended.append((spec, provider))
-            all_models.extend(installed_recommended)
-            all_models.extend(uninstalled_recommended)
-
-        profiles = get_model_profiles(cli_override=cli_override)
+    @staticmethod
+    def _catalog_model_data(
+        catalog: ModelCatalog,
+        *,
+        include_recent: bool,
+        default_scope: DefaultModelScope | None,
+    ) -> _ModelData:
+        """Return inference-host discovery with the user's local preferences."""
+        config = catalog.presentation_config()
         recent_specs = load_recent_models() if include_recent else []
         stored_default = default_scope.load() if default_scope is not None else None
         if stored_default is not None:
@@ -869,12 +879,50 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
             )
             stored_default = None
         return _ModelData(
-            all_models,
+            [(spec, spec.split(":", 1)[0]) for spec in catalog.models],
             stored_default,
-            profiles,
+            catalog.profile_entries(),
             recent_specs,
-            install_extras,
+            {
+                provider: info.install_extra
+                for provider, info in catalog.providers.items()
+                if info.install_extra is not None
+            },
+            catalog,
         )
+
+    def _presentation_config(self) -> ModelConfig:
+        """Return catalog policy and labels when discovery is server-backed."""
+        if self._catalog_config is not None:
+            return self._catalog_config
+        if self._catalog_loader is not None:
+            return ModelConfig()
+        return ModelConfig.load()
+
+    def _has_catalog_provider(self, model_spec: str) -> bool:
+        """Return whether the host recognizes an explicit provider prefix.
+
+        A colon alone is ambiguous: bare Bedrock IDs have version suffixes.
+        Leave inputs without a known prefix to the app's inference-host resolver.
+        """
+        parsed = ModelSpec.try_parse(model_spec)
+        return (
+            parsed is not None
+            and self._catalog is not None
+            and parsed.provider in self._catalog.providers
+        )
+
+    def _provider_status(self, provider: str) -> ProviderAuthStatus:
+        """Return readiness reported by the inference host."""
+        if self._catalog is not None and provider in self._catalog.providers:
+            return self._catalog.providers[provider].auth_status(provider)
+        if self._catalog_loader is not None:
+            return ProviderAuthStatus(
+                state=ProviderAuthState.UNKNOWN, provider=provider
+            )
+        from deepagents_code.model_catalog import get_provider_auth_status
+
+        return get_provider_auth_status(provider)
 
     def _apply_subset(
         self,
@@ -882,9 +930,10 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
     ) -> list[tuple[str, str]]:
         """Apply the active subset filter (onboarding or recommended-only).
 
-        Recently-used specs are unioned in even when the recommended-only
-        toggle is on, so personal usage always wins over curation. Onboarding
-        intentionally keeps a tight curated subset and skips this union.
+        Recently-used and currently active specs are unioned in even when the
+        recommended-only toggle is on, so personal usage always wins over
+        curation. Onboarding intentionally keeps a tight curated subset and
+        skips this union.
 
         Args:
             all_models: Full list of `(provider:model, provider)` pairs.
@@ -906,18 +955,19 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
                 recommended_models=self._recommended_models,
             )
             curated_specs = {spec for spec, _ in curated}
+            personal_specs = (
+                set(self._recent_specs) if self._include_recent_models else set()
+            )
+            if self._current_spec is not None:
+                personal_specs.add(self._current_spec)
             # Order follows all_models (insertion), not MRU; _update_display
             # rebuilds visual order by iterating self._recent_specs directly.
-            recent_extra = (
-                [
-                    (spec, provider)
-                    for spec, provider in all_models
-                    if spec in self._recent_specs and spec not in curated_specs
-                ]
-                if self._include_recent_models
-                else []
-            )
-            return [*recent_extra, *curated]
+            personal_extra = [
+                (spec, provider)
+                for spec, provider in all_models
+                if spec in personal_specs and spec not in curated_specs
+            ]
+            return [*personal_extra, *curated]
         return list(all_models)
 
     @staticmethod
@@ -967,21 +1017,32 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
 
         # Offload to thread because get_available_models does filesystem I/O
         try:
-            data = await asyncio.to_thread(
-                self._load_model_data,
-                self._cli_profile_override,
-                include_uninstalled=True,
-                include_recent=self._include_recent_models and not self._curated,
-                recommended_models=self._recommended_models,
-                default_scope=self._default_scope,
-            )
+            if self._catalog_loader is not None:
+                catalog = await self._catalog_loader(
+                    tuple(self._recommended_models), self._current_spec
+                )
+                data = await asyncio.to_thread(
+                    self._catalog_model_data,
+                    catalog,
+                    include_recent=self._include_recent_models and not self._curated,
+                    default_scope=self._default_scope,
+                )
+            else:
+                data = await asyncio.to_thread(
+                    self._load_model_data,
+                    self._cli_profile_override,
+                    include_uninstalled=True,
+                    include_recent=self._include_recent_models and not self._curated,
+                    recommended_models=self._recommended_models,
+                    current_spec=self._current_spec,
+                    default_scope=self._default_scope,
+                )
         except Exception:
             logger.exception("Failed to load model data for /model selector")
             self._loaded = True
             if self.is_running:
                 self.notify(
-                    "Could not load model list. "
-                    "Check provider packages and config.toml.",
+                    "Could not load model list. Check the connection and retry.",
                     severity="error",
                     timeout=10,
                     markup=False,
@@ -994,6 +1055,18 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         if not self.is_running:
             return
 
+        self._catalog = data.catalog
+        self._catalog_config = (
+            data.catalog.presentation_config() if data.catalog else None
+        )
+        if data.catalog is not None and data.catalog.current_spec:
+            self._current_spec = data.catalog.current_spec
+            parsed = ModelSpec.try_parse(self._current_spec)
+            if parsed:
+                self._current_provider, self._current_model = (
+                    parsed.provider,
+                    parsed.model,
+                )
         self._unfiltered_models = data.all_models
         self._default_spec = data.default_spec
         self._profiles = data.profiles
@@ -1103,7 +1176,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         # existing muscle-memory queries keep working.
         from deepagents_code.tui.widgets.auth import provider_display_name
 
-        config = ModelConfig.load()
+        config = self._presentation_config()
         provider_labels: dict[str, str] = {}
 
         # Resolve the display labels up front, *outside* the try below. That
@@ -1249,10 +1322,12 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
 
         if not self._filtered_models:
             if not self._loaded:
-                empty_content: Content = Content.styled("Loading models…", "dim")
+                empty_content: Content = Content.styled(
+                    f"Loading models{get_glyphs().ellipsis}", "dim"
+                )
             else:
                 typed = self._filter_text.strip()
-                policy = ModelConfig.load()
+                policy = self._presentation_config()
                 # Blame the policy only when the user typed something that
                 # resolves to a real model and the policy rejects it. `typed`
                 # is filter text, so an empty box or a substring ("clade",
@@ -1261,7 +1336,14 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
                 # filter would make this branch fire for every allowlist.
                 # Canonicalizing also judges a supported bare name the way
                 # `create_model` will judge it.
-                canonical = policy.canonical_model_spec(typed) if typed else None
+                canonical = (
+                    typed
+                    if self._catalog_loader is not None
+                    and self._has_catalog_provider(typed)
+                    else policy.canonical_model_spec(typed)
+                    if typed and self._catalog_loader is None
+                    else None
+                )
                 blocked_spec = canonical is not None and not policy.is_model_allowed(
                     canonical
                 )
@@ -1341,7 +1423,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
 
         # Resolve provider auth upfront so it can both drive the
         # availability-first ordering below and feed the widget-building loop.
-        auth_statuses = {p: get_provider_auth_status(p) for p in by_provider}
+        auth_statuses = {p: self._provider_status(p) for p in by_provider}
 
         # In the default (unfiltered) view, float providers the user can
         # actually use to the top so a usable model is reachable without
@@ -1435,7 +1517,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         # user-configured `display_name` before the built-in map.
         from deepagents_code.tui.widgets.auth import provider_display_name
 
-        config = ModelConfig.load()
+        config = self._presentation_config()
 
         for provider, model_entries in by_provider.items():
             # Provider header; auth/readiness indicator appended only when non-empty.
@@ -1570,7 +1652,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         if show_provider:
             from deepagents_code.tui.widgets.auth import provider_short_name
 
-            provider_label = provider_short_name(provider)
+            provider_label = provider_short_name(provider, self._presentation_config())
         # `_show_specs` (Ctrl+N) renders the raw `provider:model` spec instead
         # of the friendly name; `display_name=None` makes `_format_option_label`
         # fall back to the spec and drop the redundant `(provider)` tag, which
@@ -1725,7 +1807,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
                 return None
             try:
                 text = f"{format_token_count(int(val))} {suffix}"
-            except (ValueError, TypeError, OverflowError):
+            except ValueError, TypeError, OverflowError:
                 text = f"{val} {suffix}"
             return _mark(key, text)
 
@@ -1863,7 +1945,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         entry = self._profiles.get(spec)
         try:
             text = self._format_footer(entry, get_glyphs())
-        except (KeyError, ValueError, TypeError):  # Resilient footer rendering
+        except KeyError, ValueError, TypeError:  # Resilient footer rendering
             logger.warning("Failed to format footer for %s", spec, exc_info=True)
             text = Content.styled("Could not load profile details\n\n\n", "dim")
         footer.update(text)
@@ -1991,26 +2073,29 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         # No matches - check if user typed a custom provider:model spec
         filter_input = self.query_one("#model-filter", Input)
         custom_input = filter_input.value.strip()
+        if not custom_input:
+            return
+        if self._catalog_loader is not None and not self._has_catalog_provider(
+            custom_input
+        ):
+            self._dismiss_with_result((custom_input, ""))
+            return
 
-        blocked = (
-            ModelConfig.load().policy_error(custom_input, canonicalize=True)
-            if custom_input
-            else None
+        blocked = self._presentation_config().policy_error(
+            custom_input, canonicalize=self._catalog_loader is None
         )
         if blocked is not None:
-            # Returning silently would read as a dead keybinding. `create_model`
-            # would reject this spec anyway; saying so here saves a round trip.
-            # `canonicalize` keeps this preflight in step with that gate: a bare
-            # name whose provider can be inferred is matched in the same
-            # canonical form, so an allowed model is not rejected here merely
-            # for lacking a `provider:` prefix.
+            # Reject before provider setup can install packages or request auth.
+            # Catalog-backed pickers check explicit specs without local provider
+            # inference; ambiguous inputs are resolved by the inference host.
+            # Standalone pickers canonicalize locally to match model construction.
             self.notify(str(blocked), severity="error", timeout=8)
             return
 
-        if custom_input and ":" in custom_input:
+        if ":" in custom_input:
             provider = custom_input.split(":", 1)[0]
             self._select_with_auth_check(custom_input, provider)
-        elif custom_input:
+        else:
             self._dismiss_with_result((custom_input, ""))
 
     def _select_with_auth_check(self, model_spec: str, provider: str) -> None:
@@ -2022,7 +2107,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         on the selector and refresh the credential indicator so the user can
         try again or pick a different provider.
         """
-        if not provider:
+        if not provider or not self._check_provider_requirements:
             self._dismiss_with_result((model_spec, provider))
             return
 
@@ -2031,8 +2116,22 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
             provider_install_extra,
         )
 
-        extra = provider_install_extra(provider)
-        if extra is not None and not is_provider_package_installed(provider):
+        info = (
+            self._catalog.providers.get(provider) if self._catalog is not None else None
+        )
+        extra = (
+            info.install_extra
+            if info is not None
+            else (
+                provider_install_extra(provider)
+                if self._catalog_loader is None
+                else None
+            )
+        )
+        missing_package = extra is not None and (
+            info is not None or not is_provider_package_installed(provider)
+        )
+        if missing_package:
             if self._curated:
                 # Onboarding installs first, then prompts for credentials from the
                 # launch flow, matching the dependency screen's auto-install copy.
@@ -2041,7 +2140,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
             self._prompt_install_provider(model_spec, provider, extra)
             return
 
-        status = get_provider_auth_status(provider)
+        status = self._provider_status(provider)
         if not status.blocks_start:
             self._dismiss_with_result((model_spec, provider))
             return
@@ -2155,6 +2254,10 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
     async def action_set_default(self) -> None:
         """Toggle the highlighted model as the screen's stored default.
 
+        Validation and persistence run in a worker so priority key dispatch
+        stays responsive. Ignore repeated requests until it finishes to avoid
+        overlapping writes; cancelling a thread does not stop its file I/O.
+
         If the highlighted model is already stored, clears it. Otherwise stores
         it. Which preference is written — and how the footer names it — comes
         from the screen's `DefaultModelScope`, so the `/auto` classifier picker
@@ -2183,8 +2286,20 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         scope = self._default_scope
         if scope is None:
             return
+        if self._default_worker is not None and not self._default_worker.is_finished:
+            return
 
         model_spec, provider = self._filtered_models[self._selected_index]
+        self._default_worker = self.run_worker(
+            self._set_default(model_spec, provider, scope), group="model-default"
+        )
+
+    async def _set_default(
+        self, model_spec: str, provider: str, scope: DefaultModelScope
+    ) -> None:
+        """Validate and persist the captured selection outside key dispatch."""
+        if not self.is_current:
+            return
         help_widget = self.query_one(".model-selector-help", Static)
         noun = scope.noun
         # `noun[:1]` rather than `noun[0]` so a malformed empty scope degrades to
@@ -2192,6 +2307,8 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
         sentence_noun = noun[:1].upper() + noun[1:]
 
         def _fail(message: str, remedy: str, *, persistent: bool = True) -> None:
+            if not self.is_current:
+                return
             help_widget.update(
                 Content.styled(
                     message,
@@ -2206,17 +2323,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
                 self._stop_help_restore_timer()
             else:
                 self._restart_help_restore_timer()
-            if self.is_running:
-                self.notify(remedy, severity="error", timeout=10, markup=False)
-            else:
-                # Nothing is mounted to read the footer update, so the toast —
-                # the only text carrying the remedy — is dropped. Leave a trace
-                # rather than failing invisibly.
-                logger.warning(
-                    "Ctrl+S failed while the selector was not running: %s (%s)",
-                    message,
-                    remedy,
-                )
+            self.notify(remedy, severity="error", timeout=10, markup=False)
 
         if provider in self._install_extras and model_spec != self._default_spec:
             from deepagents_code.update_check import (
@@ -2270,7 +2377,15 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
 
         if model_spec == self._default_spec:
             # Already stored — clear it
-            if await asyncio.to_thread(scope.clear):
+            try:
+                cleared = await asyncio.to_thread(scope.clear)
+            except Exception:
+                logger.exception("Failed to clear model default %s", model_spec)
+                _fail(f"Failed to clear {noun}", write_remedy)
+                return
+            if not self.is_current:
+                return
+            if cleared:
                 self._default_spec = None
                 self.call_after_refresh(self._update_display)
                 help_widget.update(Content.styled(f"{sentence_noun} cleared", "bold"))
@@ -2279,10 +2394,20 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
                 _fail(f"Failed to clear {noun}", write_remedy)
         else:
             try:
+                if self._resolve_model is not None:
+                    metadata = await self._resolve_model(model_spec)
+                    if not self.is_current:
+                        return
+                    model_spec = f"{metadata.provider}:{metadata.model_name}"
                 saved = await asyncio.to_thread(scope.save, model_spec)
-            except ModelNotAllowedError as exc:
+            except Exception as exc:
+                logger.exception(
+                    "Failed to validate or save model default %s", model_spec
+                )
                 # Not an I/O failure, so `write_remedy` would misdiagnose it.
                 _fail(f"Cannot store {noun}", str(exc), persistent=False)
+                return
+            if not self.is_current:
                 return
             if not saved:
                 _fail(f"Failed to save {noun}", write_remedy)
@@ -2377,6 +2502,9 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str] | None]):
 
         info = self.query_one("#model-selector-info", Static)
         info.update(self._info_line_content())
+        if not self._help_error_shown:
+            self._stop_help_restore_timer()
+            self._restore_help_text()
 
         await self._update_display()
 

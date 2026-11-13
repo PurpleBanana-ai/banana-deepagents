@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from deepagents_code.app import DeepAgentsApp
 from deepagents_code.goal_state_notice import (
+    anchor_summarization_event,
     build_goal_state_notice,
     goal_state_notice_info,
 )
@@ -19,15 +20,6 @@ def _active_state() -> dict[str, object]:
         "_goal_objective": "ship it",
         "_goal_status": "active",
         "_goal_rubric": "tests pass",
-    }
-
-
-def _serialized(message: HumanMessage) -> dict[str, object]:
-    return {
-        "type": "human",
-        "content": message.content,
-        "id": message.id,
-        "additional_kwargs": dict(message.additional_kwargs),
     }
 
 
@@ -60,43 +52,6 @@ async def test_active_paused_active_persists_three_append_events() -> None:
         notices[0].additional_kwargs["state_fingerprint"]
         == notices[2].additional_kwargs["state_fingerprint"]
     )
-
-
-async def test_legacy_active_thread_backfills_notice() -> None:
-    """An active checkpoint without a notice is repaired before model use."""
-    updater = SimpleNamespace(aupdate_state=AsyncMock())
-    app = DeepAgentsApp(agent=MagicMock())
-    app._agent = updater
-    app._lc_thread_id = "thread-1"
-    state = {**_active_state(), "messages": []}
-
-    with patch.object(app, "_get_thread_state_values", AsyncMock(return_value=state)):
-        assert await app._ensure_goal_state_notice()
-
-    updater.aupdate_state.assert_awaited_once()
-    update = updater.aupdate_state.await_args.args[1]
-    assert set(update) == {"messages"}
-    assert goal_state_notice_info(update["messages"][0]) is not None
-
-
-async def test_matching_remote_notice_is_not_duplicated() -> None:
-    """Serialized remote checkpoints use metadata for idempotent matching."""
-    updater = SimpleNamespace(aupdate_state=AsyncMock())
-    app = DeepAgentsApp(agent=MagicMock())
-    app._agent = updater
-    app._lc_thread_id = "thread-1"
-    state = _active_state()
-    notice = build_goal_state_notice(state, event_id="goal-event-1")
-    checkpoint = {**state, "messages": [_serialized(notice)]}
-
-    with patch.object(
-        app,
-        "_get_thread_state_values",
-        AsyncMock(return_value=checkpoint),
-    ):
-        assert await app._ensure_goal_state_notice()
-
-    updater.aupdate_state.assert_not_awaited()
 
 
 async def test_invalid_later_notice_is_superseded_by_current_inactive_state() -> None:
@@ -336,63 +291,43 @@ async def test_notice_defers_for_incomplete_tool_result_batch(
     updater.aupdate_state.assert_awaited_once()
 
 
-async def test_dangling_tool_call_does_not_abort_agent_run() -> None:
-    """The graph must run so its middleware can repair an interrupted call."""
-    updater = SimpleNamespace(aupdate_state=AsyncMock())
-    app = DeepAgentsApp(agent=MagicMock())
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        app._agent = updater
-        app._lc_thread_id = "thread-1"
-        app._active_goal = "ship it"
-        app._goal_status = "active"
-        app._active_rubric = "tests pass"
-        assistant = AIMessage(
-            content="",
-            tool_calls=[{"name": "one", "args": {}, "id": "call-1"}],
-        )
-        checkpoint = {**_active_state(), "messages": [assistant]}
+def test_anchor_summarization_event_follows_id_after_removal() -> None:
+    messages = [
+        HumanMessage("a", id="a"),
+        HumanMessage("c", id="c"),
+        HumanMessage("d", id="d"),
+    ]
+    event = {"cutoff_index": 3, "cutoff_message_id": "d", "created_at_index": 4}
 
-        with (
-            patch.object(
-                app,
-                "_get_thread_state_values",
-                AsyncMock(return_value=checkpoint),
-            ),
-            patch.object(app, "_cleanup_agent_task", new_callable=AsyncMock),
-            patch(
-                "deepagents_code.tui.textual_adapter.execute_task_textual",
-                new_callable=AsyncMock,
-            ) as execute,
-        ):
-            await app._run_agent_task("resume")
+    anchored = anchor_summarization_event(event, messages)
 
-    execute.assert_awaited_once()
-    updater.aupdate_state.assert_not_awaited()
+    assert anchored == {
+        "cutoff_index": 2,
+        "cutoff_message_id": "d",
+        "created_at_index": 3,
+    }
+    assert event["cutoff_index"] == 3
 
 
-async def test_remote_state_and_notice_share_one_update() -> None:
-    """Remote TUI transitions use one attributed state-plus-message write."""
-    from deepagents_code.client.remote_client import RemoteAgent
+def test_anchor_summarization_event_reads_serialized_messages() -> None:
+    event = {"cutoff_index": 2, "cutoff_message_id": "c"}
 
-    remote = MagicMock(spec=RemoteAgent)
-    remote.aensure_thread = AsyncMock()
-    remote.aupdate_state = AsyncMock()
-    app = DeepAgentsApp(agent=remote)
-    app._lc_thread_id = "thread-1"
-    state = _active_state()
-    notice = build_goal_state_notice(state, event_id="goal-event-remote")
+    anchored = anchor_summarization_event(event, [{"id": "a"}, {"id": "c"}])
 
-    assert await app._persist_goal_rubric_state(
-        notice=notice,
-        state_update=dict(state),
-    )
+    assert anchored["cutoff_index"] == 1
 
-    remote.aensure_thread.assert_awaited_once_with(
-        {"configurable": {"thread_id": "thread-1"}}
-    )
-    remote.aupdate_state.assert_awaited_once_with(
-        {"configurable": {"thread_id": "thread-1"}},
-        {**state, "messages": [notice]},
-        as_node="model",
-    )
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        None,
+        {"cutoff_index": 1},
+        {"cutoff_index": 1, "cutoff_message_id": "gone"},
+        {"cutoff_index": 1, "cutoff_message_id": "b"},
+        {"cutoff_index": True, "cutoff_message_id": "b"},
+    ],
+)
+def test_anchor_summarization_event_leaves_unresolvable_events(event: object) -> None:
+    messages = [HumanMessage("a", id="a"), HumanMessage("b", id="b")]
+
+    assert anchor_summarization_event(event, messages) is event

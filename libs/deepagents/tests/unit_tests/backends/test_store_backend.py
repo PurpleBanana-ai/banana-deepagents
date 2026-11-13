@@ -46,6 +46,56 @@ def test_store_backend_crud_and_search():
     assert {i["path"] for i in g} == {i["path"] for i in g2}
 
 
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("max_count", [None, 1])
+@pytest.mark.parametrize("glob", [None, "*.txt", "*.png"])
+async def test_store_backend_grep_skips_binary_uploads(*, use_async: bool, max_count: int | None, glob: str | None) -> None:
+    """Binary payloads neither appear in grep results nor consume the match limit."""
+    backend = StoreBackend(store=InMemoryStore(), namespace=lambda _rt: ("filesystem",))
+    responses = backend.upload_files([("/image.png", b"\xff\xff\xff"), ("/client.txt", b"GET /api")])
+    assert all(response.error is None for response in responses)
+
+    if use_async:
+        result = await backend.agrep("/", path="/", glob=glob, max_count=max_count)
+    else:
+        result = backend.grep("/", path="/", glob=glob, max_count=max_count)
+
+    assert result.error is None
+    assert result.matches == ([] if glob == "*.png" else [{"path": "/client.txt", "line": 1, "text": "GET /api"}])
+    assert result.truncated is False
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize(
+    ("content", "encoding"),
+    [
+        (b"plain text\n", "utf-8"),
+        ("héllo".encode(), "utf-8"),
+        (b"ASCII\x00", "base64"),
+        ("hi".encode("utf-16-le"), "base64"),
+        (b"\xff\xfe", "base64"),
+    ],
+)
+async def test_store_backend_upload_encoding_round_trips(*, use_async: bool, content: bytes, encoding: str) -> None:
+    """Uploads containing NUL are stored as base64 and download byte-for-byte."""
+    mem_store = InMemoryStore()
+    backend = StoreBackend(store=mem_store, namespace=lambda _rt: ("filesystem",))
+
+    if use_async:
+        uploads = await backend.aupload_files([("/file", content)])
+        downloads = await backend.adownload_files(["/file"])
+    else:
+        uploads = backend.upload_files([("/file", content)])
+        downloads = backend.download_files(["/file"])
+
+    assert uploads[0].error is None
+    item = mem_store.get(("filesystem",), "/file")
+    assert item is not None
+    assert item.value["encoding"] == encoding
+    assert "\x00" not in str(item.value["content"])
+    assert downloads[0].content == content
+
+
 def test_store_backend_read_surfaces_pagination_metadata():
     """`StoreBackend.read` propagates the pagination metadata from `slice_read_response`."""
     mem_store = InMemoryStore()
@@ -150,6 +200,22 @@ def test_store_backend_reads_legacy_list_content() -> None:
     assert "encoding" not in stored.value
 
 
+def test_store_backend_reports_utf8_byte_sizes() -> None:
+    mem_store = InMemoryStore()
+    be = StoreBackend(store=mem_store, namespace=lambda _rt: ("filesystem",))
+    content = "hello 😀 €"
+    be.write("/unicode.txt", content)
+    expected_size = len(content.encode("utf-8"))
+
+    listing = be.ls("/").entries
+    assert listing is not None
+    assert listing[0]["size"] == expected_size
+
+    matches = be.glob("*.txt", path="/").matches
+    assert matches is not None
+    assert matches[0]["size"] == expected_size
+
+
 def test_store_backend_rejects_legacy_lists_with_non_string_items() -> None:
     mem_store = InMemoryStore()
     be = StoreBackend(store=mem_store, namespace=lambda _rt: ("filesystem",))
@@ -191,6 +257,20 @@ def test_store_backend_edit_migrates_legacy_list_content() -> None:
     assert stored is not None
     assert stored.value["content"] == "hello\nthere"
     assert stored.value["encoding"] == "utf-8"
+
+
+def test_store_backend_edit_empty_old_string_returns_error() -> None:
+    mem_store = InMemoryStore()
+    be = StoreBackend(store=mem_store, namespace=lambda _rt: ("filesystem",))
+    mem_store.put(("filesystem",), "/legacy.txt", {"content": ["hello", "world"]})
+
+    result = be.edit("/legacy.txt", "", "there")
+
+    assert result.error is not None
+    assert "old_string cannot be empty" in result.error
+    stored = mem_store.get(("filesystem",), "/legacy.txt")
+    assert stored is not None
+    assert stored.value["content"] == ["hello", "world"]
 
 
 def test_store_backend_write_overwrites_existing_file():

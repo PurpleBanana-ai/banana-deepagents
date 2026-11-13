@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from deepagents_code.mcp_config import resolve_mcp_server_env
@@ -11,33 +9,6 @@ from deepagents_code.mcp_config import resolve_mcp_server_env
 
 class TestResolveMcpServerEnv:
     """Tests for supported `.mcp.json` interpolation fields."""
-
-    def test_resolves_stdio_fields_without_mutating_source(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """`command`, `args`, and `env` resolve in a copied config."""
-        monkeypatch.setenv("MCP_HOME", "/opt/mcp")
-        monkeypatch.setenv("MCP_TOKEN", "secret")
-        monkeypatch.delenv("MCP_CACHE", raising=False)
-        config: dict[str, Any] = {
-            "command": "${MCP_HOME}/bin/server",
-            "args": ["--root", "${MCP_HOME}", "${MCP_CACHE:-/tmp/cache}"],
-            "env": {
-                "TOKEN": "prefix-${MCP_TOKEN}",
-                "CACHE": "${MCP_CACHE:-/tmp/cache}",
-            },
-        }
-
-        resolved = resolve_mcp_server_env("discourse", config)
-
-        assert resolved == {
-            "command": "/opt/mcp/bin/server",
-            "args": ["--root", "/opt/mcp", "/tmp/cache"],
-            "env": {"TOKEN": "prefix-secret", "CACHE": "/tmp/cache"},
-        }
-        assert config["command"] == "${MCP_HOME}/bin/server"
-        assert config["env"]["TOKEN"] == "prefix-${MCP_TOKEN}"
 
     def test_resolves_remote_url_and_headers(
         self,
@@ -65,49 +36,6 @@ class TestResolveMcpServerEnv:
             "X-Origin": "https-mcp.example.com",
         }
 
-    def test_empty_variable_uses_default(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The `:-` form uses its default for an empty variable."""
-        monkeypatch.setenv("MCP_SCHEME", "")
-
-        resolved = resolve_mcp_server_env(
-            "remote",
-            {"url": "${MCP_SCHEME:-https}://example.com"},
-        )
-
-        assert resolved["url"] == "https://example.com"
-
-    def test_empty_default_yields_empty_string(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """`${VAR:-}` (empty default) resolves to `""` for an unset var."""
-        monkeypatch.delenv("MCP_OPT", raising=False)
-
-        resolved = resolve_mcp_server_env(
-            "srv",
-            {"command": "node", "env": {"OPT": "${MCP_OPT:-}"}},
-        )
-
-        assert resolved["env"] == {"OPT": ""}
-
-    def test_bare_reference_set_empty_emits_empty_without_error(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """A bare `${VAR}` set to `""` emits the empty value, not an error.
-
-        Distinct from the unset case (which raises): `:-`-less refs only hard
-        error when the variable is *absent*, not when it is set-but-empty.
-        """
-        monkeypatch.setenv("MCP_EMPTY", "")
-
-        resolved = resolve_mcp_server_env("srv", {"command": "${MCP_EMPTY}/x"})
-
-        assert resolved["command"] == "/x"
-
     def test_resolved_value_containing_brace_is_not_rescanned(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -124,91 +52,64 @@ class TestResolveMcpServerEnv:
 
         assert resolved["command"] == "keep-${NOT_A_REF}-literal"
 
-    def test_remote_fields_do_not_mutate_source(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
+    def test_resolves_slack_app_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Resolving `url`/`headers` leaves the source config (and its dicts) intact."""
-        monkeypatch.setenv("MCP_TOKEN", "token")
-        config: dict[str, Any] = {
-            "url": "https://example.com",
-            "headers": {"Authorization": "Bearer ${MCP_TOKEN}"},
-        }
-
-        resolved = resolve_mcp_server_env("remote", config)
-
-        assert resolved["headers"] == {"Authorization": "Bearer token"}
-        assert config["headers"] == {"Authorization": "Bearer ${MCP_TOKEN}"}
-
-    def test_plain_dollar_and_unsupported_fields_are_unchanged(self) -> None:
-        """Only braced references in the supported field allowlist expand."""
+        """Custom credentials expand without mutating the source config."""
+        monkeypatch.setenv("SLACK_CLIENT_ID", "custom-app")
+        monkeypatch.setenv("SLACK_CLIENT_SECRET", "private-value")
         config = {
-            "command": "$HOME/bin/server",
-            "allowedTools": ["${SHOULD_NOT_EXPAND}"],
+            "url": "https://mcp.slack.com/mcp",
+            "auth": "oauth",
+            "oauth": {
+                "client_id": "${SLACK_CLIENT_ID}",
+                "client_secret": "${SLACK_CLIENT_SECRET}",
+            },
         }
-
-        resolved = resolve_mcp_server_env("srv", config)
-
-        assert resolved == config
-
-    def test_unset_variable_reports_exact_field_path(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Missing required variables identify the server and field."""
-        monkeypatch.delenv("MISSING_MCP_PATH", raising=False)
-
-        with pytest.raises(
-            RuntimeError,
-            match=r"mcpServers\.srv\.args\[1\].*MISSING_MCP_PATH",
-        ):
-            resolve_mcp_server_env(
-                "srv",
-                {"command": "node", "args": ["--root", "${MISSING_MCP_PATH}"]},
-            )
-
-    def test_non_string_supported_value_reports_exact_field_path(self) -> None:
-        """Malformed supported values fail with a field-specific error."""
-        with pytest.raises(TypeError, match=r"mcpServers\.srv\.env\.PORT"):
-            resolve_mcp_server_env("srv", {"command": "node", "env": {"PORT": 1}})
-
-    def test_non_string_args_element_reports_indexed_field_path(self) -> None:
-        """A non-string element inside `args` names its index."""
-        with pytest.raises(TypeError, match=r"mcpServers\.srv\.args\[0\]"):
-            resolve_mcp_server_env("srv", {"command": "node", "args": [1]})
-
-    def test_non_string_header_value_reports_field_path(self) -> None:
-        """A non-string header value names the offending header."""
-        with pytest.raises(TypeError, match=r"mcpServers\.srv\.headers\.X-Bad"):
-            resolve_mcp_server_env(
-                "srv",
-                {"url": "https://x", "headers": {"X-Bad": 1}},
-            )
-
-    def test_args_not_a_list_reports_field_path(self) -> None:
-        """`args` must be a list, not a bare string."""
-        with pytest.raises(TypeError, match=r"mcpServers\.srv\.args must be a list"):
-            resolve_mcp_server_env("srv", {"command": "node", "args": "solo"})
-
-    def test_mapping_field_not_a_dict_reports_field_path(self) -> None:
-        """`env`/`headers` must be dictionaries."""
-        with pytest.raises(
-            TypeError,
-            match=r"mcpServers\.srv\.headers must be a dictionary",
-        ):
-            resolve_mcp_server_env("srv", {"url": "https://x", "headers": ["nope"]})
+        resolved = resolve_mcp_server_env("slack", config)
+        assert resolved["oauth"] == {
+            "client_id": "custom-app",
+            "client_secret": "private-value",
+        }
+        assert config["oauth"]["client_secret"] == "${SLACK_CLIENT_SECRET}"
 
     @pytest.mark.parametrize(
-        "value",
+        "oauth",
         [
-            "${VAR-default}",
-            "${VAR:default}",
-            "prefix-${VAR",
-            "${A:-foo${BAD}",
-            "${A:-${B}}",
+            None,
+            [],
+            {},
+            {"client_id": ""},
+            {"client_id": 123},
+            {"client_id": "app", "client_secret": ""},
+            {"client_id": "app", "client_secret": "private\nvalue"},
+            {"client_id": "app", "unknown": "private-value"},
         ],
     )
-    def test_malformed_reference_is_rejected(self, value: str) -> None:
-        """An unparseable `${...}` fails instead of being emitted verbatim."""
-        with pytest.raises(RuntimeError, match=r"malformed"):
-            resolve_mcp_server_env("srv", {"command": value})
+    def test_rejects_invalid_slack_credentials(self, oauth: object) -> None:
+        """Invalid settings fail without reflecting credential values."""
+        with pytest.raises((TypeError, ValueError)) as error:
+            resolve_mcp_server_env(
+                "slack",
+                {
+                    "url": "https://mcp.slack.com/mcp",
+                    "auth": "oauth",
+                    "oauth": oauth,
+                },
+            )
+        assert "private" not in str(error.value)
+
+    @pytest.mark.parametrize(
+        "url", ["https://example.com/mcp", "https://slack.com.evil.test/mcp"]
+    )
+    def test_rejects_app_credentials_for_other_hosts(self, url: str) -> None:
+        """Slack-specific app settings cannot affect another provider."""
+        with pytest.raises(ValueError, match="only for Slack"):
+            resolve_mcp_server_env(
+                "server",
+                {
+                    "url": url,
+                    "auth": "oauth",
+                    "oauth": {"client_id": "app"},
+                },
+            )

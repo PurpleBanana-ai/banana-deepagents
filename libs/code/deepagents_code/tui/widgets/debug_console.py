@@ -26,7 +26,7 @@ from textual.screen import ModalScreen
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
 from textual.style import Style as TStyle
-from textual.widgets import Checkbox, Select, Static
+from textual.widgets import Button, Checkbox, Select, Static
 from textual.widgets._select import (  # noqa: PLC2701  # needed to keep Tab navigation inside the open Select overlay
     SelectCurrent,
     SelectOverlay,
@@ -41,6 +41,7 @@ from deepagents_code._debug_buffer import (
     retention_bucket_for_level,
 )
 from deepagents_code.clipboard import copy_text_to_clipboard
+from deepagents_code.config import get_glyphs
 from deepagents_code.tui.widgets._copy_spans import copy_span_style, copy_span_target
 from deepagents_code.tui.widgets._links import open_style_link
 from deepagents_code.unicode_security import sanitize_control_chars
@@ -50,6 +51,8 @@ if TYPE_CHECKING:
 
     from textual import events
     from textual.app import ComposeResult
+
+    from deepagents_code.mcp_tools import MCPServerInfo
 
 logger = logging.getLogger(__name__)
 
@@ -87,11 +90,16 @@ level-partitioned retention instead of re-flattening it into a single window."""
 _FILTER_SELECT_ID = "debug-level-filter"
 _CLICK_TO_COPY_ID = "debug-click-to-copy"
 """Id of the checkbox that opts click-to-copy in for the console."""
+_COST_BREAKDOWN_ID = "debug-cost-breakdown"
+_MCP_SERVERS_ID = "debug-mcp-servers"
 _CLICK_TO_COPY_DEFAULT = False
 """Whether click-to-copy is enabled before the user toggles the checkbox."""
 _MIN_HANGING_VALUE_WIDTH = 10
 """Minimum readable value-column width for hanging snapshot rows."""
-_FOCUS_CYCLE = f"#{_FILTER_SELECT_ID}, #{_CLICK_TO_COPY_ID}, #debug-log"
+_FOCUS_CYCLE = (
+    f"#{_COST_BREAKDOWN_ID}, #{_MCP_SERVERS_ID}, "
+    f"#{_FILTER_SELECT_ID}, #{_CLICK_TO_COPY_ID}, #debug-log"
+)
 """Tab-cycle selector spanning the toolbar controls and the log view."""
 FilterValue = Literal[
     "all",
@@ -152,9 +160,15 @@ def _filter_options() -> tuple[tuple[str, FilterValue], ...]:
     """Return level filter options valid for the current logging configuration."""
     if not _debug_records_enabled():
         return _BASE_FILTER_OPTIONS
-    all_option = _BASE_FILTER_OPTIONS[:1]
-    rest = _BASE_FILTER_OPTIONS[1:]
-    return (*all_option, *_DEBUG_FILTER_OPTIONS, *rest)
+    minimum_options = _BASE_FILTER_OPTIONS[:5]
+    only_options = _BASE_FILTER_OPTIONS[5:]
+    return (
+        minimum_options[0],
+        _DEBUG_FILTER_OPTIONS[0],
+        *minimum_options[1:],
+        _DEBUG_FILTER_OPTIONS[1],
+        *only_options,
+    )
 
 
 def _record_matches_filter(
@@ -266,6 +280,7 @@ class _DebugLogView(ScrollView, can_focus=True):
         self._wrap_prefix: list[int] = [0]
         self._total_visual = 0
         self._cached_width = 0
+        self._scroll_end_after_layout = False
         self._hover_index: int | None = None
         self._selected_index: int | None = None
         self._render_line_cache: LRUCache[
@@ -306,8 +321,9 @@ class _DebugLogView(ScrollView, can_focus=True):
         start = len(self._contents)
         self._records.extend(records)
         self._contents.extend(_record_to_content(record) for record in records)
-        width = self._cached_width or self.size.width
+        width = self._cached_width or self.scrollable_content_region.width
         if width <= 0:
+            self._scroll_end_after_layout = self._scroll_end_after_layout or at_bottom
             # Not yet sized (e.g. first poll before layout). Assume one visual
             # line per new content so `_wrap_counts` stays 1:1 with `_contents`;
             # the first `on_resize` reflow recomputes real counts. Skipping this
@@ -340,7 +356,7 @@ class _DebugLogView(ScrollView, can_focus=True):
         self._hover_index = None
         self._selected_index = None
         self._render_line_cache.clear()
-        self.virtual_size = Size(self.size.width, 0)
+        self.virtual_size = Size(self.scrollable_content_region.width, 0)
         self.refresh()
 
     def show_notice(self, message: str) -> None:
@@ -371,7 +387,7 @@ class _DebugLogView(ScrollView, can_focus=True):
         self._total_visual = self._wrap_prefix[-1]
 
     def _reflow(self) -> None:
-        width = self.size.width
+        width = self.scrollable_content_region.width
         if width <= 0:
             width = self._cached_width
         if width <= 0:
@@ -443,7 +459,7 @@ class _DebugLogView(ScrollView, can_focus=True):
     def render_line(self, y: int) -> Strip:
         _scroll_x, scroll_y = self.scroll_offset
         abs_y = scroll_y + y
-        width = self.size.width
+        width = self.scrollable_content_region.width
         key = (
             abs_y,
             width,
@@ -495,10 +511,13 @@ class _DebugLogView(ScrollView, can_focus=True):
         super().notify_style_update()
         self._render_line_cache.clear()
 
-    def on_resize(self, event: events.Resize) -> None:
+    def on_resize(self, _event: events.Resize) -> None:
         """Re-wrap log entries when the view width changes."""
-        if event.size.width != self._cached_width:
+        if self.scrollable_content_region.width != self._cached_width:
             self._reflow()
+        if self._scroll_end_after_layout:
+            self._scroll_end_after_layout = False
+            self.scroll_end(animate=False, immediate=True, x_axis=False)
 
     def on_mouse_move(self, event: events.MouseMove) -> None:
         """Highlight the logical log record under the pointer."""
@@ -706,13 +725,13 @@ class DebugConsoleScreen(ModalScreen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "close", "Close", show=False),
         Binding(DEBUG_TOGGLE_KEY, "close", "Close", show=False, priority=True),
-        Binding("ctrl+l", "clear_view", "Clear view", show=False, priority=True),
+        Binding("ctrl+x,ctrl+l", "clear_view", "Clear view", show=False, priority=True),
         # Not `priority`: a priority `c` would pre-empt type-to-search in the
         # open level dropdown (e.g. typing "c" to reach CRITICAL). The log view
         # has no `c` binding, so it still bubbles up to this copy action.
         Binding("c", "copy", "Copy", show=False),
     ]
-    """The toggle-key close (`ctrl+backslash`) and `ctrl+l` clear-view are
+    """The toggle-key close (`ctrl+backslash`) and clear-view shortcuts are
     `priority`. Escape close and `c` copy are deliberately *not* `priority`:
     Escape must reach the open level dropdown's overlay first so it closes only
     the menu (a priority Escape would tear down the whole console instead), and
@@ -741,6 +760,24 @@ class DebugConsoleScreen(ModalScreen[None]):
 
     DebugConsoleScreen .debug-console-snapshot {
         margin-bottom: 1;
+    }
+
+    DebugConsoleScreen .debug-console-details {
+        width: auto;
+        min-width: 0;
+        height: 1;
+        border: none;
+        padding: 0 1;
+        margin-bottom: 1;
+        color: $primary;
+        background: transparent;
+    }
+
+    DebugConsoleScreen .debug-console-details:hover,
+    DebugConsoleScreen .debug-console-details:focus {
+        color: $text;
+        background: $surface-lighten-1;
+        text-style: bold;
     }
 
     DebugConsoleScreen .debug-console-toolbar {
@@ -792,6 +829,8 @@ class DebugConsoleScreen(ModalScreen[None]):
         snapshot: Sequence[SnapshotField],
         *,
         snapshot_provider: Callable[[], Sequence[SnapshotField]] | None = None,
+        cost_breakdown_provider: Callable[[], str] | None = None,
+        mcp_servers_provider: Callable[[], Sequence[MCPServerInfo]] | None = None,
         cleared_upto: int = 0,
         on_clear: Callable[[int], None] | None = None,
         click_to_copy: bool = _CLICK_TO_COPY_DEFAULT,
@@ -805,10 +844,14 @@ class DebugConsoleScreen(ModalScreen[None]):
                 live host state. When set, the header is refreshed on the same
                 tick as the log tail whenever the provider returns a different
                 row list. Omit for a freeze-frame header (e.g. unit tests).
-            cleared_upto: Absolute emission index a prior `Ctrl+L` cleared up to.
+            cost_breakdown_provider: Optional callable that builds the detailed
+                token and cost breakdown shown in a dedicated modal. An empty
+                string hides the breakdown button.
+            mcp_servers_provider: Live metadata for the read-only MCP server modal.
+            cleared_upto: Absolute emission index a prior clear advanced to.
                 The console starts rendering from here so a clear persists across
                 close/reopen; records emitted after it still appear.
-            on_clear: Invoked with the new clear cursor whenever `Ctrl+L` clears
+            on_clear: Invoked with the new clear cursor whenever a shortcut clears
                 the view, letting the owner persist it for the next open.
             click_to_copy: Initial state of the "Click to copy" checkbox,
                 restored from the persisted preference.
@@ -818,9 +861,11 @@ class DebugConsoleScreen(ModalScreen[None]):
         super().__init__()
         self._snapshot = list(snapshot)
         self._snapshot_provider = snapshot_provider
+        self._cost_breakdown_provider = cost_breakdown_provider
+        self._mcp_servers_provider = mcp_servers_provider
         self._records: list[InMemoryLogRecord] = []
         # Absolute index of the next unrendered log record (incremental writes),
-        # seeded from any persisted clear so reopening honors the last Ctrl+L.
+        # seeded from any persisted clear so reopening honors the last reset.
         self._rendered_upto = cleared_upto
         self._on_clear = on_clear
         # One-shot guard so the "buffer unavailable" notice is written only once.
@@ -874,6 +919,20 @@ class DebugConsoleScreen(ModalScreen[None]):
                 self._render_snapshot(), self._snapshot_value_column()
             )
             yield snapshot_view
+            if self._cost_breakdown_provider is not None:
+                yield Button(
+                    "View token & cost breakdown",
+                    id=_COST_BREAKDOWN_ID,
+                    classes="debug-console-details",
+                    variant="default",
+                )
+            if self._mcp_servers_provider is not None:
+                yield Button(
+                    "View MCP servers",
+                    id=_MCP_SERVERS_ID,
+                    classes="debug-console-details",
+                    variant="default",
+                )
             with Horizontal(classes="debug-console-toolbar"):
                 yield Static("Level", classes="debug-console-filter-label")
                 yield _LogLevelSelect(
@@ -908,7 +967,19 @@ class DebugConsoleScreen(ModalScreen[None]):
     def _on_refresh_tick(self) -> None:
         """Rebuild the snapshot header (when live) and append new log records."""
         self._poll_snapshot()
+        self._refresh_cost_breakdown_button()
         self._poll_logs()
+
+    def _refresh_cost_breakdown_button(self) -> None:
+        """Show cost detail only when the provider has historical coverage."""
+        if self._cost_breakdown_provider is None:
+            return
+        try:
+            available = bool(self._cost_breakdown_provider())
+        except Exception:
+            logger.debug("Cost breakdown build failed", exc_info=True)
+            available = False
+        self.query_one(f"#{_COST_BREAKDOWN_ID}", Button).display = available
 
     def _poll_snapshot(self) -> None:
         """Rebuild the snapshot header from the host provider, if configured.
@@ -991,7 +1062,7 @@ class DebugConsoleScreen(ModalScreen[None]):
                 asyncio.to_thread(build_langsmith_thread_url, thread_id),
                 timeout=2.0,
             )
-        except (TimeoutError, OSError):
+        except TimeoutError, OSError:
             # Expected: the outer timeout fired or a network error escaped the
             # helper. A passive convenience link merely fails to appear.
             logger.debug(
@@ -1075,6 +1146,38 @@ class DebugConsoleScreen(ModalScreen[None]):
         overlay = select.query_one(SelectOverlay)
         return overlay.display and overlay.region.contains(offset.x, offset.y)
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Open read-only session details."""
+        if event.button.id == _MCP_SERVERS_ID:
+            event.stop()
+            if self._mcp_servers_provider is not None:
+                from deepagents_code.tui.modals.mcp_servers import MCPServersScreen
+
+                self.app.push_screen(MCPServersScreen(self._mcp_servers_provider))
+            return
+        if event.button.id != _COST_BREAKDOWN_ID:
+            return
+        event.stop()
+        if self._cost_breakdown_provider is None:
+            return
+        from deepagents_code.tui.modals.cost_breakdown import CostBreakdownScreen
+
+        try:
+            breakdown = self._cost_breakdown_provider()
+        except Exception:
+            logger.warning("Cost breakdown build failed", exc_info=True)
+            self.app.notify(
+                "Token and cost breakdown unavailable",
+                severity="warning",
+                timeout=3,
+                markup=False,
+            )
+            return
+        if breakdown:
+            self.app.push_screen(
+                CostBreakdownScreen(breakdown, self._cost_breakdown_provider)
+            )
+
     def on_select_changed(self, event: Select.Changed) -> None:
         """Refresh visible records when the log-level filter changes."""
         if event.select.id != _FILTER_SELECT_ID:
@@ -1152,7 +1255,9 @@ class DebugConsoleScreen(ModalScreen[None]):
             The formatted key-hint line.
         """
         return Content.styled(
-            "Esc close · Ctrl+L clear view · c copy visible logs · Enter copy line",
+            f"Esc close {get_glyphs().separator} Ctrl+X clear "
+            f"{get_glyphs().separator} c copy visible logs "
+            f"{get_glyphs().separator} Enter copy line",
             "dim italic",
         )
 

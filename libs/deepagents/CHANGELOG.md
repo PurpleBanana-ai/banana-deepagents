@@ -2,6 +2,261 @@
 
 # Deep Agents Changelog
 
+## [0.7.38](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.37...deepagents==0.7.38) (2026-11-13)
+
+### Bug Fixes
+
+- Exclude results from `ls`, `grep`, and `glob` when a symlink resolves outside the approved search scope. ([#7706](https://github.com/langchain-ai/deepagents/pull/7706))
+
+## [0.7.37](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.36...deepagents==0.7.37) (2026-11-12)
+
+### Bug Fixes
+
+- Cache optional prompt-caching provider lookups in the SDK ([#7585](https://github.com/langchain-ai/deepagents/pull/7585)).
+
+## [0.7.36](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.35...deepagents==0.7.36) (2026-11-12)
+
+### Features
+
+- Pass the agent's backend to middleware that requests it ([#7668](https://github.com/langchain-ai/deepagents/pull/7668)).
+- Record the subagent's checkpoint namespace on the `task` tool message ([#7580](https://github.com/langchain-ai/deepagents/pull/7580)).
+
+### Bug Fixes
+
+- Prevent `FilesystemBackend.download_files` from hanging on FIFO files ([#7663](https://github.com/langchain-ai/deepagents/pull/7663)).
+
+## [0.7.35](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.34...deepagents==0.7.35) (2026-11-09)
+
+### Bug Fixes
+
+- Keep forked subagents on their parent's prompt-cache prefix ([#7628](https://github.com/langchain-ai/deepagents/pull/7628)).
+- Preserve symlink names in virtual filesystem results ([#7618](https://github.com/langchain-ai/deepagents/pull/7618)).
+- Correctly mark `read_file` media and Nemotron nudges as harness notifications ([#7589](https://github.com/langchain-ai/deepagents/pull/7589)).
+
+## [0.7.34](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.33...deepagents==0.7.34) (2026-11-05)
+
+### Bug Fixes
+
+- Fixed summarization cutoff handling by anchoring it to the message ID ([#7567](https://github.com/langchain-ai/deepagents/pull/7567)).
+
+## [0.7.33](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.32...deepagents==0.7.33) (2026-11-05)
+
+### Features
+
+- Raise errors on model refusals by default and report subagent refusals to the parent agent ([#7512](https://github.com/langchain-ai/deepagents/pull/7512)).
+- Add notification metadata to async subagent notifications ([#7334](https://github.com/langchain-ai/deepagents/pull/7334)).
+- Record the `task` call ID on subagent checkpoints ([#7509](https://github.com/langchain-ai/deepagents/pull/7509)).
+
+### Bug Fixes
+
+- Restrict the Python `grep` fallback to the requested file and clip long result lines to a window around the match ([#7539](https://github.com/langchain-ai/deepagents/pull/7539), [#7526](https://github.com/langchain-ai/deepagents/pull/7526)).
+- Report failed compaction with an error status ([#7538](https://github.com/langchain-ai/deepagents/pull/7538)).
+- Promote rubric middleware out of beta ([#7368](https://github.com/langchain-ai/deepagents/pull/7368)).
+
+## [0.7.32](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.31...deepagents==0.7.32) (2026-10-23)
+
+### Performance Improvements
+
+- Avoid importing `langchain_anthropic` and `langchain_openai` at SDK import time ([#7204](https://github.com/langchain-ai/deepagents/pull/7204), [#7185](https://github.com/langchain-ai/deepagents/pull/7185)).
+
+## [0.7.31](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.30...deepagents==0.7.31) (2026-10-23)
+
+### Features
+
+- Expose execution output retention metadata in tracing ([#6876](https://github.com/langchain-ai/deepagents/pull/6876)).
+
+### Bug Fixes
+
+- Omit async task IDs from user replies by default ([#7174](https://github.com/langchain-ai/deepagents/pull/7174)).
+- Preserve filesystem permissions in SDK middleware overrides ([#7166](https://github.com/langchain-ai/deepagents/pull/7166)).
+
+## [0.7.30](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.29...deepagents==0.7.30) (2026-10-22)
+
+### Features
+
+- Async subagent follow-ups can now queue without interrupting active work ([#7082](https://github.com/langchain-ai/deepagents/pull/7082)).
+- Added `notify_parent` ([#7132](https://github.com/langchain-ai/deepagents/pull/7132)) and `webhook` ([#7072](https://github.com/langchain-ai/deepagents/pull/7072)) to `AsyncSubAgent`.
+
+### Bug Fixes
+
+- Async subagent checks now report runs cancelled on the server and omit reasoning from results ([#7060](https://github.com/langchain-ai/deepagents/pull/7060)).
+- Async subagent checks now retry when a thread cannot be read ([#7124](https://github.com/langchain-ai/deepagents/pull/7124)).
+- Summaries now remove reasoning blocks associated with the history they replace ([#7127](https://github.com/langchain-ai/deepagents/pull/7127)).
+- `LocalShellBackend` now enforces output limits in UTF-8 bytes ([#7074](https://github.com/langchain-ai/deepagents/pull/7074)).
+
+## [0.7.29](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.28...deepagents==0.7.29) (2026-10-20)
+
+### Bug Fixes
+
+- `CompositeBackend` now handles routes without a trailing slash ([#7028](https://github.com/langchain-ai/deepagents/pull/7028)).
+- Text edits to binary files are now rejected ([#7069](https://github.com/langchain-ai/deepagents/pull/7069)).
+- In-memory `grep` now skips binary files ([#7032](https://github.com/langchain-ai/deepagents/pull/7032)).
+
+## [0.7.28](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.27...deepagents==0.7.28) (2026-10-16)
+
+### Bug Fixes
+
+- Fixed `ContextHubBackend.glob` to honor the `path` argument ([#6998](https://github.com/langchain-ai/deepagents/pull/6998)).
+
+## [0.7.27](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.26...deepagents==0.7.27) (2026-10-16)
+
+### Features
+
+- Keep the main agent informed of asynchronous subagent status updates ([#6853](https://github.com/langchain-ai/deepagents/pull/6853)).
+
+### Bug Fixes
+
+- Pass subagent names to subagents ([#6987](https://github.com/langchain-ai/deepagents/pull/6987)).
+
+## [0.7.26](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.25...deepagents==0.7.26) (2026-10-15)
+
+### Features
+
+- Async subagents now report when they're waiting for a human. ([#6842](https://github.com/langchain-ai/deepagents/pull/6842))
+- Async subagent runs now appear under their parent's trace and identify the agent that launched them. ([#6823](https://github.com/langchain-ai/deepagents/pull/6823), [#6836](https://github.com/langchain-ai/deepagents/pull/6836))
+- Summarization middleware now exposes its `summarizer`. ([#6900](https://github.com/langchain-ai/deepagents/pull/6900))
+
+### Bug Fixes
+
+- Preserve resolved tool-result paths. ([#6968](https://github.com/langchain-ai/deepagents/pull/6968))
+
+## [0.7.25](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.24...deepagents==0.7.25) (2026-10-13)
+
+### Features
+
+- Read inline skill tool support from model profiles. ([#6879](https://github.com/langchain-ai/deepagents/pull/6879))
+
+### Bug Fixes
+
+- Filesystem permission rules and `interrupt_on` approvals now check both the requested and symlink-resolved paths; previously, `FilesystemBackend` followed symlinks after the check, potentially allowing access to denied paths. Review your rules and approvals for symlink targets. ([#6818](https://github.com/langchain-ai/deepagents/pull/6818))
+- Fixed path-glob `grep` in sandboxes. ([#6910](https://github.com/langchain-ai/deepagents/pull/6910))
+
+### Performance Improvements
+
+- Sandbox searches now prefer ripgrep, and sandbox `grep` skips `.git`. ([#6919](https://github.com/langchain-ai/deepagents/pull/6919), [#6910](https://github.com/langchain-ai/deepagents/pull/6910))
+
+## [0.7.24](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.23...deepagents==0.7.24) (2026-10-12)
+
+### Features
+
+- Added fork mode support for async subagents ([#6739](https://github.com/langchain-ai/deepagents/pull/6739)).
+
+### Bug Fixes
+
+- Recover from context overflow during summary calls ([#6864](https://github.com/langchain-ai/deepagents/pull/6864)).
+- Preserve the parent rubric during parallel subagent calls ([#6849](https://github.com/langchain-ai/deepagents/pull/6849)).
+
+## [0.7.23](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.22...deepagents==0.7.23) (2026-10-07)
+
+### Features
+
+- Pin skills by name with `pinned_skills` in the SDK ([#6810](https://github.com/langchain-ai/deepagents/pull/6810)).
+
+### Bug Fixes
+
+- Ensure each subagent uses its own `SkillsMiddleware` in the skills slot ([#6820](https://github.com/langchain-ai/deepagents/pull/6820)).
+
+## [0.7.22](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.21...deepagents==0.7.22) (2026-10-05)
+
+### Features
+
+- Load a skill's tools only when the skill is read. ([#6552](https://github.com/langchain-ai/deepagents/pull/6552))
+
+### Bug Fixes
+
+- Reset stale encoding when overwriting text. ([#6737](https://github.com/langchain-ai/deepagents/pull/6737))
+
+## [0.7.21](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.20...deepagents==0.7.21) (2026-09-30)
+
+### Features
+
+- `FilesystemMiddleware` can now store blobs on the backend ([#6550](https://github.com/langchain-ai/deepagents/pull/6550)).
+
+## [0.7.20](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.19...deepagents==0.7.20) (2026-09-29)
+
+### Bug Fixes
+
+- Fixed binary content in `StateBackend.upload_files` being tagged as base64 ([#6551](https://github.com/langchain-ai/deepagents/pull/6551)).
+
+## [0.7.19](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.18...deepagents==0.7.19) (2026-09-24)
+
+### Bug Fixes
+
+- Recover when `read_file` media is rejected ([#6515](https://github.com/langchain-ai/deepagents/pull/6515)).
+- Filter unsupported multimodal content through separate middleware ([#6366](https://github.com/langchain-ai/deepagents/pull/6366)).
+- Bound tool offload paths and abbreviate long IDs ([#6519](https://github.com/langchain-ai/deepagents/pull/6519)).
+
+## [0.7.18](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.17...deepagents==0.7.18) (2026-09-22)
+
+### Bug Fixes
+
+- Large tool result previews now more clearly explain when output was clipped or truncated, including byte-cap losses, per-line clipping, and showing truncation notices only when truncation occurs. Legacy large-result preview templates are preserved behind a deprecation path. ([#5567](https://github.com/langchain-ai/deepagents/pull/5567), [#5564](https://github.com/langchain-ai/deepagents/pull/5564), [#5563](https://github.com/langchain-ai/deepagents/pull/5563), [#5568](https://github.com/langchain-ai/deepagents/pull/5568))
+- Task tool calls now reject unknown argument keys instead of silently dropping unexpected input. ([#6299](https://github.com/langchain-ai/deepagents/pull/6299))
+- Correct `FileInfo.size` to represent the file size in bytes across backends. ([#6258](https://github.com/langchain-ai/deepagents/pull/6258))
+
+## [0.7.17](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.16...deepagents==0.7.17) (2026-09-22)
+
+### Bug Fixes
+
+- Preserve the backend exit status when capture metadata is missing. ([#6451](https://github.com/langchain-ai/deepagents/pull/6451))
+- Restrict inline file blocks to supported MIME types. ([#6447](https://github.com/langchain-ai/deepagents/pull/6447))
+
+## [0.7.16](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.15...deepagents==0.7.16) (2026-09-21)
+
+### Features
+
+- Reload skills when `skills_metadata` is reset to `None` ([#6364](https://github.com/langchain-ai/deepagents/pull/6364)).
+
+### Bug Fixes
+
+- Reject parallel edits to the same file to prevent conflicting changes ([#6446](https://github.com/langchain-ai/deepagents/pull/6446)).
+
+## [0.7.15](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.14...deepagents==0.7.15) (2026-09-16)
+
+### Bug Fixes
+
+- Gave tool result offloads without IDs unique paths to avoid collisions. ([#6316](https://github.com/langchain-ai/deepagents/pull/6316))
+- Propagated subagent state keys for provided subagent middleware. ([#5553](https://github.com/langchain-ai/deepagents/pull/5553))
+- Allow colons in model profile keys. ([#6334](https://github.com/langchain-ai/deepagents/pull/6334))
+- Required a real Nemotron task transition for built-in profile. ([#6296](https://github.com/langchain-ai/deepagents/pull/6296))
+
+## [0.7.14](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.13...deepagents==0.7.14) (2026-09-13)
+
+### Features
+
+- Updated `read_file` output formatting. ([#5648](https://github.com/langchain-ai/deepagents/pull/5648))
+
+### Bug Fixes
+
+- Bounded compaction recovery and added validation for input budgets. ([#6267](https://github.com/langchain-ai/deepagents/pull/6267))
+- Fixed invalid partial tool-call patching and updated imputed `ToolMessage` content in `PatchToolCallsMiddleware`. ([#5430](https://github.com/langchain-ai/deepagents/pull/5430), [#6277](https://github.com/langchain-ai/deepagents/pull/6277))
+- Rejected empty `old_string` values in `edit_file` paths. ([#5747](https://github.com/langchain-ai/deepagents/pull/5747))
+- Fixed character counting in `ls` and `glob` output. ([#6204](https://github.com/langchain-ai/deepagents/pull/6204))
+- Improved `glob` tool results to suggest populating `path` when appropriate. ([#6199](https://github.com/langchain-ai/deepagents/pull/6199))
+- Prevented blank read windows from triggering the empty-file warning. ([#5050](https://github.com/langchain-ai/deepagents/pull/5050))
+
+## [0.7.13](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.12...deepagents==0.7.13) (2026-09-02)
+
+### Bug Fixes
+
+- Renamed the SDK subagent mode from `handoff` to `isolated` ([#6030](https://github.com/langchain-ai/deepagents/issues/6030)).
+
+## [0.7.12](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.11...deepagents==0.7.12) (2026-09-01)
+
+### Features
+
+- Added subagent conversation forking in the SDK ([#5714](https://github.com/langchain-ai/deepagents/issues/5714)).
+
+### Bug Fixes
+
+- Fixed glob sorting to tolerate missing `modified_at` values in the SDK ([#4376](https://github.com/langchain-ai/deepagents/issues/4376)).
+
+## [0.7.11](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.10...deepagents==0.7.11) (2026-08-28)
+
+### Features
+
+- Added SDK integration hooks for rubric graders ([#5874](https://github.com/langchain-ai/deepagents/issues/5874))
+
 ## [0.7.10](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.9...deepagents==0.7.10) (2026-08-28)
 
 ### Bug Fixes

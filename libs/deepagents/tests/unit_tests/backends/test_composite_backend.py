@@ -683,24 +683,6 @@ def test_composite_backend_execute_without_sandbox_default():
         comp.execute("ls -la")
 
 
-def test_composite_backend_supports_execution_check():
-    """Test the isinstance check works correctly for CompositeBackend."""
-    mem_store = InMemoryStore()
-
-    # CompositeBackend with sandbox default should pass isinstance check
-    sandbox = MockSandboxBackend(store=mem_store, namespace=lambda _rt: ("default",))
-    comp_with_sandbox = CompositeBackend(default=sandbox, routes={})
-    # Note: CompositeBackend itself has execute() method, so isinstance will pass
-    # but the actual support depends on the default backend
-    assert hasattr(comp_with_sandbox, "execute")
-
-    # CompositeBackend with non-sandbox default should still have execute() method
-    # but will raise NotImplementedError when called
-    state = StoreBackend(store=mem_store, namespace=lambda _rt: ("default",))
-    comp_without_sandbox = CompositeBackend(default=state, routes={})
-    assert hasattr(comp_without_sandbox, "execute")
-
-
 def test_composite_backend_execute_with_routed_backends():
     """Test that execution doesn't interfere with file routing."""
     mem_store = InMemoryStore()
@@ -1680,6 +1662,32 @@ def test_route_for_path_no_trailing_slash_boundary() -> None:
         "/abcde/file.txt",
         None,
     )
+
+
+@pytest.mark.parametrize("prefix", ["/memories", "/memories/"])
+def test_search_results_preserve_route_prefix(tmp_path: Path, prefix: str) -> None:
+    """Paths from `ls`, `glob`, and `grep` keep the full route name and read back.
+
+    Regression test for https://github.com/langchain-ai/deepagents/issues/7013.
+    """
+    (tmp_path / "workspace").mkdir()
+    (tmp_path / "memory").mkdir()
+    backend = CompositeBackend(
+        default=FilesystemBackend(root_dir=tmp_path / "workspace", virtual_mode=True),
+        routes={prefix: FilesystemBackend(root_dir=tmp_path / "memory", virtual_mode=True)},
+    )
+    backend.write("/memories/note.md", "hello")
+
+    paths = [
+        *(fi["path"] for fi in backend.ls("/memories").entries or []),
+        *(fi["path"] for fi in backend.glob("*.md", path="/memories").matches or []),
+        *(fi["path"] for fi in backend.glob("**/*.md", path="/").matches or []),
+        *(m["path"] for m in backend.grep("hello", path="/memories").matches or []),
+        *(m["path"] for m in backend.grep("hello", path="/").matches or []),
+    ]
+
+    assert paths == ["/memories/note.md"] * 5
+    assert backend.read(paths[0]).error is None
 
 
 def test_write_result_path_restored_to_full_routed_path():

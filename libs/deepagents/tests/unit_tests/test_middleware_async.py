@@ -679,8 +679,9 @@ class TestFilesystemMiddlewareAsync:
 
         negative_offset = await read_file_tool.ainvoke({"file_path": "/test.txt", "offset": -1, "limit": 100, "runtime": _runtime()})
         assert negative_offset.status == "success"
-        assert negative_offset.content.startswith("1  Line 1")
-        assert "before the start of the file" in negative_offset.content
+        assert negative_offset.content == (
+            "[Requested offset -1 is before the start of the file; read from line 1 instead.]\n@@ lines 1-3 of 3 @@\nLine 1\nLine 2\nLine 3"
+        )
 
     async def test_aread_file_with_offset(self):
         """Test async read_file tool with offset."""
@@ -820,7 +821,7 @@ class TestFilesystemMiddlewareAsync:
         backend, mem_store = _make_backend(files)
         middleware = FilesystemMiddleware(
             backend=backend,
-            _permissions=[FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")],
+            permissions=[FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")],
         )
         delete_tool = next(tool for tool in middleware.tools if tool.name == "delete")
         result = await delete_tool.ainvoke(
@@ -941,7 +942,7 @@ class TestFilesystemMiddlewareAsync:
         assert "Async Hello world\nAsync Line 2" in result.content
         assert "succeeded" in result.content
         assert "exit code 0" in result.content
-        assert result.artifact == {"exit_code": 0}
+        assert result.artifact == {"exit_code": 0, "truncated": False}
 
     async def test_aexecute_tool_output_formatting_with_failure(self):
         """Test async execute tool formats failure output correctly."""
@@ -985,7 +986,7 @@ class TestFilesystemMiddlewareAsync:
         assert "Async Error: command not found" in result.content
         assert "failed" in result.content
         assert "exit code 127" in result.content
-        assert result.artifact == {"exit_code": 127}
+        assert result.artifact == {"exit_code": 127, "truncated": False}
 
     async def test_aexecute_tool_omits_artifact_exit_code_when_unknown(self):
         """Test async execute tool omits `exit_code` when the backend reports none."""
@@ -1018,7 +1019,7 @@ class TestFilesystemMiddlewareAsync:
 
         assert "async output" in result.content
         assert "exit code" not in result.content
-        assert result.artifact == {}
+        assert result.artifact == {"truncated": False}
 
     async def test_aexecute_tool_error_paths_carry_no_artifact(self):
         """Test async execute tool returns no artifact when no command ran."""
@@ -1097,3 +1098,4 @@ class TestFilesystemMiddlewareAsync:
 
         assert "Async Very long output..." in result.content
         assert "truncated" in result.content
+        assert result.artifact == {"exit_code": 0, "truncated": True}

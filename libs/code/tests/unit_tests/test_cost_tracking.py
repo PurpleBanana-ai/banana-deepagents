@@ -3,20 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-import builtins
 import gc
-import inspect
 import json
 import logging
-import subprocess
-import sys
+import sqlite3
 import threading
-import warnings
+import weakref
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast, get_type_hints
-from unittest.mock import MagicMock, create_autospec, patch
-from uuid import uuid4
+from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
+from uuid import UUID, uuid4
 
 import pytest
 from deepagents.backends import StateBackend
@@ -24,50 +23,68 @@ from deepagents.middleware import SubAgentMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain.agents.middleware.human_in_the_loop import ApproveDecision
-from langchain.agents.middleware.summarization import SummarizationMiddleware
 from langchain.agents.middleware.types import (
     AgentMiddleware,
     ModelRequest,
     ModelResponse,
-    OmitFromInput,
-    PrivateStateAttr,
 )
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
-from langchain_core.outputs import ChatGeneration, ChatResult, LLMResult
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+)
+from langchain_core.outputs import (
+    ChatGeneration,
+    ChatGenerationChunk,
+    ChatResult,
+    LLMResult,
+)
 from langchain_core.tools import BaseTool, tool
-from langgraph.channels import BinaryOperatorAggregate
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph import StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolRuntime  # noqa: TC002  # Runtime tool injection.
 from langgraph.types import Command, Overwrite
 
 from deepagents_code import cost_tracking
 from deepagents_code._fake_models import _ToolBindingFakeModel
+from deepagents_code._session_stats import (
+    SessionStats,
+    finalize_recorded_requests,
+    record_message_usage,
+    record_model_usage_event,
+)
 from deepagents_code.cost_tracking import (
     _CONFIGURED_PROVIDER_METADATA_KEY,
+    _MODEL_INVOCATION_METADATA_KEY,
     _RECORDER_VAR,
     MODEL_USAGE_EVENT_TYPE,
     SESSION_COST_EVENT_TYPE,
+    SUMMARIZATION_STARTED_EVENT_TYPE,
     CostState,
     CostTrackingMiddleware,
     _ModelCallRecord,
     _SessionCostRecorder,
     _set_configured_model_metadata,
     estimate_cost,
-    resolve_message_model,
 )
+from deepagents_code.model_retry import CodeModelRetryMiddleware
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
     from pathlib import Path
 
     from genai_prices import UpdatePrices
     from genai_prices.types import Provider
-    from langchain_core.callbacks import CallbackManagerForLLMRun
+    from langchain_core.callbacks import (
+        AsyncCallbackManagerForLLMRun,
+        CallbackManagerForLLMRun,
+    )
     from langchain_core.language_models import BaseChatModel
     from langchain_core.runnables import RunnableConfig
     from langgraph.runtime import Runtime
+    from starlette.applications import Starlette
 
 KNOWN_MODEL = "claude-sonnet-4-5"
 KNOWN_PROVIDER = "anthropic"
@@ -242,613 +259,39 @@ def _subagent_command(result: dict[str, Any], runtime: ToolRuntime) -> Command[A
 class TestEstimateCost:
     """Tests for the shared `genai-prices` adapter."""
 
-    def test_known_model_returns_positive_cost(self) -> None:
-        cost_usd = estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
-        assert cost_usd is not None
-        assert cost_usd > 0
-
-    def test_unknown_model_returns_none(self) -> None:
-        assert (
-            estimate_cost(
-                _usage(),
-                "definitely-not-a-real-model",
-                "unknown-provider",
-            )
-            is None
-        )
-
-    def test_aggregate_only_usage_returns_none(self) -> None:
-        assert (
-            estimate_cost(
-                {"total_tokens": 1_100},
-                KNOWN_MODEL,
-                KNOWN_PROVIDER,
-            )
-            is None
-        )
-
-    def test_azure_openai_uses_azure_catalog(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import genai_prices
-
-        provider_ids: list[str | None] = []
-
-        def fake_calc_price(
-            usage: object,
-            model_ref: str,
-            *,
-            provider_id: str | None = None,
-        ) -> SimpleNamespace:
-            assert usage is not None
-            assert model_ref == "gpt-5.5"
-            provider_ids.append(provider_id)
-            return SimpleNamespace(total_price=0.42)
-
-        monkeypatch.setattr(genai_prices, "calc_price", fake_calc_price)
-
-        assert estimate_cost(_usage(), "gpt-5.5", "azure_openai") == pytest.approx(0.42)
-        assert provider_ids == ["azure"]
-
-    def test_malformed_price_result_returns_none(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import genai_prices
-
-        monkeypatch.setattr(
-            genai_prices,
-            "calc_price",
-            lambda *_args, **_kwargs: SimpleNamespace(total_price=object()),
-        )
-
-        assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is None
-
-    @pytest.mark.parametrize("bad_total", [float("inf"), float("nan"), -5.0])
-    def test_non_finite_or_negative_price_returns_none(
-        self, monkeypatch: pytest.MonkeyPatch, bad_total: float
-    ) -> None:
-        """A price that is not a usable dollar figure must not reach the total."""
-        import genai_prices
-
-        monkeypatch.setattr(
-            genai_prices,
-            "calc_price",
-            lambda *_args, **_kwargs: SimpleNamespace(total_price=bad_total),
-        )
-
-        assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is None
-
-    def test_unavailable_pricing_package_is_reported_once(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A broken install is a different problem from an unpriced model.
-
-        It makes every request unpriceable, so it is logged at WARNING once per
-        process and exposed through `pricing_data_available` -- otherwise the
-        user is told their models have no published rates.
-        """
-        monkeypatch.setattr(cost_tracking, "_PRICING_UNAVAILABLE", False)
-        real_import = builtins.__import__
-
-        def fail_genai_prices(name: str, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401  # __import__ passthrough
-            if name == "genai_prices":
-                msg = "no genai_prices"
-                raise ImportError(msg)
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", fail_genai_prices)
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is None
-            assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is None
-
-        assert caplog.text.count("Could not load genai-prices") == 1
-        assert not cost_tracking.pricing_data_available()
-
-    def test_azure_fallback_overrides_generic_openai_metadata(self) -> None:
-        message = _message(_usage(), model="gpt-5.5", provider="openai")
-
-        _, provider = resolve_message_model(
-            message,
-            fallback_model="gpt-5.5",
-            fallback_provider="azure_openai",
-        )
-
-        assert provider == "azure_openai"
-
-    def test_codex_subscription_usage_is_not_priced_as_openai_api(self) -> None:
-        assert estimate_cost(_usage(), "gpt-5.4", "openai_codex") is None
-
-    def test_cache_read_is_priced_separately(self) -> None:
-        uncached = estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
-        cached = estimate_cost(
-            _usage(cache_read=900),
-            KNOWN_MODEL,
-            KNOWN_PROVIDER,
-        )
-        assert uncached is not None
-        assert cached is not None
-        assert cached < uncached
-
-    def test_cache_write_is_priced_separately(self) -> None:
-        uncached = estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
-        cached = estimate_cost(
-            _usage(cache_write=900),
-            KNOWN_MODEL,
-            KNOWN_PROVIDER,
-        )
-        assert uncached is not None
-        assert cached is not None
-        assert cached > uncached
-
-    @pytest.mark.parametrize(
-        ("cache_read", "cache_write"),
-        [
-            (1_500, 0),
-            (0, 1_500),
-            (600, 900),
-        ],
-    )
-    def test_cache_buckets_over_the_input_total_still_price(
-        self,
-        cache_read: int,
-        cache_write: int,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """Self-inconsistent provider counts must not drop the whole request.
-
-        `genai-prices` rejects a negative uncached-input count, and that raise
-        is swallowed into `None` -- which would silently remove the request
-        from the durable total rather than estimate it. Clamping keeps an
-        estimate, and the warning keeps the anomaly diagnosable.
-        """
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            cost = estimate_cost(
-                _usage(1_000, 100, cache_read=cache_read, cache_write=cache_write),
-                KNOWN_MODEL,
-                KNOWN_PROVIDER,
-            )
-
-        assert cost is not None
-        assert cost > 0
-        assert "exceed the inclusive input total" in caplog.text
-
-    def test_in_range_cache_buckets_do_not_warn(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert (
-                estimate_cost(
-                    _usage(1_000, 100, cache_read=600, cache_write=100),
-                    KNOWN_MODEL,
-                    KNOWN_PROVIDER,
-                )
-                is not None
-            )
-
-        assert "exceed the inclusive input total" not in caplog.text
-
-    def test_cache_write_alias_is_priced_separately(self) -> None:
-        uncached = estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
-        usage = _usage()
-        usage["input_token_details"] = {"cache_write": 900}
-        cached = estimate_cost(usage, KNOWN_MODEL, KNOWN_PROVIDER)
-
-        assert uncached is not None
-        assert cached is not None
-        assert cached > uncached
-
-    def test_only_one_hour_cache_writes_use_a_distinct_rate(self) -> None:
-        """One-hour writes cost more; five-minute writes price as generic ones.
-
-        The catalog publishes no five-minute cache-write rate, so that bucket
-        falls back to the generic one and only the one-hour split changes the
-        price. Forwarding the five-minute count is inert but forward-compatible.
-        """
-        five_minute_usage = _usage()
-        five_minute_usage["input_token_details"] = {
-            "cache_creation": 0,
-            "ephemeral_5m_input_tokens": 900,
-        }
-        one_hour_usage = _usage()
-        one_hour_usage["input_token_details"] = {
-            "cache_creation": 0,
-            "ephemeral_1h_input_tokens": 900,
-        }
-
-        five_minute = estimate_cost(five_minute_usage, KNOWN_MODEL, KNOWN_PROVIDER)
-        one_hour = estimate_cost(one_hour_usage, KNOWN_MODEL, KNOWN_PROVIDER)
-        generic = estimate_cost(
-            _usage(cache_write=900),
-            KNOWN_MODEL,
-            KNOWN_PROVIDER,
-        )
-
-        assert five_minute is not None
-        assert one_hour is not None
-        assert generic is not None
-        assert five_minute == pytest.approx(generic)
-        assert one_hour > five_minute
-
-    def test_detailed_cache_writes_over_the_input_total_still_price(
-        self, caplog: pytest.LogCaptureFixture
+    @pytest.mark.parametrize("details_reported", [False, True])
+    def test_category_cost_completeness_requires_usage_details(
+        self, details_reported: bool
     ) -> None:
         usage = _usage()
-        usage["input_token_details"] = {
-            "cache_read": 600,
-            "ephemeral_5m_input_tokens": 500,
-            "ephemeral_1h_input_tokens": 500,
-        }
+        if details_reported:
+            usage["input_token_details"] = {}
+            usage["output_token_details"] = {}
+        estimate = cost_tracking._estimate_cost(usage, KNOWN_MODEL, KNOWN_PROVIDER)
+        assert estimate is not None
+        breakdown = cost_tracking._breakdown_for_estimate(estimate)
 
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            cost = estimate_cost(usage, KNOWN_MODEL, KNOWN_PROVIDER)
-
-        assert cost is not None
-        assert cost > 0
-        assert "exceed the inclusive input total" in caplog.text
-        # Per bucket and with the clamped values, so the log says which bucket
-        # lost tokens -- only the one-hour rate carries a premium.
-        assert "5m=500->400" in caplog.text
-        assert "1h=500->0" in caplog.text
-
-    def test_clamping_starves_the_one_hour_bucket_first(self) -> None:
-        """Pin which bucket survives a clamp, because it moves the price.
-
-        Buckets drain in tuple order, so the pricier one-hour writes are zeroed
-        before the five-minute ones and the estimate is biased low. Reversing
-        that order would silently raise every clamped estimate.
-        """
-        over_total = _usage()
-        over_total["input_token_details"] = {
-            "cache_read": 600,
-            "ephemeral_5m_input_tokens": 500,
-            "ephemeral_1h_input_tokens": 500,
-        }
-        surviving_five_minute = _usage()
-        surviving_five_minute["input_token_details"] = {
-            "cache_read": 600,
-            "ephemeral_5m_input_tokens": 400,
-        }
-        surviving_one_hour = _usage()
-        surviving_one_hour["input_token_details"] = {
-            "cache_read": 600,
-            "ephemeral_1h_input_tokens": 400,
-        }
-
-        clamped = estimate_cost(over_total, KNOWN_MODEL, KNOWN_PROVIDER)
-        as_five_minute = estimate_cost(
-            surviving_five_minute, KNOWN_MODEL, KNOWN_PROVIDER
+        detailed_usage = _usage(cache_read=200, cache_write=100)
+        detailed_usage["output_token_details"] = {"reasoning": 50}
+        detailed_estimate = cost_tracking._estimate_cost(
+            detailed_usage, KNOWN_MODEL, KNOWN_PROVIDER
         )
-        as_one_hour = estimate_cost(surviving_one_hour, KNOWN_MODEL, KNOWN_PROVIDER)
+        assert detailed_estimate is not None
+        detailed_breakdown = cost_tracking._breakdown_for_estimate(detailed_estimate)
+        merged = cost_tracking._merge_cost_breakdowns(breakdown, detailed_breakdown)
 
-        assert clamped is not None
-        assert as_five_minute is not None
-        assert as_one_hour is not None
-        assert clamped == pytest.approx(as_five_minute)
-        assert clamped < as_one_hour
-
-    def test_reasoning_and_audio_details_are_forwarded(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        captured: dict[str, int | None] = {}
-
-        class CapturingUsage:
-            def __init__(self, **values: int | None) -> None:
-                captured.update(values)
-
-        def fake_calc_price(
-            usage: object,
-            model_ref: str,
-            *,
-            provider_id: str | None = None,
-        ) -> SimpleNamespace:
-            assert isinstance(usage, CapturingUsage)
-            assert model_ref == KNOWN_MODEL
-            assert provider_id == KNOWN_PROVIDER
-            return SimpleNamespace(total_price=0.42)
-
-        monkeypatch.setattr(
-            cost_tracking,
-            "_load_pricing",
-            lambda: (CapturingUsage, fake_calc_price),
-        )
-        usage = _usage()
-        usage["input_token_details"] = {"audio": 250}
-        usage["output_token_details"] = {"audio": 25, "reasoning": 50}
-
-        assert estimate_cost(usage, KNOWN_MODEL, KNOWN_PROVIDER) == pytest.approx(0.42)
-        assert captured["input_audio_tokens"] == 250
-        assert captured["output_audio_tokens"] == 25
-        assert captured["output_tokens"] == 100
-        assert captured["output_reasoning_tokens"] == 50
-
-    def test_perplexity_reasoning_is_added_to_output_total(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Perplexity reports reasoning outside its completion-token total."""
-        captured: dict[str, int | None] = {}
-
-        class CapturingUsage:
-            def __init__(self, **values: int | None) -> None:
-                captured.update(values)
-
-        def fake_calc_price(
-            usage: object,
-            model_ref: str,
-            *,
-            provider_id: str | None = None,
-        ) -> SimpleNamespace:
-            assert isinstance(usage, CapturingUsage)
-            assert model_ref == "sonar-deep-research"
-            assert provider_id == "perplexity"
-            return SimpleNamespace(total_price=0.42)
-
-        monkeypatch.setattr(
-            cost_tracking,
-            "_load_pricing",
-            lambda: (CapturingUsage, fake_calc_price),
-        )
-        usage = _usage(output_tokens=100)
-        usage["output_token_details"] = {"reasoning": 50}
-
-        assert estimate_cost(
-            usage, "sonar-deep-research", "perplexity"
-        ) == pytest.approx(0.42)
-        assert captured["output_tokens"] == 150
-        assert captured["output_reasoning_tokens"] == 50
-
-    def test_forwarded_usage_keys_are_recognized_by_genai_prices(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Every key `estimate_cost` forwards must be one `Usage` recognizes.
-
-        `Usage` only warns for an unrecognized key and then drops it, so a rename
-        anywhere in the allowed dependency range would silently stop pricing that
-        bucket instead of failing. Feeding the real `Usage` exactly what the code
-        sent -- rather than a hand-copied list -- keeps this from drifting.
-        """
-        captured: dict[str, int] = {}
-
-        class CapturingUsage:
-            def __init__(self, **values: int | None) -> None:
-                # Accumulate only what was actually forwarded: a later request
-                # that omits a bucket passes `None` and would otherwise erase
-                # the key an earlier one contributed.
-                captured.update(
-                    {key: value for key, value in values.items() if value is not None}
-                )
-
-        monkeypatch.setattr(
-            cost_tracking,
-            "_load_pricing",
-            lambda: (
-                CapturingUsage,
-                lambda *_args, **_kwargs: SimpleNamespace(total_price=0.0),
-            ),
-        )
-        # Separate calls because the overlap guard drops input audio whenever
-        # cached tokens are present, so one request cannot forward every key.
-        audio = _usage()
-        audio["input_token_details"] = {"audio": 100}
-        audio["output_token_details"] = {"audio": 25, "reasoning": 50}
-        estimate_cost(audio, KNOWN_MODEL, KNOWN_PROVIDER)
-        writes = _usage()
-        writes["input_token_details"] = {
-            "ephemeral_5m_input_tokens": 200,
-            "ephemeral_1h_input_tokens": 200,
-        }
-        estimate_cost(writes, KNOWN_MODEL, KNOWN_PROVIDER)
-        estimate_cost(_usage(cache_read=300), KNOWN_MODEL, KNOWN_PROVIDER)
-
-        forwarded = captured
-        assert "cache_read_tokens" in forwarded
-        assert "cache_write_5m_tokens" in forwarded
-        assert "cache_write_1h_tokens" in forwarded
-        assert "input_audio_tokens" in forwarded
-        assert "output_audio_tokens" in forwarded
-        assert "output_reasoning_tokens" in forwarded
-
-        from genai_prices import Usage
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            Usage(**forwarded)
-
-    def test_audio_with_cache_reads_still_prices(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A model pricing the audio/cache intersection must stay priceable.
-
-        `gemini-2.5-flash` prices `cache_audio_read_mtok`, so reporting both audio
-        and cache reads makes `genai-prices` demand the intersection LangChain
-        never provides. Without the guard the whole request would be dropped from
-        the session total instead of priced at the ordinary input rate.
-        """
-        monkeypatch.setattr(cost_tracking, "_AUDIO_CACHE_OVERLAP_REPORTED", False)
-        usage = _usage()
-        usage["input_token_details"] = {"audio": 250, "cache_read": 400}
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            cost = estimate_cost(usage, "gemini-2.5-flash", "google")
-
-        assert cost is not None
-        assert cost > 0
-        assert "audio/cache intersection" in caplog.text
-
-    def test_audio_with_cache_writes_still_prices(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A model pricing audio cache writes must stay priceable.
-
-        `gemini-2.5-flash` prices `cache_audio_write_mtok`, but LangChain does not
-        provide that intersection. The audio split must be suppressed so
-        `genai-prices` does not reject and omit the entire request.
-        """
-        monkeypatch.setattr(cost_tracking, "_AUDIO_CACHE_OVERLAP_REPORTED", False)
-        audio_and_writes = _usage()
-        audio_and_writes["input_token_details"] = {
-            "audio": 250,
-            "ephemeral_5m_input_tokens": 300,
-        }
-        writes_only = _usage()
-        writes_only["input_token_details"] = {"ephemeral_5m_input_tokens": 300}
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            with_audio = estimate_cost(audio_and_writes, "gemini-2.5-flash", "google")
-        without_audio = estimate_cost(writes_only, "gemini-2.5-flash", "google")
-
-        assert with_audio is not None
-        assert without_audio is not None
-        assert with_audio == pytest.approx(without_audio)
-        assert "audio/cache intersection" in caplog.text
-
-    def test_audio_and_reasoning_details_change_the_price(self) -> None:
-        """Assert the new detail buckets bill, not merely that they are passed."""
-        input_audio = _usage()
-        input_audio["input_token_details"] = {"audio": 250}
-        output_audio = _usage()
-        output_audio["output_token_details"] = {"audio": 50}
-
-        assert (priced := estimate_cost(input_audio, "gpt-4o-transcribe", "openai"))
-        assert (plain := estimate_cost(_usage(), "gpt-4o-transcribe", "openai"))
-        assert priced > plain
-
-        assert (
-            audio_out := estimate_cost(output_audio, "gemini-live-2.5-flash", "google")
-        )
-        assert (plain_out := estimate_cost(_usage(), "gemini-live-2.5-flash", "google"))
-        assert audio_out > plain_out
-
-        # Perplexity reports reasoning outside its completion total, so this is
-        # 150 output tokens of which 50 bill at the cheaper reasoning rate --
-        # strictly less than 150 tokens all billed as ordinary output.
-        split_reasoning = _usage(output_tokens=100)
-        split_reasoning["output_token_details"] = {"reasoning": 50}
-        assert (
-            with_reasoning := estimate_cost(
-                split_reasoning, "sonar-deep-research", "perplexity"
+        for category in ("cache_read", "cache_creation", "reasoning"):
+            cost = getattr(estimate, f"{category}_cost_usd")
+            if details_reported:
+                assert cost == pytest.approx(0.0)
+            else:
+                assert cost is None
+            assert dict(breakdown)[f"{category}_cost_complete"] is details_reported
+            assert dict(merged)[f"{category}_cost_complete"] is details_reported
+            assert dict(merged)[f"{category}_tokens_complete"] is details_reported
+            assert dict(merged)[f"{category}_cost_usd"] == pytest.approx(
+                dict(detailed_breakdown)[f"{category}_cost_usd"]
             )
-        )
-        assert (
-            all_output := estimate_cost(
-                _usage(output_tokens=150), "sonar-deep-research", "perplexity"
-            )
-        )
-        assert with_reasoning < all_output
-
-    def test_a_rejected_usage_schema_reports_broken_pricing(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A `Usage` constructor that refuses fixed fields is a broken install.
-
-        Left indistinguishable, a total pricing outage reaches the user as
-        "pricing isn't available for the models used", which sends them to change
-        models instead of repairing the install.
-        """
-        rejection = "unexpected keyword argument 'cache_write_5m_tokens'"
-
-        class RejectingUsage:
-            def __init__(self, **_values: int | None) -> None:
-                raise TypeError(rejection)
-
-        monkeypatch.setattr(cost_tracking, "_PRICING_CONTRACT_BROKEN", False)
-        monkeypatch.setattr(
-            cost_tracking,
-            "_load_pricing",
-            lambda: (
-                RejectingUsage,
-                lambda *_args, **_kwargs: SimpleNamespace(total_price=0.0),
-            ),
-        )
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is None
-
-        assert not cost_tracking.pricing_data_available()
-        assert "rejected the usage schema" in caplog.text
-
-    def test_a_request_specific_value_error_keeps_pricing_healthy(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """One invalid decomposition must not look like a broken installation."""
-
-        def rejecting_calc_price(*_args: object, **_kwargs: object) -> object:
-            msg = "missing cache_audio_write_tokens overlap"
-            raise ValueError(msg)
-
-        monkeypatch.setattr(cost_tracking, "_PRICING_CONTRACT_BROKEN", False)
-        monkeypatch.setattr(
-            cost_tracking, "_load_pricing", lambda: (dict, rejecting_calc_price)
-        )
-
-        assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is None
-        assert cost_tracking.pricing_data_available()
-
-    def test_an_uncovered_model_does_not_report_broken_pricing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A model with no published rates must still read as a healthy install."""
-        monkeypatch.setattr(cost_tracking, "_PRICING_CONTRACT_BROKEN", False)
-
-        assert estimate_cost(_usage(), "no-such-model-in-the-catalog", "") is None
-        assert cost_tracking.pricing_data_available()
-
-    def test_a_successful_price_clears_an_earlier_contract_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """One rejected request must not condemn a session that prices fine."""
-        monkeypatch.setattr(cost_tracking, "_PRICING_CONTRACT_BROKEN", True)
-
-        assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is not None
-        assert cost_tracking.pricing_data_available()
-
-    def test_detail_over_its_total_is_clamped_and_reported(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A detail bucket larger than its total is clamped, not dropped.
-
-        Anthropic rather than Perplexity: the Perplexity path folds reasoning into
-        the output total first, so the clamp could never fire there.
-        """
-        usage = _usage(output_tokens=100)
-        usage["output_token_details"] = {"reasoning": 500}
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            cost = estimate_cost(usage, KNOWN_MODEL, KNOWN_PROVIDER)
-
-        assert cost is not None
-        assert "field=output reasoning reported=500 clamped=100" in caplog.text
-
-    def test_cache_tokens_are_not_double_counted(self) -> None:
-        uncached = estimate_cost(
-            _usage(output_tokens=0),
-            KNOWN_MODEL,
-            KNOWN_PROVIDER,
-        )
-        all_cache_read = estimate_cost(
-            _usage(output_tokens=0, cache_read=1_000),
-            KNOWN_MODEL,
-            KNOWN_PROVIDER,
-        )
-        assert uncached is not None
-        assert all_cache_read is not None
-        assert all_cache_read < uncached
-
-    def test_module_import_does_not_import_genai_prices(self) -> None:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import sys; import deepagents_code.cost_tracking; "
-                    "assert 'genai_prices' not in sys.modules"
-                ),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, result.stderr
 
 
 def _override_catalog(
@@ -892,6 +335,77 @@ def _override_model(
 class TestPriceOverrides:
     """Local pricing catalogs consulted after a primary `LookupError`."""
 
+    @pytest.mark.parametrize("reasoning_rate", [None, 20.0, 0.0])
+    def test_reasoning_cost_preserves_explicit_override_rates(
+        self, monkeypatch: pytest.MonkeyPatch, reasoning_rate: float | None
+    ) -> None:
+        prices = {"input_mtok": 2.0, "output_mtok": 10.0}
+        if reasoning_rate is not None:
+            prices["output_reasoning_mtok"] = reasoning_rate
+        self._install_built_ins(monkeypatch, [_override_model(_OVERRIDE_MODEL, prices)])
+        usage = _usage(output_tokens=1_000)
+        usage["output_token_details"] = {"reasoning": 500}
+
+        estimate = cost_tracking._estimate_cost(usage, _OVERRIDE_MODEL, "dcode-test")
+
+        assert estimate is not None
+        expected = 500 * (10 if reasoning_rate is None else reasoning_rate) / 1_000_000
+        assert estimate.reasoning_cost_usd == pytest.approx(expected)
+        assert estimate.output_cost_usd == pytest.approx(0.005 + expected)
+        assert estimate.total_cost_usd == pytest.approx(0.007 + expected)
+
+    @pytest.mark.parametrize(
+        ("input_tokens", "reasoning_cost"), [(1_000, 0.005), (3_000, 0.01)]
+    )
+    def test_inherited_reasoning_cost_uses_parent_pricing_tier(
+        self, monkeypatch: pytest.MonkeyPatch, input_tokens: int, reasoning_cost: float
+    ) -> None:
+        model = _override_model(_OVERRIDE_MODEL, {"input_mtok": 2.0})
+        model["prices"]["output_mtok"] = {
+            "base": 10.0,
+            "tiers": [{"start": 2_000, "price": 20.0}],
+        }
+        self._install_built_ins(monkeypatch, [model])
+        usage = _usage(input_tokens=input_tokens, output_tokens=1_000)
+        usage["output_token_details"] = {"reasoning": 500}
+
+        estimate = cost_tracking._estimate_cost(usage, _OVERRIDE_MODEL, "dcode-test")
+
+        assert estimate is not None
+        assert estimate.reasoning_cost_usd == pytest.approx(reasoning_cost)
+        assert estimate.output_cost_usd == pytest.approx(reasoning_cost * 2)
+
+    def test_inherited_cache_cost_preserves_explicit_rates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._install_built_ins(
+            monkeypatch,
+            [
+                _override_model(
+                    _OVERRIDE_MODEL,
+                    {
+                        "input_mtok": 2.0,
+                        "output_mtok": 10.0,
+                        "cache_write_mtok": 3.0,
+                        "cache_write_1h_mtok": 4.0,
+                    },
+                )
+            ],
+        )
+        usage = _usage()
+        usage["input_token_details"] = {
+            "cache_read": 100,
+            "ephemeral_5m_input_tokens": 200,
+            "ephemeral_1h_input_tokens": 300,
+        }
+
+        estimate = cost_tracking._estimate_cost(usage, _OVERRIDE_MODEL, "dcode-test")
+
+        assert estimate is not None
+        assert estimate.cache_read_cost_usd == pytest.approx(0.0002)
+        assert estimate.cache_creation_cost_usd == pytest.approx(0.0018)
+        assert estimate.input_cost_usd == pytest.approx(0.0028)
+
     def _install_raw_built_ins(
         self, monkeypatch: pytest.MonkeyPatch, raw: list[dict[str, Any]]
     ) -> None:
@@ -926,486 +440,6 @@ class TestPriceOverrides:
         (tmp_path / "prices.json").write_text(
             json.dumps(_override_catalog(models)), encoding="utf-8"
         )
-
-    def test_built_in_override_prices_a_model_the_catalog_lacks(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The decomposition is genai-prices', not naive input/output math.
-
-        Every published bucket bills at its own rate, so the expected total is
-        computed bucket by bucket: 100 uncached input + 800 cache reads + 100
-        cache writes + 60 ordinary output + 40 reasoning output.
-        """
-        self._install_built_ins(
-            monkeypatch,
-            [
-                _override_model(
-                    _OVERRIDE_MODEL,
-                    {
-                        "input_mtok": 1.0,
-                        "output_mtok": 2.0,
-                        "cache_read_mtok": 0.1,
-                        "cache_write_mtok": 1.25,
-                        "output_reasoning_mtok": 0.5,
-                    },
-                )
-            ],
-        )
-        usage = _usage(cache_read=800, cache_write=100)
-        usage["output_token_details"] = {"reasoning": 40}
-
-        cost = estimate_cost(usage, _OVERRIDE_MODEL, "dcode-test")
-
-        expected = (
-            100 * 1.0 + 800 * 0.1 + 100 * 1.25 + 60 * 2.0 + 40 * 0.5
-        ) / 1_000_000
-        assert cost == pytest.approx(expected)
-
-    def test_built_in_override_prices_without_a_provider_id(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """An empty provider searches every override provider's models."""
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(_OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0})],
-        )
-
-        assert estimate_cost(_usage(), _OVERRIDE_MODEL, "") == pytest.approx(
-            (1_000 * 1.0 + 100 * 2.0) / 1_000_000
-        )
-
-    def test_an_unclaimed_provider_id_falls_through_to_the_full_sweep(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A provider id nothing claims still reaches every override model.
-
-        The fixture provider declares no `provider_match` and no `model_match`,
-        so `find_provider_by_id` cannot claim it and inference finds nothing --
-        leaving the full sweep, which is the last-resort behavior that keeps
-        entries reachable where upstream would raise. Prefix-matched so the
-        sweep is resolving through `ModelInfo.match` rather than an exact id.
-        """
-        self._install_built_ins(
-            monkeypatch,
-            [
-                _override_model(
-                    _OVERRIDE_MODEL,
-                    {"input_mtok": 1.0, "output_mtok": 2.0},
-                    match_prefix="dcode-override-",
-                )
-            ],
-        )
-
-        assert estimate_cost(_usage(), _OVERRIDE_MODEL, "unmatched-provider") == (
-            pytest.approx((1_000 * 1.0 + 100 * 2.0) / 1_000_000)
-        )
-
-    def test_model_match_inference_wins_over_the_full_sweep(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A `model_match` claim narrows the search, as upstream's does.
-
-        Two providers carry the model at different rates and neither id matches
-        the request. Only the second declares `model_match`, so inference must
-        narrow to it; a sweep would reach the first provider and bill its rate
-        instead. The rates are what tell the two paths apart.
-        """
-        prices = {"input_mtok": 1.0, "output_mtok": 2.0}
-        claimed = {"input_mtok": 3.0, "output_mtok": 6.0}
-        self._install_raw_built_ins(
-            monkeypatch,
-            [
-                *_override_catalog(
-                    [_override_model(_OVERRIDE_MODEL, prices)], provider_id="swept"
-                ),
-                *_override_catalog(
-                    [_override_model(_OVERRIDE_MODEL, claimed)],
-                    provider_id="claimant",
-                    model_match={"starts_with": "dcode-override-"},
-                ),
-            ],
-        )
-
-        assert estimate_cost(_usage(), _OVERRIDE_MODEL, "unmatched-provider") == (
-            pytest.approx((1_000 * 3.0 + 100 * 6.0) / 1_000_000)
-        )
-
-    def test_a_matched_provider_id_wins_over_a_model_match_claim(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The top rung of the ladder: an id claim beats an inferred claim.
-
-        Two providers carry the model. One is named by the request; the other
-        claims it via `model_match`. Swapping the two branches in
-        `_find_override_model` is otherwise caught by nothing, and the rates are
-        what tell them apart.
-        """
-        self._install_raw_built_ins(
-            monkeypatch,
-            [
-                *_override_catalog(
-                    [
-                        _override_model(
-                            _OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0}
-                        )
-                    ],
-                    provider_id="named",
-                ),
-                *_override_catalog(
-                    [
-                        _override_model(
-                            _OVERRIDE_MODEL, {"input_mtok": 3.0, "output_mtok": 6.0}
-                        )
-                    ],
-                    provider_id="claimant",
-                    model_match={"starts_with": "dcode-override-"},
-                ),
-            ],
-        )
-
-        assert estimate_cost(_usage(), _OVERRIDE_MODEL, "named") == pytest.approx(
-            (1_000 * 1.0 + 100 * 2.0) / 1_000_000
-        )
-
-    def test_a_claiming_provider_without_the_model_is_a_miss_not_a_sweep(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A claim is final: the search does not fall through past it.
-
-        The request names a provider that exists in the catalog but does not
-        carry the model, while another provider does. Reporting nothing is the
-        intended outcome -- a file that names a provider is taken at its word
-        about which models it serves, and sweeping past it would bill some other
-        provider's copy of the model. Pinned because the alternative reads like a
-        bug fix, and "fixing" it would silently change which rate bills.
-        """
-        self._install_raw_built_ins(
-            monkeypatch,
-            [
-                *_override_catalog([], provider_id="claimant"),
-                *_override_catalog(
-                    [
-                        _override_model(
-                            _OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0}
-                        )
-                    ],
-                    provider_id="holder",
-                ),
-            ],
-        )
-
-        assert estimate_cost(_usage(), _OVERRIDE_MODEL, "claimant") is None
-
-    def test_a_sweep_that_prices_under_another_provider_warns(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The one path here that can bill a confidently wrong figure.
-
-        The same model id is commonly published by several providers at very
-        different rates, so an entry reached by a sweep may be the wrong
-        provider's copy. Unlike every other outcome, this hands the user a dollar
-        figure rather than no figure, so it must not stay at DEBUG.
-        """
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(_OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0})],
-        )
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            cost = estimate_cost(_usage(), _OVERRIDE_MODEL, "some-other-provider")
-            estimate_cost(_usage(), _OVERRIDE_MODEL, "some-other-provider")
-
-        assert cost == pytest.approx((1_000 * 1.0 + 100 * 2.0) / 1_000_000)
-        assert caplog.text.count("the request ran against provider") == 1
-        assert "'dcode-test'" in caplog.text
-        assert "'some-other-provider'" in caplog.text
-
-    def test_pricing_under_the_named_provider_does_not_warn(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The mismatch warning must not fire on the ordinary case."""
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(_OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0})],
-        )
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is not None
-
-        assert "the request ran against provider" not in caplog.text
-
-    def test_user_file_prices_a_model_both_catalogs_lack(self, tmp_path: Path) -> None:
-        self._install_user_file(
-            tmp_path,
-            [
-                _override_model(
-                    _OVERRIDE_USER_MODEL, {"input_mtok": 4.0, "output_mtok": 8.0}
-                )
-            ],
-        )
-
-        assert estimate_cost(_usage(), _OVERRIDE_USER_MODEL, "dcode-test") == (
-            pytest.approx((1_000 * 4.0 + 100 * 8.0) / 1_000_000)
-        )
-
-    def test_user_file_beats_a_conflicting_built_in_entry(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Same `(provider id, model id)`: the user rate must be the one used."""
-        self._install_built_ins(
-            monkeypatch,
-            [
-                _override_model(
-                    _OVERRIDE_CONFLICT_MODEL,
-                    {"input_mtok": 100.0, "output_mtok": 2.0},
-                )
-            ],
-        )
-        self._install_user_file(
-            tmp_path,
-            [
-                _override_model(
-                    _OVERRIDE_CONFLICT_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0}
-                )
-            ],
-        )
-
-        assert estimate_cost(_usage(), _OVERRIDE_CONFLICT_MODEL, "dcode-test") == (
-            pytest.approx((1_000 * 1.0 + 100 * 2.0) / 1_000_000)
-        )
-
-    def test_user_provider_keeps_non_conflicting_bundled_models(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """A partial user provider supplements rather than hides built-ins."""
-        self._install_built_ins(
-            monkeypatch,
-            [
-                _override_model(
-                    _OVERRIDE_BUNDLED_MODEL,
-                    {"input_mtok": 3.0, "output_mtok": 6.0},
-                )
-            ],
-        )
-        self._install_user_file(
-            tmp_path,
-            [
-                _override_model(
-                    _OVERRIDE_USER_MODEL,
-                    {"input_mtok": 1.0, "output_mtok": 2.0},
-                )
-            ],
-        )
-
-        assert estimate_cost(_usage(), _OVERRIDE_BUNDLED_MODEL, "dcode-test") == (
-            pytest.approx((1_000 * 3.0 + 100 * 6.0) / 1_000_000)
-        )
-
-    def test_overrides_are_not_consulted_when_the_primary_catalog_covers_the_model(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Upstream wins: a `calc_price` success never reaches the overrides."""
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(KNOWN_MODEL, {"input_mtok": 999.0, "output_mtok": 999.0})],
-        )
-        # The built-in fixture has no `model_match` and KNOWN_PROVIDER does not
-        # match its id, so were the overrides consulted the request would price
-        # at the absurd fixture rate instead of the real catalog one.
-        cost = estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
-        assert cost is not None
-        assert cost < 0.01
-
-    def test_malformed_user_file_warns_once_and_built_ins_still_price(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(_OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0})],
-        )
-        (tmp_path / "prices.json").write_text("{not json", encoding="utf-8")
-
-        # Twice, so the count below means "once per process" rather than "once
-        # per call" -- the claim the cached one-shot build is what buys.
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is not None
-            assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is not None
-
-        # Count the message rather than the filename: the file's path is
-        # interpolated into it, so a substring count would also be counting
-        # however many times `tmp_path` happens to appear.
-        assert caplog.text.count("Could not parse the pricing overrides") == 1
-        assert "ignoring that source" in caplog.text
-        assert cost_tracking.pricing_data_available()
-
-    def test_schema_invalid_user_file_warns_once_and_built_ins_still_price(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(_OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0})],
-        )
-        (tmp_path / "prices.json").write_text(
-            json.dumps([{"id": "dcode-test", "bogus": True}]), encoding="utf-8"
-        )
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is not None
-            assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is not None
-
-        assert caplog.text.count("failed validation") == 1
-        assert cost_tracking.pricing_data_available()
-
-    def test_unreadable_user_file_warns_once_and_built_ins_still_price(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """A directory where the file should be is the portable EISDIR case.
-
-        Permanent rather than transient: a directory does not become a readable
-        file on retry, so the build caches and the second call does not re-read.
-        Classifying it transient would cost a re-read and a full re-validation of
-        both catalogs on every unpriced request for the life of the process,
-        silently -- see `_TRANSIENT_READ_ERRNOS`.
-        """
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(_OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0})],
-        )
-        (tmp_path / "prices.json").mkdir()
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is not None
-            assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is not None
-
-        assert caplog.text.count("Could not read the pricing overrides") == 1
-        assert cost_tracking._PRICE_OVERRIDES is not None
-        assert cost_tracking.pricing_data_available()
-
-    def test_a_non_utf8_user_file_is_reported_and_not_retried(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """A UTF-16 or binary `prices.json` raises `UnicodeDecodeError`.
-
-        That is a `ValueError`, not an `OSError`, so it never reaches the errno
-        classification -- and the same bytes cannot decode differently later, so
-        it must cache like any other deterministic outcome.
-        """
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(_OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0})],
-        )
-        (tmp_path / "prices.json").write_bytes(b"\xff\xfe[\x00]\x00")
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is not None
-
-        assert "as UTF-8 text" in caplog.text
-        assert cost_tracking._PRICE_OVERRIDES is not None
-        assert cost_tracking.pricing_data_available()
-
-    def test_a_deterministic_failure_on_one_source_does_not_spam_the_other(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """Warn-once must not depend on the build having been cached.
-
-        A transient failure on one source suppresses caching by design, so the
-        *other* source's deterministic warning would re-fire on every unpriced
-        request if it relied on the cache for deduplication rather than on
-        `_report_override_once`.
-        """
-        import errno
-        import pathlib
-
-        # Built-ins are structurally invalid, deterministically. The user file
-        # read fails transiently every time, so no build ever caches.
-        self._install_raw_built_ins(monkeypatch, [{"id": "dcode-test", "bogus": True}])
-        real_read_text = pathlib.Path.read_text
-
-        def always_flaky(self: Path, *args: Any, **kwargs: Any) -> str:
-            if self.name == "prices.json":
-                raise OSError(errno.EMFILE, "too many open files")
-            return real_read_text(self, *args, **kwargs)
-
-        monkeypatch.setattr(pathlib.Path, "read_text", always_flaky)
-        self._install_user_file(tmp_path, [])
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            for _ in range(3):
-                assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is None
-
-        assert cost_tracking._PRICE_OVERRIDES is None
-        assert caplog.text.count("failed validation") == 1
-        assert caplog.text.count("Could not read the pricing overrides") == 1
-
-    def test_invalid_overrides_do_not_touch_bundled_pricing_health(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A bad user file must not masquerade as a broken pricing install."""
-        (tmp_path / "prices.json").write_text("{not json", encoding="utf-8")
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is not None
-
-        assert cost_tracking.pricing_data_available()
-
-    def test_a_missing_user_file_is_a_silent_no_op(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), "no-such-model-in-any-catalog", "") is None
-
-        assert "prices.json" not in caplog.text
-
-    def test_auto_update_snapshot_swap_cannot_clobber_overrides(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Composes with #5264: the hourly swap leaves override pricing intact.
-
-        Overrides live outside the snapshot mechanism precisely because
-        `UpdatePrices` wholesale-replaces the custom snapshot every refresh.
-        Installing an empty snapshot -- the most destructive thing an
-        auto-update can do to the primary catalog -- must not change where the
-        override rate comes from.
-        """
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(_OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0})],
-        )
-
-        before = estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test")
-
-        import genai_prices.data_snapshot
-
-        genai_prices.data_snapshot.set_custom_snapshot(
-            genai_prices.data_snapshot.DataSnapshot(providers=[], from_auto_update=True)
-        )
-        # Drop the cached build, so the second call rebuilds the catalog *after*
-        # the swap. Left cached, `after` would come back from the cache no matter
-        # what the swap did to the override path, and this would be a test of the
-        # cache rather than of the independence it claims to pin.
-        monkeypatch.setattr(cost_tracking, "_PRICE_OVERRIDES", None)
-        try:
-            after = estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test")
-        finally:
-            genai_prices.data_snapshot.set_custom_snapshot(None)
-
-        assert before is not None
-        assert after == pytest.approx(before)
 
     def test_an_override_stops_being_consulted_once_upstream_covers_the_model(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1455,348 +489,6 @@ class TestPriceOverrides:
             genai_prices.data_snapshot.set_custom_snapshot(None)
 
         assert after == pytest.approx((1_000 * 1.0 + 100 * 2.0) / 1_000_000)
-
-    def test_editing_the_user_file_mid_session_needs_a_restart(
-        self, tmp_path: Path
-    ) -> None:
-        """The merged catalog is built once per process, deliberately.
-
-        Documented here because it is user-visible and otherwise invisible in the
-        code: without a test, adding mtime-based reloading looks free, and the
-        restart requirement `_PRICE_OVERRIDES` documents would quietly stop being
-        true.
-        """
-        self._install_user_file(
-            tmp_path,
-            [
-                _override_model(
-                    _OVERRIDE_USER_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0}
-                )
-            ],
-        )
-        first = estimate_cost(_usage(), _OVERRIDE_USER_MODEL, "dcode-test")
-
-        self._install_user_file(
-            tmp_path,
-            [
-                _override_model(
-                    _OVERRIDE_USER_MODEL, {"input_mtok": 50.0, "output_mtok": 50.0}
-                )
-            ],
-        )
-
-        assert first == pytest.approx((1_000 * 1.0 + 100 * 2.0) / 1_000_000)
-        assert estimate_cost(_usage(), _OVERRIDE_USER_MODEL, "dcode-test") == (
-            pytest.approx(first)
-        )
-
-    def test_the_bundled_override_resource_ships_and_parses(self) -> None:
-        """The wheel `include` for `bundled_prices.json` is load-bearing.
-
-        Every other built-in test patches the read helper away, so without this
-        a dropped `pyproject.toml` include or a renamed resource would ship with
-        a green suite and a silently dead maintainer catalog.
-
-        The payload is parsed rather than merely shape-checked, because a schema
-        typo in the first real stopgap entry has no louder symptom in production:
-        `_price_overrides` logs one warning, drops the source, and the model goes
-        on showing $0 -- exactly what it showed before the entry was added.
-        Deliberately not asserted empty, so adding that first entry does not
-        red-fail this test and invite someone to weaken it.
-        """
-        from genai_prices.types import _providers_from_raw
-
-        payload, transient = cost_tracking._read_override_source(None)
-
-        assert transient is False
-        assert isinstance(payload, list)
-        assert _providers_from_raw(payload) is not None
-
-    def test_every_bundled_override_entry_is_priced_and_links_upstream(self) -> None:
-        """`bundled_prices.README.md`'s policy, enforced instead of just written.
-
-        The policy -- every entry names its upstream genai-prices PR/issue in
-        `price_comments`, so nobody has to remember why it is here or when to
-        remove it -- otherwise depends on a maintainer noticing a `.README.md`
-        next to a data file. An entry with no rates is the other silent defect:
-        it validates, matches, and prices at $0.
-        """
-        from genai_prices.types import _providers_from_raw
-
-        payload, _ = cost_tracking._read_override_source(None)
-        assert isinstance(payload, list)
-
-        for provider in _providers_from_raw(payload):
-            for model in provider.models:
-                where = f"{provider.id}/{model.id}"
-                assert model.prices, f"{where} carries no rates"
-                comments = model.price_comments or provider.price_comments or ""
-                assert "genai-prices" in comments, (
-                    f"{where} must link its upstream genai-prices PR/issue in "
-                    f"`price_comments` (see bundled_prices.README.md); got "
-                    f"{comments!r}"
-                )
-
-    def test_a_missing_bundled_resource_is_reported(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Unlike an absent user file, absent package data is always a defect."""
-        monkeypatch.setattr(
-            cost_tracking, "_BUNDLED_OVERRIDES_RESOURCE", "no-such-prices.json"
-        )
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            payload, transient = cost_tracking._read_override_source(None)
-
-        assert payload is None
-        assert transient is False
-        assert "shipped without its package data" in caplog.text
-
-    def test_a_non_array_user_payload_is_rejected_with_the_schema_named(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """`{"providers": [...]}` is the shape users assume; say what is wanted."""
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(_OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0})],
-        )
-        (tmp_path / "prices.json").write_text(
-            json.dumps({"providers": _override_catalog([])}), encoding="utf-8"
-        )
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is not None
-
-        assert "must be an array of providers" in caplog.text
-        assert cost_tracking.pricing_data_available()
-
-    def test_an_empty_user_file_is_a_silent_no_op(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """`touch ~/.deepagents/prices.json` must not warn on every session."""
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(_OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0})],
-        )
-        (tmp_path / "prices.json").write_text("   \n", encoding="utf-8")
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is not None
-
-        assert "prices.json" not in caplog.text
-
-    def test_a_transient_read_failure_is_retried_rather_than_cached(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """A momentary I/O error must not read as "this user has no overrides".
-
-        Caching the empty build would hide the user's rates for the rest of the
-        process -- the mirror of the transient-failure latching
-        `_PRICING_UNAVAILABLE` refuses. The warning still fires only once.
-        """
-        import errno
-        import pathlib
-
-        self._install_user_file(
-            tmp_path,
-            [
-                _override_model(
-                    _OVERRIDE_USER_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0}
-                )
-            ],
-        )
-        real_read_text = pathlib.Path.read_text
-        attempts = 0
-
-        def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
-            nonlocal attempts
-            if self.name == "prices.json":
-                attempts += 1
-                if attempts == 1:
-                    raise OSError(errno.EMFILE, "too many open files")
-            return real_read_text(self, *args, **kwargs)
-
-        monkeypatch.setattr(pathlib.Path, "read_text", flaky)
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            first = estimate_cost(_usage(), _OVERRIDE_USER_MODEL, "dcode-test")
-            second = estimate_cost(_usage(), _OVERRIDE_USER_MODEL, "dcode-test")
-
-        assert first is None
-        assert second == pytest.approx((1_000 * 1.0 + 100 * 2.0) / 1_000_000)
-        assert caplog.text.count("Could not read the pricing overrides") == 1
-
-    def test_an_override_rate_that_overflows_a_float_is_not_billed(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Rates are unbounded `Decimal`s, so a mistyped one converts to `inf`.
-
-        `inf > 0`, so nothing downstream filters it out: it would poison the
-        session total for good. The primary path returns `None` for the same
-        rate, and the override path must not be the looser of the two.
-        """
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(_OVERRIDE_MODEL, {"input_mtok": int("1" + "0" * 400)})],
-        )
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            cost = estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test")
-
-        assert cost is None
-        assert "not a finite non-negative cost" in caplog.text
-
-    def test_a_negative_override_rate_is_not_billed(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A negative rate parses, so the rejection has to happen at pricing time.
-
-        A negative cost would *subtract* from the running total, which is worse
-        than reporting nothing. The installed genai-prices raises out of
-        `calc_price` rather than at parse time, so what must hold is the
-        observable pair: nothing is billed, and the user hears about the entry
-        they hand-wrote instead of it failing at DEBUG.
-        """
-        self._install_built_ins(
-            monkeypatch,
-            [
-                _override_model(
-                    _OVERRIDE_MODEL, {"input_mtok": -5.0, "output_mtok": 2.0}
-                )
-            ],
-        )
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            cost = estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test")
-            estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test")
-
-        assert cost is None
-        assert caplog.text.count("its rates were rejected") == 1
-        assert _OVERRIDE_MODEL in caplog.text
-
-    def test_a_loaded_user_file_that_matches_nothing_is_reported_once(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The likeliest disappointment: ids that do not line up, and no signal.
-
-        Without this the case is indistinguishable from having no override file
-        at all, so a user who hand-wrote rates and still sees no cost has
-        nothing to go on.
-        """
-        self._install_user_file(
-            tmp_path,
-            [
-                _override_model(
-                    _OVERRIDE_USER_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0}
-                )
-            ],
-        )
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), "dcode-unmatched-model", "") is None
-            assert estimate_cost(_usage(), "dcode-unmatched-model", "") is None
-
-        assert caplog.text.count("No pricing override matched") == 1
-        assert "contributed 1 model entry" in caplog.text
-        # The full path, not the bare filename: which `prices.json` is the
-        # actionable part, and every other message here names its source in full.
-        assert str(tmp_path / "prices.json") in caplog.text
-
-    def test_the_miss_report_is_not_spent_by_an_unrelated_model(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Each model gets its own miss report.
-
-        A miss fires for every model the primary catalog does not cover, side
-        models included. Latched once per process, the first of those would spend
-        the report and the user's own misconfigured model would then miss in
-        silence -- while the warning they did see named a model they never wrote
-        an entry for.
-        """
-        self._install_user_file(
-            tmp_path,
-            [
-                _override_model(
-                    _OVERRIDE_USER_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0}
-                )
-            ],
-        )
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), "dcode-some-side-model", "") is None
-            assert estimate_cost(_usage(), "dcode-the-model-i-configured", "") is None
-
-        assert caplog.text.count("No pricing override matched") == 2
-        assert "dcode-the-model-i-configured" in caplog.text
-
-    def test_a_vanished_provider_lookup_degrades_to_inference_and_still_prices(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Losing the id lookup costs narrowing, not the whole catalog.
-
-        A different and weaker consequence than the parser going missing, so it
-        needs its own coverage: the request must still be priced, through the
-        sweep, with the loss reported.
-
-        Driven through `_override_price` rather than `estimate_cost` because
-        `DataSnapshot.find_provider` calls this same module-level name, so
-        deleting it takes the *primary* path down too -- with a `NameError` rather
-        than the `LookupError` that reaches the fallback. Simulating the rename
-        end-to-end is therefore not possible; what is under test is the override
-        path's own degradation.
-        """
-        import genai_prices.data_snapshot
-        from genai_prices import Usage
-
-        self._install_built_ins(
-            monkeypatch,
-            [_override_model(_OVERRIDE_MODEL, {"input_mtok": 1.0, "output_mtok": 2.0})],
-        )
-        usage = Usage(input_tokens=1_000, output_tokens=100)
-        monkeypatch.delattr(genai_prices.data_snapshot, "find_provider_by_id")
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            cost = cost_tracking._override_price(usage, _OVERRIDE_MODEL, "dcode-test")
-            cost_tracking._override_price(usage, _OVERRIDE_MODEL, "dcode-test")
-
-        assert cost == pytest.approx((1_000 * 1.0 + 100 * 2.0) / 1_000_000)
-        assert caplog.text.count("genai-prices no longer provides") == 1
-        assert "find_provider_by_id" in caplog.text
-
-    def test_an_unexpected_load_failure_warns_and_disables_the_catalog(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A load failure must not be downgraded to DEBUG by the pricing net.
-
-        `_override_price`'s handler exists for a bad *rate*; what silently stops
-        applying on a bad *load* is the user's own hand-written catalog, so that
-        belongs at WARNING. Caching the empty catalog is the other half: letting
-        the failure escape would rebuild and re-raise on every unpriced request
-        for the life of the process.
-        """
-
-        def boom(*_args: Any, **_kwargs: Any) -> tuple[list[Any] | None, bool]:
-            msg = "unanticipated"
-            raise RuntimeError(msg)
-
-        monkeypatch.setattr(cost_tracking, "_read_override_source", boom)
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is None
-            assert estimate_cost(_usage(), _OVERRIDE_MODEL, "dcode-test") is None
-
-        assert caplog.text.count("Could not load the pricing override catalog") == 1
-        assert cost_tracking._PRICE_OVERRIDES == ()
-        assert cost_tracking.pricing_data_available()
 
     def test_a_vanished_upstream_parser_is_reported_at_warning(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -1871,15 +563,6 @@ class TestPriceUpdater:
     def _reset_updater_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Isolate the process-wide updater state between tests.
 
-        `monkeypatch.setattr` restores this module's latches after each test.
-        genai-prices' own module globals are rolled back too: a leaked handle
-        in `_global_update_prices` would make a later `start()` raise, and a
-        leaked `_custom_snapshot` would silently re-price every later test off
-        fetched data. Note this does *not* stop a daemon thread that a real
-        `start()` already spawned -- it only clears the guard and the catalog.
-        Nothing here starts a real one; the conftest opt-out keeps the rest of
-        the suite from doing so either.
-
         `DEEPAGENTS_CODE_OFFLINE` is cleared because the suite-wide
         `_skip_managed_tool_downloads` fixture sets it, and it now suppresses
         this updater too -- leaving it set would make every test here pass
@@ -1895,11 +578,6 @@ class TestPriceUpdater:
         # read is stubbed, so a local `[update].prices_auto_update = false`
         # would silently disable the updater under test.
         monkeypatch.setattr("deepagents_code.config_manifest.load_config_toml", dict)
-        import genai_prices.data_snapshot
-        import genai_prices.update_prices
-
-        monkeypatch.setattr(genai_prices.update_prices, "_global_update_prices", None)
-        monkeypatch.setattr(genai_prices.data_snapshot, "_custom_snapshot", None)
 
     def _patch_updater(
         self, monkeypatch: pytest.MonkeyPatch, instance: MagicMock
@@ -1945,88 +623,6 @@ class TestPriceUpdater:
             lambda *_args, **_kwargs: SimpleNamespace(total_price=0.01),
         )
 
-    def test_first_pricing_call_starts_updater_once(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from genai_prices import UpdatePrices
-
-        self._enable_auto_update(monkeypatch)
-        updater = self._autospec_updater()
-        factory = self._patch_updater(monkeypatch, updater)
-        # Repeated calls keep exercising the real `_load_pricing` import path.
-        self._stub_calc_price(monkeypatch)
-
-        for _ in range(3):
-            assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is not None
-
-        factory.assert_called_once_with(UpdatePrices)
-        updater.start.assert_called_once_with(wait=False)
-        assert cost_tracking._PRICE_UPDATER is updater
-
-    def test_starting_claims_the_genai_prices_logger(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The updater's logger never reaches `logging.lastResort`.
-
-        `config._quiet_sdk_logging` covers the CLI, but the server graph and
-        embedded hosts never call it -- and an unhandled ERROR from the hourly
-        refresh prints over the TUI. Starting the updater must claim the logger
-        on its own.
-        """
-        self._enable_auto_update(monkeypatch)
-        gp_logger = logging.getLogger("genai-prices")
-        monkeypatch.setattr(gp_logger, "handlers", [])
-        self._patch_updater(monkeypatch, self._autospec_updater())
-        self._stub_calc_price(monkeypatch)
-
-        assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is not None
-
-        assert gp_logger.handlers
-
-    def test_real_updater_accepts_the_start_call_this_module_makes(self) -> None:
-        """Pin the genai-prices API the start call depends on.
-
-        Every other test here stands the updater in with an autospec, so this
-        is what fails if a `>=0.1.1,<0.2.0` release renames `start`'s keyword.
-        Without it, that drift kills the feature in production -- the broad
-        `except` downgrades it to a warning -- while the suite stays green.
-        """
-        from genai_prices import UpdatePrices
-
-        signature = inspect.signature(UpdatePrices.start)
-        wait = signature.parameters["wait"]
-        assert wait.kind is inspect.Parameter.KEYWORD_ONLY
-        assert wait.default is False
-
-    @pytest.mark.parametrize("value", ["false", "0", "off", ""])
-    def test_disabled_env_var_never_starts_updater(
-        self, monkeypatch: pytest.MonkeyPatch, value: str
-    ) -> None:
-        from deepagents_code._env_vars import PRICES_AUTO_UPDATE
-
-        monkeypatch.setenv(PRICES_AUTO_UPDATE, value)
-        factory = self._patch_updater(monkeypatch, self._autospec_updater())
-        self._stub_calc_price(monkeypatch)
-
-        assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is not None
-
-        factory.assert_not_called()
-
-    def test_toml_opt_out_never_starts_updater(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The TOML opt-out gates the updater, not just `config get`."""
-        monkeypatch.setattr(
-            "deepagents_code.config_manifest.load_config_toml",
-            lambda: {"update": {"prices_auto_update": False}},
-        )
-        factory = self._patch_updater(monkeypatch, self._autospec_updater())
-        self._stub_calc_price(monkeypatch)
-
-        assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is not None
-
-        factory.assert_not_called()
-
     def test_env_var_overrides_toml_opt_out(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2044,106 +640,6 @@ class TestPriceUpdater:
         assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is not None
 
         factory.assert_called_once()
-
-    def test_offline_mode_never_starts_updater(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """`DEEPAGENTS_CODE_OFFLINE` suppresses this fetch like every other."""
-        from deepagents_code._env_vars import OFFLINE
-
-        monkeypatch.setenv(OFFLINE, "1")
-        factory = self._patch_updater(monkeypatch, self._autospec_updater())
-        self._stub_calc_price(monkeypatch)
-
-        assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) is not None
-
-        factory.assert_not_called()
-
-    def test_the_start_attempt_is_serialized_by_a_lock(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The latch is read and set inside `_PRICE_UPDATER_LOCK`.
-
-        `estimate_cost` runs on the event loop and on the executor threads that
-        price drained records, so an unguarded check-then-set lets two threads
-        both reach `start()`. The loser trips genai-prices' process-wide
-        singleton guard and its `RuntimeError` gets reported as a failed start
-        -- a warning claiming the updater is down while the winner's runs fine.
-
-        Holding the lock here and watching a pricing thread block on it tests
-        that directly, rather than trying to lose a race on purpose.
-        """
-        from genai_prices import UpdatePrices
-
-        self._enable_auto_update(monkeypatch)
-        self._stub_calc_price(monkeypatch)
-        factory = self._patch_updater(monkeypatch, self._autospec_updater())
-
-        priced = threading.Event()
-
-        def _price() -> None:
-            estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
-            priced.set()
-
-        thread = threading.Thread(target=_price)
-        with cost_tracking._PRICE_UPDATER_LOCK:
-            thread.start()
-            # Without the lock the thread sails through the start attempt.
-            assert not priced.wait(0.25)
-            factory.assert_not_called()
-
-        thread.join(timeout=5)
-        assert priced.is_set()
-        factory.assert_called_once_with(UpdatePrices)
-
-    def test_failed_start_still_prices_and_logs_once(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A broken updater must not break pricing or spam the log.
-
-        The failure is latched because nothing a later request does can fix an
-        incompatible genai-prices release or a claimed singleton -- retrying
-        would only repeat the warning on every model call while pricing works.
-        """
-        self._enable_auto_update(monkeypatch)
-        updater = self._autospec_updater()
-        updater.start.side_effect = RuntimeError("unexpected genai-prices API")
-        self._patch_updater(monkeypatch, updater)
-        self._stub_calc_price(monkeypatch)
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            for _ in range(3):
-                assert estimate_cost(
-                    _usage(), KNOWN_MODEL, KNOWN_PROVIDER
-                ) == pytest.approx(0.01)
-
-        updater.start.assert_called_once_with(wait=False)
-        warning = "Could not start the genai-prices background updater"
-        records = [r for r in caplog.records if warning in r.getMessage()]
-        assert len(records) == 1
-        # Asserted on the formatted message, not `caplog.text`: `exc_info=True`
-        # appends a traceback naming the same exception, so a check against the
-        # full text would pass even if the message dropped the type entirely.
-        assert "RuntimeError: unexpected genai-prices API" in records[0].getMessage()
-        assert cost_tracking.pricing_data_available()
-        assert cost_tracking._PRICE_UPDATER is None
-
-    def test_a_start_failure_does_not_price_from_a_half_built_updater(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A failure inside the factory itself is caught like any other."""
-        self._enable_auto_update(monkeypatch)
-        monkeypatch.setattr(
-            cost_tracking,
-            "_build_price_updater",
-            MagicMock(side_effect=AttributeError("no UpdatePrices")),
-        )
-        self._stub_calc_price(monkeypatch)
-
-        assert estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER) == pytest.approx(
-            0.01
-        )
-        assert cost_tracking._PRICE_UPDATER is None
 
 
 class TestPriceCatalogGuard:
@@ -2175,91 +671,93 @@ class TestPriceCatalogGuard:
         monkeypatch.setattr(UpdatePrices, "fetch", lambda _self: snapshot)
         return cost_tracking._build_price_updater(UpdatePrices), len(bundled)
 
-    def test_a_complete_catalog_is_installed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from genai_prices.data import providers as bundled
-
-        updater, _ = self._guarded_updater(monkeypatch, len(bundled))
-
-        snapshot = updater.fetch()
-
-        assert snapshot is not None
-        assert len(snapshot.providers) == len(bundled)
-
-    def test_a_grown_catalog_is_installed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Upstream adding providers is the normal case, not a truncation."""
-        from genai_prices.data import providers as bundled
-
-        updater, _ = self._guarded_updater(monkeypatch, len(bundled) + 5)
-
-        snapshot = updater.fetch()
-
-        assert snapshot is not None
-        assert len(snapshot.providers) == len(bundled) + 5
-
-    @pytest.mark.parametrize("fetched", [0, 1, None])
-    def test_a_truncated_catalog_is_refused(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-        fetched: int | None,
-    ) -> None:
-        """An empty or half-published data.json must not replace bundled data.
-
-        genai-prices validates only that the payload is an array of well-formed
-        providers, so `[]` installs cleanly and makes every later `calc_price`
-        raise `LookupError` -- which this module reports as an unpriced model
-        rather than a broken catalog, so costs stop with no visible cause.
-        """
-        updater, bundled_count = self._guarded_updater(monkeypatch, fetched)
-
-        with (
-            caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"),
-            pytest.raises(ValueError, match="Refused pricing catalog"),
-        ):
-            updater.fetch()
-
-        assert f"{bundled_count} bundled" in caplog.text
-
-    def test_a_refusal_is_reported_once_not_hourly(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The refusal recurs every hour while upstream stays broken."""
-        updater, _ = self._guarded_updater(monkeypatch, 0)
-
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.cost_tracking"):
-            for _ in range(3):
-                with pytest.raises(ValueError, match="Refused pricing catalog"):
-                    updater.fetch()
-
-        assert caplog.text.count("Refusing an upstream pricing catalog") == 1
-
-    def test_a_refusal_leaves_the_installed_catalog_alone(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Raising, not returning `None`, is what preserves the last good fetch.
-
-        `UpdatePrices._update_prices` installs whatever `fetch` returns --
-        including `None`, which reverts to bundled data. Raising instead makes
-        the background loop treat the refresh as failed and retry later.
-        """
-        import genai_prices.data_snapshot as snapshot_mod
-
-        updater, _ = self._guarded_updater(monkeypatch, 0)
-        good = SimpleNamespace(providers=[object()], from_auto_update=True)
-        monkeypatch.setattr(snapshot_mod, "_custom_snapshot", good)
-
-        with pytest.raises(ValueError, match="Refused pricing catalog"):
-            updater._update_prices()
-
-        assert snapshot_mod._custom_snapshot is good
-
 
 class TestCostTrackingMiddleware:
     """Tests for cumulative cost writes on the model checkpoint path."""
+
+    @pytest.mark.parametrize("path", ["message", "recorder", "operation"])
+    @pytest.mark.parametrize("provider", ["openai", "ollama", "openai_codex"])
+    def test_unpriced_requests_retain_reported_tokens(
+        self, recorder: _SessionCostRecorder, path: str, provider: str
+    ) -> None:
+        usage = _usage(cache_read=200, cache_write=100)
+        usage["output_token_details"] = {"reasoning": 50}
+        model = "uncatalogued-test-model"
+        if path != "message":
+            _collect(recorder, _record(model=model, provider=provider, usage=usage))
+        state: CostState = {
+            "messages": (
+                [_message(usage, model=model, provider=provider)]
+                if path == "message"
+                else []
+            ),
+        }
+        events: list[dict[str, Any]] = []
+
+        result = (
+            cost_tracking.prepare_operation_cost(state, THREAD_ID).update
+            if path == "operation"
+            else CostTrackingMiddleware().after_model(
+                state, _runtime(thread_id=THREAD_ID, events=events)
+            )
+        )
+
+        assert result is not None
+        breakdown = result["_session_cost_breakdown"]
+        assert breakdown["request_count"] == 1
+        assert breakdown["priced_request_count"] == 0
+        for category, count in (
+            ("input", 1_000),
+            ("output", 100),
+            ("cache_read", 200),
+            ("cache_creation", 100),
+            ("reasoning", 50),
+        ):
+            assert breakdown[f"{category}_tokens"] == count
+            assert breakdown[f"{category}_tokens_complete"] is True
+            assert breakdown[f"{category}_cost_complete"] is False
+        assert breakdown["total_cost_usd"] == 0
+        if path != "operation":
+            assert events[0]["breakdown"] == breakdown
+
+    @pytest.mark.parametrize("details_reported", [False, True])
+    def test_unpriced_usage_distinguishes_missing_details_from_zero(
+        self, details_reported: bool
+    ) -> None:
+        usage = _usage()
+        if details_reported:
+            usage["input_token_details"] = {}
+            usage["output_token_details"] = {}
+        result = CostTrackingMiddleware().after_model(
+            {"messages": [_message(usage, provider="openai_codex")]}, _runtime()
+        )
+        assert result is not None
+        breakdown = result["_session_cost_breakdown"]
+        for category in ("cache_read", "cache_creation", "reasoning"):
+            assert breakdown[f"{category}_tokens"] == 0
+            assert breakdown[f"{category}_tokens_complete"] is details_reported
+
+    @pytest.mark.parametrize(
+        ("provider", "output"), [("ollama", 100), ("perplexity", 300)]
+    )
+    def test_unpriced_usage_normalizes_cache_and_reasoning_counts(
+        self, provider: str, output: int
+    ) -> None:
+        usage = _usage(cache_read=900)
+        usage["input_token_details"].update(
+            ephemeral_5m_input_tokens=80, ephemeral_1h_input_tokens=80
+        )
+        usage["output_token_details"] = {"reasoning": 200}
+        result = CostTrackingMiddleware().after_model(
+            {"messages": [_message(usage, model="uncatalogued", provider=provider)]},
+            _runtime(),
+        )
+        assert result is not None
+        breakdown = result["_session_cost_breakdown"]
+        assert breakdown["cache_read_tokens"] == 900
+        assert breakdown["cache_creation_tokens"] == 100
+        assert breakdown["output_tokens"] == output
+        assert breakdown["reasoning_tokens"] == min(output, 200)
 
     def test_prepared_operation_cost_can_commit_or_rollback(
         self,
@@ -2283,12 +781,116 @@ class TestCostTrackingMiddleware:
         one_call = estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
 
         assert one_call is not None
-        assert prepared.update == {"_session_cost_usd": pytest.approx(one_call)}
+        assert prepared.update["_session_cost_usd"] == pytest.approx(one_call)
+        assert prepared.update["_session_cost_breakdown"]["request_count"] == 1
         assert recorder.drain(THREAD_ID) == []
 
         prepared.rollback()
         retried = cost_tracking.prepare_operation_cost(state, THREAD_ID)
-        assert retried.update == {"_session_cost_usd": pytest.approx(one_call)}
+        assert retried.update["_session_cost_usd"] == pytest.approx(one_call)
+        assert retried.update["_session_cost_breakdown"]["request_count"] == 1
+
+    @pytest.mark.parametrize("saved_breakdown", [None, {}, {"version": 999}])
+    @pytest.mark.parametrize("saved_cost", [0.0, 1.25])
+    def test_prepared_operation_preserves_legacy_history_gap(
+        self,
+        recorder: _SessionCostRecorder,
+        saved_breakdown: object,
+        saved_cost: float,
+    ) -> None:
+        """The first post-upgrade offload must not erase missing historical detail."""
+        _collect(
+            recorder,
+            _record(message_id="offload-summary"),
+            checkpoint_ns="dcode_offload:operation-1",
+        )
+        state = cast(
+            "CostState",
+            {
+                "messages": [_message(_usage(), provider="ollama")],
+                "_model_spec": f"{KNOWN_PROVIDER}:{KNOWN_MODEL}",
+                "_session_cost_usd": saved_cost,
+                "_session_cost_breakdown": saved_breakdown,
+            },
+        )
+
+        prepared = cost_tracking.prepare_operation_cost(state, THREAD_ID)
+
+        assert (
+            prepared.update["_session_cost_breakdown"]["historical_complete"] is False
+        )
+
+    @pytest.mark.parametrize("saved_breakdown", [None, {}, {"version": 999}])
+    @pytest.mark.parametrize("saved_cost", [0.0, 1.25])
+    def test_new_request_preserves_legacy_history_gap(
+        self, saved_breakdown: object, saved_cost: float
+    ) -> None:
+        """Checkpoint and stream retain the gap after an old thread continues."""
+        state = cast(
+            "CostState",
+            {
+                "messages": [
+                    _message(_usage(), provider="openai_codex", message_id="old"),
+                    _message(_usage(), message_id="new-request"),
+                ],
+                "_model_spec": f"{KNOWN_PROVIDER}:{KNOWN_MODEL}",
+                "_session_cost_usd": saved_cost,
+                "_session_cost_breakdown": saved_breakdown,
+            },
+        )
+        events: list[dict[str, Any]] = []
+
+        result = CostTrackingMiddleware().after_model(
+            state, _runtime(thread_id=THREAD_ID, events=events)
+        )
+
+        assert result is not None
+        assert result["_session_cost_breakdown"]["historical_complete"] is False
+        assert events[0]["breakdown"]["historical_complete"] is False
+        assert events[0]["total"] == pytest.approx(
+            saved_cost + result["_session_cost_usd"]
+        )
+        state["_session_cost_breakdown"] = result["_session_cost_breakdown"]
+        state["messages"].append(_message(_usage(), message_id="later-request"))
+        later = CostTrackingMiddleware().after_model(
+            state, _runtime(thread_id=THREAD_ID, events=events)
+        )
+        assert later is not None
+        assert events[-1]["breakdown"]["historical_complete"] is False
+        assert events[-1]["breakdown"]["request_count"] == 2
+
+    @pytest.mark.parametrize("path", ["message", "recorder", "operation"])
+    def test_first_request_has_complete_history(
+        self, recorder: _SessionCostRecorder, path: str
+    ) -> None:
+        if path != "message":
+            _collect(recorder, _record())
+        state: CostState = {
+            "messages": [] if path == "operation" else [_message(_usage())],
+            "_session_cost_usd": 0.0,
+        }
+        events: list[dict[str, Any]] = []
+        if path == "operation":
+            prepared = cost_tracking.prepare_operation_cost(state, THREAD_ID)
+            result = prepared.update
+            prepared.commit()
+        else:
+            result = CostTrackingMiddleware().after_model(
+                state, _runtime(thread_id=THREAD_ID, events=events)
+            )
+            assert events[0]["breakdown"]["historical_complete"] is True
+
+        assert result is not None
+        assert result["_session_cost_breakdown"]["historical_complete"] is True
+        assert result["_session_cost_breakdown"]["request_count"] == 1
+        state["_session_cost_breakdown"] = result["_session_cost_breakdown"]
+        state["messages"].append(_message(_usage(), message_id="later-request"))
+        later = CostTrackingMiddleware().after_model(
+            state, _runtime(thread_id=THREAD_ID, events=events)
+        )
+        assert later is not None
+        assert events[-1]["breakdown"]["historical_complete"] is True
+        assert events[-1]["breakdown"]["request_count"] == 2
 
     def test_committed_prepare_does_not_restore_records(
         self,
@@ -2344,107 +946,6 @@ class TestCostTrackingMiddleware:
 
         assert "abandoned without commit or rollback" in caplog.text
 
-    def test_cost_channel_is_private_and_additive(self) -> None:
-        """The channel must compile to a summing reducer, not a `LastValue`.
-
-        LangGraph reads only the *last* entry of the `Annotated` metadata when
-        detecting a reducer. Reordering it so `PrivateStateAttr` comes last
-        degrades the channel to `LastValue`, at which point every delta
-        overwrites the total instead of adding to it and the thread's lifetime
-        cost silently collapses to whatever the final step spent. Assert the
-        compiled channel and its behavior, not just the annotation.
-        """
-        hints = get_type_hints(CostState, include_extras=True)
-        metadata = tuple(getattr(hints["_session_cost_usd"], "__metadata__", ()))
-        assert PrivateStateAttr in metadata
-        assert metadata
-
-        channels = StateGraph(cast("Any", CostState)).channels
-        cost_channel = channels["_session_cost_usd"]
-        assert isinstance(cost_channel, BinaryOperatorAggregate)
-        cost_channel.update([1.25, 0.02, 0.005])
-        assert cost_channel.get() == pytest.approx(1.275)
-
-        transfer_metadata = tuple(
-            getattr(hints["_session_cost_transfers"], "__metadata__", ())
-        )
-        assert OmitFromInput in transfer_metadata
-        assert PrivateStateAttr not in transfer_metadata
-
-        transfer_channel = channels["_session_cost_transfers"]
-        assert isinstance(transfer_channel, BinaryOperatorAggregate)
-        transfer_channel.update([{"a": {"owner_scope": "", "cost_usd": 1.0}}])
-        transfer_channel.update([{"b": {"owner_scope": "", "cost_usd": 2.0}}])
-        # Parallel subagents hand off independently, so entries must merge
-        # rather than the later write replacing the earlier one.
-        assert set(cast("dict[str, Any]", transfer_channel.get())) == {"a", "b"}
-
-    def test_returns_request_cost_as_delta(self) -> None:
-        middleware = CostTrackingMiddleware()
-        state: CostState = {
-            "messages": [HumanMessage("hello"), _message(_usage())],
-            "_session_cost_usd": 1.25,
-        }
-        result = middleware.after_model(state, _runtime())
-        assert result is not None
-        # Additive channel: only this request's estimate is returned.
-        assert 0 < result["_session_cost_usd"] < 1
-        assert result["_session_cost_usd"] == estimate_cost(
-            _usage(),
-            KNOWN_MODEL,
-            KNOWN_PROVIDER,
-        )
-
-    def test_recorded_request_is_charged_once(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        """The recorder and the state fallback must not both charge one call."""
-        _collect(recorder, _record(message_id="response-1"))
-        middleware = CostTrackingMiddleware()
-        state: CostState = {
-            "messages": [_message(_usage(), message_id="response-1")],
-        }
-
-        result = middleware.after_model(state, _runtime(thread_id=THREAD_ID))
-
-        assert result is not None
-        assert result["_session_cost_usd"] == pytest.approx(
-            estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
-        )
-
-    def test_side_call_is_charged_on_top_of_the_agent_response(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        """A recorded request with no message in state is extra spend."""
-        _collect(recorder, _record(message_id="summary-1"))
-        _collect(recorder, _record(message_id="response-1"))
-        middleware = CostTrackingMiddleware()
-        state: CostState = {
-            "messages": [_message(_usage(), message_id="response-1")],
-        }
-
-        result = middleware.after_model(state, _runtime(thread_id=THREAD_ID))
-
-        one_call = estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
-        assert one_call is not None
-        assert result is not None
-        assert result["_session_cost_usd"] == pytest.approx(2 * one_call)
-
-    def test_unidentified_response_is_not_charged_twice(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        """Without a message ID to join on, prefer undercounting to double."""
-        _collect(recorder, _record(message_id=None))
-        middleware = CostTrackingMiddleware()
-        state: CostState = {"messages": [_message(_usage(), message_id=None)]}
-
-        result = middleware.after_model(state, _runtime(thread_id=THREAD_ID))
-
-        assert result is not None
-        assert result["_session_cost_usd"] == pytest.approx(
-            estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
-        )
-
     def test_unpriceable_record_leaves_the_message_to_state_pricing(
         self, recorder: _SessionCostRecorder
     ) -> None:
@@ -2472,204 +973,115 @@ class TestCostTrackingMiddleware:
             estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
         )
 
-    def test_records_are_not_drained_without_a_thread(
-        self, recorder: _SessionCostRecorder
+    def test_unpriceable_main_with_priced_side_counts_each_request_once(
+        self,
+        recorder: _SessionCostRecorder,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """An unthreaded run cannot attribute records, but still prices itself."""
-        _collect(recorder, _record(message_id="summary-1"))
-        middleware = CostTrackingMiddleware()
-        state: CostState = {
-            "messages": [_message(_usage(), message_id="response-1")],
-        }
-
-        result = middleware.after_model(state, _runtime())
-
-        assert result is not None
-        assert result["_session_cost_usd"] == pytest.approx(
-            estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
+        """State fallback replaces an unpriceable matching recorder contribution."""
+        _collect(
+            recorder,
+            _record(message_id="side", model=KNOWN_MODEL),
         )
-        assert recorder.drain(THREAD_ID)
-
-    def test_streams_the_new_absolute_total(self) -> None:
-        events: list[dict[str, Any]] = []
-        middleware = CostTrackingMiddleware()
-        state: CostState = {
-            "messages": [_message(_usage())],
-            "_session_cost_usd": 1.25,
-        }
-
-        result = middleware.after_model(
-            state, _runtime(thread_id="thread-1", events=events)
+        _collect(
+            recorder,
+            _record(message_id="main", model="missing-model"),
         )
+        real_request_estimate = cost_tracking._request_estimate
 
-        assert result is not None
-        assert events == [
-            {
-                "type": "session_cost",
-                "total": pytest.approx(1.25 + result["_session_cost_usd"]),
-                # Tags the total so a client that has since switched threads
-                # can discard it instead of showing the old thread's spend.
-                "thread_id": "thread-1",
-                # Reported from where pricing runs: a remote client cannot see
-                # a broken price-data install in the server's process.
-                "pricing_ok": True,
-            }
-        ]
+        def request_estimate(
+            usage_metadata: dict[str, Any] | None,
+            model_name: str,
+            provider: str = "",
+        ) -> object:
+            if model_name == "missing-model":
+                return None
+            return real_request_estimate(usage_metadata, model_name, provider)
 
-    def test_streamed_event_reports_broken_pricing(self) -> None:
-        """The client cannot see a broken install in the server's process.
-
-        Hard-coding this to `True` would leave a remote user reading `/cost`
-        and blaming their model choice for a package fault they could fix.
-        """
-        events: list[dict[str, Any]] = []
-        middleware = CostTrackingMiddleware()
-        state: Any = {
-            "messages": [_message(_usage())],
+        monkeypatch.setattr(cost_tracking, "_request_estimate", request_estimate)
+        state: CostState = {
+            "messages": [_message(_usage(), message_id="main")],
             "_model_spec": f"{KNOWN_PROVIDER}:{KNOWN_MODEL}",
-            "_session_cost_usd": 1.25,
         }
 
-        with (
-            patch(
-                "deepagents_code.cost_tracking.estimate_cost",
-                return_value=None,
-            ),
-            patch(
-                "deepagents_code.cost_tracking.pricing_data_available",
-                return_value=False,
-            ),
-        ):
-            result = middleware.after_model(
-                state,
-                _runtime(thread_id="thread-1", events=events),
-            )
-
-        assert result is None
-        assert events == [
-            {
-                "type": "session_cost",
-                "total": pytest.approx(1.25),
-                "thread_id": "thread-1",
-                "pricing_ok": False,
-            }
-        ]
-
-    def test_failed_pricing_returns_records_to_the_recorder(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        """`drain` removes what it returns, so a failure must hand it back.
-
-        Without this the spend is destroyed: there is no second copy anywhere,
-        and the next drain finds an empty queue.
-        """
-        _collect(recorder, _record())
-        middleware = CostTrackingMiddleware()
-        state: Any = {"messages": []}
-
-        with (
-            patch(
-                "deepagents_code.cost_tracking.estimate_cost",
-                side_effect=RuntimeError("pricing exploded"),
-            ),
-            pytest.raises(RuntimeError),
-        ):
-            middleware._charge(
-                state,
-                _runtime(thread_id=THREAD_ID),
-                price_latest_message=False,
-            )
-
-        assert len(recorder.drain(THREAD_ID)) == 1
-
-    def test_cancelled_turn_does_not_destroy_drained_records(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        """`CancelledError` is a `BaseException`, so `except Exception` misses it."""
-        _collect(recorder, _record())
-        middleware = CostTrackingMiddleware()
-        state: Any = {"messages": []}
-
-        with (
-            patch(
-                "deepagents_code.cost_tracking.estimate_cost",
-                side_effect=asyncio.CancelledError(),
-            ),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            middleware._charge(
-                state,
-                _runtime(thread_id=THREAD_ID),
-                price_latest_message=False,
-            )
-
-        assert len(recorder.drain(THREAD_ID)) == 1
-
-    def test_after_model_does_not_fail_the_turn_on_a_pricing_error(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        """Each hook is its own graph node; raising here would fail the turn."""
-        _collect(recorder, _record())
-        middleware = CostTrackingMiddleware()
-        state: Any = {"messages": []}
-
-        with patch.object(
-            middleware, "_charge", side_effect=RuntimeError("boom")
-        ) as charge:
-            result = middleware.after_model(state, _runtime(thread_id=THREAD_ID))
-
-        assert result is None
-        assert charge.called
-
-    def test_after_agent_does_not_fail_the_turn_on_a_pricing_error(self) -> None:
-        middleware = CostTrackingMiddleware()
-        state: Any = {"messages": []}
-
-        with patch.object(
-            middleware, "_after_agent_update", side_effect=RuntimeError("boom")
-        ):
-            result = middleware.after_agent(state, _runtime(thread_id=THREAD_ID))
-
-        assert result is None
-
-    def test_no_event_is_streamed_without_new_spend(self) -> None:
-        events: list[dict[str, Any]] = []
-        middleware = CostTrackingMiddleware()
-        state = cast("CostState", {"messages": [], "_session_cost_usd": 1.25})
-
-        assert middleware.after_model(state, _runtime(events=events)) is None
-        assert events == []
-
-    def test_after_agent_charges_late_records_only(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        """Tool-node spend lands in the same turn without re-pricing messages."""
-        _collect(recorder, _record(message_id="compaction-summary"))
-        middleware = CostTrackingMiddleware()
-        state: CostState = {
-            "messages": [_message(_usage(), message_id="response-1")],
-        }
-
-        result = middleware.after_agent(state, _runtime(thread_id=THREAD_ID))
-
-        assert result is not None
-        assert result["_session_cost_usd"] == pytest.approx(
-            estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
+        result = CostTrackingMiddleware().after_model(
+            state, _runtime(thread_id=THREAD_ID)
         )
 
-    def test_after_agent_is_a_noop_without_late_records(self) -> None:
-        middleware = CostTrackingMiddleware()
-        state: CostState = {"messages": [_message(_usage())]}
-
-        assert middleware.after_agent(state, _runtime(thread_id=THREAD_ID)) is None
-
-    def test_nested_agent_resets_cost_on_start(self) -> None:
-        middleware = CostTrackingMiddleware(nested=True)
-        state = cast("CostState", {"messages": [], "_session_cost_usd": 9.5})
-        result = middleware.before_agent(state, _runtime())
         assert result is not None
-        assert isinstance(result["_session_cost_usd"], Overwrite)
-        assert result["_session_cost_usd"].value == pytest.approx(0.0)
+        assert result["_session_cost_breakdown"]["request_count"] == 2
+        assert result["_session_cost_breakdown"]["priced_request_count"] == 2
+
+    def test_zero_cost_breakdown_is_persisted_and_emitted(
+        self,
+        recorder: _SessionCostRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Free requests keep tokens and request counts despite a zero USD delta."""
+        _collect(recorder, _record(message_id="free"))
+        estimate = cost_tracking._estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
+        assert estimate is not None
+        monkeypatch.setattr(
+            cost_tracking,
+            "_request_estimate",
+            lambda *_args: replace(
+                estimate,
+                total_cost_usd=0.0,
+                input_cost_usd=0.0,
+                output_cost_usd=0.0,
+            ),
+        )
+        events: list[dict[str, Any]] = []
+
+        result = CostTrackingMiddleware().after_model(
+            cast("CostState", {"messages": [_message(_usage(), message_id="free")]}),
+            _runtime(thread_id=THREAD_ID, events=events),
+        )
+
+        assert result is not None
+        assert "_session_cost_usd" not in result
+        assert result["_session_cost_breakdown"]["request_count"] == 1
+        assert events[0]["total"] == pytest.approx(0.0)
+        assert events[0]["breakdown"]["request_count"] == 1
+
+    def test_nested_zero_cost_breakdown_transfers_to_parent(
+        self,
+        recorder: _SessionCostRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Nested free requests transfer structured detail without positive cost."""
+        _collect(
+            recorder,
+            _record(message_id="free", scope="tools:a"),
+            checkpoint_ns="tools:a|model:a",
+        )
+        monkeypatch.setattr(cost_tracking, "_request_estimate", lambda *_args: None)
+        middleware = CostTrackingMiddleware(nested=True)
+        runtime = _runtime(
+            thread_id=THREAD_ID,
+            checkpoint_ns="tools:a|CostTrackingMiddleware.after_model:a",
+        )
+        update = middleware.after_model(
+            cast("CostState", {"messages": [_message(_usage(), message_id="free")]}),
+            runtime,
+        )
+        assert update is not None
+
+        transfer = middleware.after_agent(
+            cast(
+                "CostState",
+                {
+                    "messages": [],
+                    "_session_cost_breakdown": update["_session_cost_breakdown"],
+                },
+            ),
+            runtime,
+        )
+
+        assert transfer is not None
+        pending = transfer["_session_cost_transfers"].value
+        assert pending["tools:a"]["cost_usd"] == pytest.approx(0.0)
+        assert pending["tools:a"]["breakdown"]["request_count"] == 1
 
     def test_nested_agent_checkpoints_and_transfers_cost(
         self, recorder: _SessionCostRecorder
@@ -2761,8 +1173,12 @@ class TestCostTrackingMiddleware:
 
         one_call = estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
         assert one_call is not None
-        assert first == {"_session_cost_usd": pytest.approx(one_call)}
-        assert second == {"_session_cost_usd": pytest.approx(one_call)}
+        assert first is not None
+        assert second is not None
+        assert first["_session_cost_usd"] == pytest.approx(one_call)
+        assert second["_session_cost_usd"] == pytest.approx(one_call)
+        assert first["_session_cost_breakdown"]["request_count"] == 1
+        assert second["_session_cost_breakdown"]["request_count"] == 1
         assert recorder.drain(THREAD_ID) == []
 
     def test_nested_agent_claims_only_transfers_owned_by_its_graph(self) -> None:
@@ -2803,11 +1219,6 @@ class TestCostTrackingMiddleware:
             }
         }
 
-    def test_main_agent_does_not_reset_cost_on_start(self) -> None:
-        middleware = CostTrackingMiddleware()
-        state = cast("CostState", {"messages": [], "_session_cost_usd": 9.5})
-        assert middleware.before_agent(state, _runtime()) is None
-
     def test_uses_persisted_model_spec_when_message_metadata_is_absent(self) -> None:
         middleware = CostTrackingMiddleware()
         message = AIMessage(
@@ -2821,16 +1232,6 @@ class TestCostTrackingMiddleware:
         result = middleware.after_model(state, _runtime())
         assert result is not None
         assert result["_session_cost_usd"] > 0
-
-    def test_codex_model_spec_overrides_generic_openai_message_metadata(self) -> None:
-        middleware = CostTrackingMiddleware()
-        state: CostState = {
-            "messages": [_message(_usage(), model="gpt-5.4", provider="openai")],
-            "_model_spec": "openai_codex:gpt-5.4",
-            "_session_cost_usd": 2.5,
-        }
-
-        assert middleware.after_model(state, _runtime()) is None
 
     @pytest.mark.parametrize(
         ("configured_provider", "expected_delta"),
@@ -2877,56 +1278,10 @@ class TestCostTrackingMiddleware:
         assert priced_providers
         assert set(priced_providers) == {configured_provider}
         if expected_delta is None:
-            assert result is None
-        else:
             assert result is not None
-            assert result["_session_cost_usd"] == pytest.approx(expected_delta)
-
-    @pytest.mark.parametrize(
-        ("configured_provider", "expected_delta"),
-        [
-            pytest.param("azure_openai", 0.42, id="azure"),
-            pytest.param("openai_codex", None, id="codex-subscription"),
-        ],
-    )
-    def test_hidden_openai_response_uses_its_configured_provider(
-        self,
-        recorder: _SessionCostRecorder,
-        monkeypatch: pytest.MonkeyPatch,
-        configured_provider: str,
-        expected_delta: float | None,
-    ) -> None:
-        """A side call retains its provider without sharing the main message ID."""
-        from deepagents_code import cost_tracking
-
-        pricing_targets: list[tuple[str, str]] = []
-
-        def price(
-            usage_metadata: object,
-            model_name: str,
-            provider: str = "",
-        ) -> float | None:
-            assert usage_metadata
-            pricing_targets.append((model_name, provider))
-            return None if provider == "openai_codex" else 0.42
-
-        monkeypatch.setattr(cost_tracking, "estimate_cost", price)
-        _collect(
-            recorder,
-            _record(message_id="summary-1", model="gpt-5.4", provider="openai"),
-            configured_provider=configured_provider,
-        )
-        middleware = CostTrackingMiddleware()
-        state: CostState = {
-            "messages": [_message(_usage(), model="gpt-5.4", provider="openai")],
-            "_model_spec": f"{configured_provider}:gpt-5.4",
-        }
-
-        result = middleware.after_agent(state, _runtime(thread_id=THREAD_ID))
-
-        assert pricing_targets == [("gpt-5.4", configured_provider)]
-        if expected_delta is None:
-            assert result is None
+            assert "_session_cost_usd" not in result
+            assert result["_session_cost_breakdown"]["request_count"] == 1
+            assert result["_session_cost_breakdown"]["priced_request_count"] == 0
         else:
             assert result is not None
             assert result["_session_cost_usd"] == pytest.approx(expected_delta)
@@ -2995,49 +1350,110 @@ class TestCostTrackingMiddleware:
         assert (KNOWN_MODEL, KNOWN_PROVIDER) in pricing_targets
         assert ("gpt-5.4", configured_provider) in pricing_targets
 
-    def test_unpriceable_model_leaves_prior_total_unchanged(self) -> None:
-        middleware = CostTrackingMiddleware()
-        state: CostState = {
-            "messages": [
-                _message(
-                    _usage(),
-                    model="definitely-not-a-real-model",
-                    provider="unknown-provider",
-                )
-            ],
-            "_session_cost_usd": 2.5,
-        }
-        assert middleware.after_model(state, _runtime()) is None
-
-    @pytest.mark.parametrize(
-        "messages",
-        [[], [HumanMessage("hello")], [AIMessage(content="no usage")]],
-    )
-    def test_no_priceable_message_is_a_noop(self, messages: list[Any]) -> None:
-        middleware = CostTrackingMiddleware()
-        state = cast("CostState", {"messages": messages})
-        assert middleware.after_model(state, _runtime()) is None
-
 
 class TestSessionCostRecorder:
     """Tests for the callback handler that collects completed requests."""
 
-    def test_records_are_scoped_to_their_thread(
+    async def test_langgraph_stream_carries_invocation_id_from_first_chunk(
         self, recorder: _SessionCostRecorder
     ) -> None:
-        _collect(recorder, _record(message_id="a"), thread_id="thread-a")
-        _collect(recorder, _record(message_id="b"), thread_id="thread-b")
+        """Guard the private LangGraph metadata bridge using real callbacks.
 
-        drained = recorder.drain("thread-a")
+        No handler or metadata mocks: upstream changes to callback ordering or
+        per-run metadata must fail here, even before a usage chunk arrives.
+        """
+        agent = create_agent(model=_ResponsesStyleStreamingModel(), tools=[])
+        invocation_ids: list[str] = []
+        async for message, metadata in agent.astream(
+            {"messages": [HumanMessage("hello")]},
+            stream_mode="messages",
+            config={"configurable": {"thread_id": THREAD_ID}},
+        ):
+            assert isinstance(message, AIMessageChunk)
+            assert isinstance(metadata, dict)
+            if not invocation_ids:
+                assert message.id == "resp_child"
+                assert not message.usage_metadata
+            # Read immediately so later metadata mutation cannot hide a late ID.
+            invocation_id = metadata.get(_MODEL_INVOCATION_METADATA_KEY)
+            assert isinstance(invocation_id, str), (
+                "LangGraph must expose the model invocation ID on every chunk"
+            )
+            invocation_ids.append(invocation_id)
 
-        assert [record.message_id for record in drained] == ["a"]
-        assert [record.message_id for record in recorder.drain("thread-b")] == ["b"]
+        assert invocation_ids
+        records = recorder.drain(THREAD_ID)
+        assert len(records) == 1
+        assert set(invocation_ids) == {records[0].invocation_id}
 
-    def test_draining_clears_the_queue(self, recorder: _SessionCostRecorder) -> None:
-        _collect(recorder, _record())
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    async def test_batched_responses_keep_separate_usage(
+        self, recorder: _SessionCostRecorder, asynchronous: bool
+    ) -> None:
+        from dataclasses import dataclass
 
-        assert len(recorder.drain(THREAD_ID)) == 1
-        assert recorder.drain(THREAD_ID) == []
+        from langgraph.graph import END, START, StateGraph
+
+        @dataclass
+        class BatchState:
+            prompt: str = "hello"
+
+        model = _fake_model(
+            _message(_usage(), message_id="batch-1"),
+            _message(_usage(), message_id="batch-2"),
+        )
+        prompts: list[list[BaseMessage]] = [
+            [HumanMessage("first")],
+            [HumanMessage("second")],
+        ]
+
+        def batch(state: BatchState, config: RunnableConfig) -> BatchState:
+            model.generate(
+                prompts, callbacks=config["callbacks"], metadata=config["metadata"]
+            )
+            return state
+
+        async def abatch(state: BatchState, config: RunnableConfig) -> BatchState:
+            await model.agenerate(
+                prompts, callbacks=config["callbacks"], metadata=config["metadata"]
+            )
+            return state
+
+        builder = StateGraph(BatchState)
+        builder.add_node("batch", abatch if asynchronous else batch)
+        builder.add_edge(START, "batch")
+        builder.add_edge("batch", END)
+        graph = builder.compile()
+        deliveries: list[tuple[BaseMessage, dict[str, Any]]] = []
+        async for message, metadata in graph.astream(
+            BatchState(),
+            stream_mode="messages",
+            config={"configurable": {"thread_id": THREAD_ID}},
+        ):
+            assert isinstance(message, BaseMessage)
+            assert isinstance(metadata, dict)
+            deliveries.append((message, metadata))
+        stats = SessionStats()
+        ledger = {}
+        for message, metadata in deliveries:
+            record_message_usage(
+                stats, message, request_metadata=metadata, recorded_requests=ledger
+            )
+
+        assert stats.request_count == 2
+        assert stats.input_tokens == 2 * _usage()["input_tokens"]
+        assert stats.output_tokens == 2 * _usage()["output_tokens"]
+        assert {
+            metadata[_MODEL_INVOCATION_METADATA_KEY] for _, metadata in deliveries
+        } == {record.invocation_id for record in recorder.drain(THREAD_ID)}
+        finalize_recorded_requests(ledger)
+        for message, metadata in deliveries:
+            assert (
+                record_message_usage(
+                    stats, message, request_metadata=metadata, recorded_requests=ledger
+                )
+                is None
+            )
 
     def test_nested_request_emits_provisional_usage(
         self, recorder: _SessionCostRecorder, monkeypatch: pytest.MonkeyPatch
@@ -3061,8 +1477,10 @@ class TestSessionCostRecorder:
                 "provider": KNOWN_PROVIDER,
                 "thread_id": THREAD_ID,
                 "scope": "tools:task",
+                "invocation_id": str(events[0]["invocation_id"]),
             }
         ]
+        UUID(events[0]["invocation_id"])
         assert [record.message_id for record in recorder.drain(THREAD_ID)] == [
             "child-1"
         ]
@@ -3115,6 +1533,43 @@ class TestSessionCostRecorder:
         assert events == []
         assert len(recorder.drain(THREAD_ID)) == 2
 
+    def test_root_summarization_emits_start_and_usage(
+        self, recorder: _SessionCostRecorder, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        events: list[dict[str, Any]] = []
+        monkeypatch.setattr("langgraph.config.get_stream_writer", lambda: events.append)
+        run_id = uuid4()
+
+        recorder.on_chat_model_start(
+            {},
+            [],
+            run_id=run_id,
+            metadata={"thread_id": THREAD_ID, "lc_source": "summarization"},
+        )
+        recorder.on_llm_end(
+            LLMResult(
+                generations=[
+                    [
+                        ChatGeneration(
+                            message=_message(
+                                _usage(),
+                                model=KNOWN_MODEL,
+                                provider=KNOWN_PROVIDER,
+                                message_id="summary-1",
+                            )
+                        )
+                    ]
+                ]
+            ),
+            run_id=run_id,
+        )
+
+        assert events[0] == {"type": SUMMARIZATION_STARTED_EVENT_TYPE}
+        assert events[1]["type"] == MODEL_USAGE_EVENT_TYPE
+        assert events[1]["lc_source"] == "summarization"
+        assert events[1]["scope"] == ""
+        assert events[1]["request_id"] == "summary-1"
+
     def test_usage_writer_failure_keeps_the_durable_record(
         self, recorder: _SessionCostRecorder, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3160,128 +1615,6 @@ class TestSessionCostRecorder:
 
         assert len(recorder.drain(THREAD_ID)) == 1
 
-    async def test_model_provider_metadata_survives_side_invoke_metadata(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        """Per-call metadata must not erase the provider attached to the model."""
-        model = _fake_model(
-            _message(
-                _usage(),
-                model="gpt-5.4",
-                provider="openai",
-                message_id="summary-1",
-            )
-        )
-        _set_configured_model_metadata(model, "gpt-5.4", "openai_codex")
-
-        await model.ainvoke(
-            "summarize",
-            config={
-                "metadata": {
-                    "thread_id": THREAD_ID,
-                    "lc_source": "summarization",
-                }
-            },
-        )
-
-        records = recorder.drain(THREAD_ID)
-        assert len(records) == 1
-        assert records[0].provider == "openai_codex"
-
-    def test_request_without_a_thread_is_not_recorded(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        run_id = uuid4()
-        recorder.on_chat_model_start({}, [], run_id=run_id, metadata={})
-        assert recorder._run_contexts[run_id].scope == ""
-        recorder.on_llm_end(
-            LLMResult(generations=[[ChatGeneration(message=_message(_usage()))]]),
-            run_id=run_id,
-        )
-
-        assert recorder.drain(THREAD_ID) == []
-
-    def test_failed_request_is_forgotten(self, recorder: _SessionCostRecorder) -> None:
-        run_id = uuid4()
-        recorder.on_chat_model_start(
-            {}, [], run_id=run_id, metadata={"thread_id": THREAD_ID}
-        )
-        recorder.on_llm_error(RuntimeError("provider failed"), run_id=run_id)
-        recorder.on_llm_end(
-            LLMResult(generations=[[ChatGeneration(message=_message(_usage()))]]),
-            run_id=run_id,
-        )
-
-        assert recorder.drain(THREAD_ID) == []
-
-    def test_response_without_usage_is_not_recorded(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        run_id = uuid4()
-        recorder.on_chat_model_start(
-            {}, [], run_id=run_id, metadata={"thread_id": THREAD_ID}
-        )
-        recorder.on_llm_end(
-            LLMResult(
-                generations=[[ChatGeneration(message=AIMessage(content="no usage"))]]
-            ),
-            run_id=run_id,
-        )
-
-        assert recorder.drain(THREAD_ID) == []
-
-    def test_undrained_threads_are_bounded(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        """A process that never drains must not grow for its whole lifetime."""
-        from deepagents_code.cost_tracking import _MAX_TRACKED_THREADS
-
-        for index in range(_MAX_TRACKED_THREADS + 5):
-            _collect(recorder, _record(), thread_id=f"thread-{index}")
-
-        assert recorder.drain("thread-0") == []
-        assert len(recorder.drain(f"thread-{_MAX_TRACKED_THREADS + 4}")) == 1
-
-    def test_undrained_records_for_one_thread_are_bounded(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        from deepagents_code.cost_tracking import _MAX_RECORDS_PER_THREAD
-
-        for index in range(_MAX_RECORDS_PER_THREAD + 3):
-            _collect(recorder, _record(message_id=f"m-{index}"))
-
-        drained = recorder.drain(THREAD_ID)
-
-        assert len(drained) == _MAX_RECORDS_PER_THREAD
-        assert drained[-1].message_id == f"m-{_MAX_RECORDS_PER_THREAD + 2}"
-
-    def test_restored_records_remain_bounded(
-        self, recorder: _SessionCostRecorder
-    ) -> None:
-        """A failed batch cannot bypass either recorder retention limit."""
-        from deepagents_code.cost_tracking import (
-            _MAX_RECORDS_PER_THREAD,
-            _MAX_TRACKED_THREADS,
-        )
-
-        for index in range(_MAX_RECORDS_PER_THREAD):
-            _collect(recorder, _record(message_id=f"new-{index}"))
-        recorder.restore(THREAD_ID, [_record(message_id="old")])
-
-        restored = recorder.drain(THREAD_ID)
-        assert len(restored) == _MAX_RECORDS_PER_THREAD
-        assert restored[0].message_id == "new-0"
-
-        for index in range(_MAX_TRACKED_THREADS):
-            _collect(recorder, _record(), thread_id=f"thread-{index}")
-        recorder.restore("restored-thread", [_record(message_id="restored")])
-
-        assert len(recorder._records) == _MAX_TRACKED_THREADS
-        assert recorder.drain("thread-0") == []
-        assert [record.message_id for record in recorder.drain("restored-thread")] == [
-            "restored"
-        ]
-
 
 _CompiledAgent = CompiledStateGraph[Any, Any, Any, Any]
 """The agent object `create_agent` compiles, as these tests use it."""
@@ -3311,6 +1644,57 @@ class _QueuedFakeModel(_ToolBindingFakeModel):
 def _fake_model(*messages: AIMessage) -> _QueuedFakeModel:
     """Build a fake model that returns the given responses in order."""
     return _QueuedFakeModel(queue=iter(messages))
+
+
+class _ResponsesStyleStreamingModel(_QueuedFakeModel):
+    """Emit a provider ID first and usage on an ID-less final chunk."""
+
+    disable_streaming: bool = False
+    provider_usage_id: bool = False
+    fail_first: bool = False
+    calls: int = 0
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],  # noqa: ARG002
+        stop: list[str] | None = None,  # noqa: ARG002
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,  # noqa: ARG002
+        **kwargs: Any,  # noqa: ARG002
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        self.calls += 1
+        yield ChatGenerationChunk(message=AIMessageChunk(content="", id="resp_child"))
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="done",
+                id="resp_child" if self.provider_usage_id else None,
+                usage_metadata={
+                    "input_tokens": 1_000,
+                    "output_tokens": 100,
+                    "total_tokens": 1_100,
+                },
+            )
+        )
+        if self.fail_first and self.calls == 1:
+            msg = "Retry after partial usage"
+            raise TimeoutError(msg)
+
+
+class _TwiceMiddleware(AgentMiddleware):
+    """Exercise multiple model invocations within a single retry attempt."""
+
+    def __init__(self, *, concurrent: bool) -> None:
+        super().__init__()
+        self.concurrent = concurrent
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        if self.concurrent:
+            return (await asyncio.gather(handler(request), handler(request)))[-1]
+        await handler(request)
+        return await handler(request)
 
 
 def _repeating_fake_model(message_id_prefix: str) -> _QueuedFakeModel:
@@ -3491,12 +1875,120 @@ class TestGraphCostOwnership:
             checkpointer=InMemorySaver(),
         )
 
-    async def test_main_agent_call_is_charged_once(self) -> None:
-        agent = self._agent(model=_fake_model(_message(_usage(), message_id="a")))
+    @pytest.mark.parametrize(
+        ("scenario", "provider_usage_id"),
+        [
+            ("plain", False),
+            ("plain", True),
+            ("sequential", True),
+            ("concurrent", True),
+            ("retry", False),
+            ("retry", True),
+        ],
+    )
+    async def test_responses_style_stream_and_callback_share_invocation_id(
+        self, provider_usage_id: bool, scenario: str
+    ) -> None:
+        model = _ResponsesStyleStreamingModel(
+            provider_usage_id=provider_usage_id, fail_first=scenario == "retry"
+        )
+        middleware: list[AgentMiddleware[Any, Any, Any]] = [
+            CostTrackingMiddleware(nested=True)
+        ]
+        if scenario != "plain":
+            middleware.append(CodeModelRetryMiddleware(max_retries=1))
+        if scenario in {"sequential", "concurrent"}:
+            middleware.append(_TwiceMiddleware(concurrent=scenario == "concurrent"))
+        child = create_agent(model=model, tools=[], middleware=middleware)
 
-        total_usd, _totals = await self._run(agent)
+        @tool
+        async def task(query: str, runtime: ToolRuntime) -> Command[Any]:
+            """Run the child model."""
+            result = await child.ainvoke({"messages": [HumanMessage(query)]})
+            return _subagent_command(result, runtime)
 
-        assert total_usd == pytest.approx(self._one_call_usd())
+        parent_call = _message(_usage(), message_id="parent-1")
+        parent_call.tool_calls = [
+            {"name": "task", "args": {"query": "go"}, "id": "t1", "type": "tool_call"}
+        ]
+        agent = self._agent(
+            model=_fake_model(parent_call, _message(_usage(), message_id="parent-2")),
+            tools=[task],
+        )
+        deliveries: list[tuple[str, Any, tuple[tuple[str, ...], str, int] | None]] = []
+        active = {}
+        async for namespace, mode, data in agent.astream(
+            {"messages": [HumanMessage("hello")]},
+            stream_mode=["messages", "custom"],
+            subgraphs=True,
+            config={"configurable": {"thread_id": THREAD_ID}},
+        ):
+            if not namespace:
+                continue
+            assert isinstance(namespace, tuple)
+            if (
+                mode == "custom"
+                and isinstance(data, dict)
+                and data.get("type") == "model_attempt"
+            ):
+                if data["phase"] == "start":
+                    active[namespace] = (namespace, data["call_id"], data["attempt"])
+                else:
+                    active.pop(namespace, None)
+            elif mode == "messages" or (
+                isinstance(data, dict) and data.get("type") == MODEL_USAGE_EVENT_TYPE
+            ):
+                deliveries.append((mode, data, active.get(namespace)))
+
+        chunks = [
+            (message, metadata)
+            for mode, data, _scope in deliveries
+            if mode == "messages"
+            for message, metadata in [data]
+            if isinstance(message, AIMessageChunk) and message.usage_metadata
+        ]
+        events = [data for mode, data, _scope in deliveries if mode == "custom"]
+        assert len(chunks) == model.calls
+        run_ids = {metadata[_MODEL_INVOCATION_METADATA_KEY] for _, metadata in chunks}
+        assert len(run_ids) == model.calls
+        assert {event["invocation_id"] for event in events} <= run_ids
+
+        stats = SessionStats()
+        ledger = {}
+        for mode, data, scope in deliveries:
+            if mode == "messages":
+                message, metadata = data
+                record_message_usage(
+                    stats,
+                    message,
+                    request_metadata=metadata,
+                    kind="subagent",
+                    recorded_requests=ledger,
+                    attempt_scope=scope,
+                )
+            else:
+                record_model_usage_event(
+                    stats,
+                    data,
+                    active_thread_id=THREAD_ID,
+                    recorded_requests=ledger,
+                    attempt_scope=scope,
+                )
+        assert model.calls == (1 if scenario == "plain" else 2)
+        assert stats.request_count == model.calls
+        assert stats.input_tokens == model.calls * _usage()["input_tokens"]
+        assert stats.output_tokens == model.calls * _usage()["output_tokens"]
+        assert stats.per_kind["subagent"].request_count == model.calls
+        finalize_recorded_requests(ledger)
+        for message, _metadata in chunks:
+            assert (
+                record_message_usage(stats, message, recorded_requests=ledger) is None
+            )
+        for event in events:
+            assert (
+                record_model_usage_event(stats, event, recorded_requests=ledger) is None
+            )
+        assert stats.request_count == model.calls
 
     async def test_streamed_total_matches_the_checkpoint(self) -> None:
         agent = self._agent(model=_fake_model(_message(_usage(), message_id="a")))
@@ -3534,102 +2026,6 @@ class TestGraphCostOwnership:
         one_call = self._one_call_usd()
         assert busy_total == pytest.approx(2 * one_call)
         assert quiet_total == pytest.approx(one_call)
-
-    async def test_offload_summarization_call_is_charged(self) -> None:
-        agent = self._agent(
-            model=_fake_model(_message(_usage(), message_id="a")),
-            middleware=[
-                _SideInvokeMiddleware(
-                    _fake_model(_message(_usage(), message_id="summary")),
-                    "summarization",
-                )
-            ],
-        )
-
-        total_usd, _totals = await self._run(agent)
-
-        assert total_usd == pytest.approx(2 * self._one_call_usd())
-
-    async def test_real_summarization_middleware_call_is_charged(self) -> None:
-        """The stock summarization middleware summarizes in its own node.
-
-        Its model call therefore never passes through the agent's model node or
-        `after_model` at all, which is the case the recorder exists for.
-        """
-        summary_model = _fake_model(_message(_usage(), message_id="summary"))
-        agent = self._agent(
-            model=_fake_model(_message(_usage(), message_id="a")),
-            middleware=[
-                SummarizationMiddleware(
-                    model=summary_model,
-                    trigger=("messages", 2),
-                    keep=("messages", 1),
-                )
-            ],
-        )
-
-        total_usd, _totals = await self._run(
-            agent,
-            messages=[
-                HumanMessage("first"),
-                _message(_usage(), message_id="earlier"),
-                HumanMessage("hello"),
-            ],
-        )
-
-        # The summary call plus this turn's own call. The seeded history is not
-        # re-priced: only requests completed in this run are charged.
-        assert total_usd == pytest.approx(2 * self._one_call_usd())
-
-    async def test_auto_classifier_call_is_charged(self) -> None:
-        agent = self._agent(
-            model=_fake_model(_message(_usage(), message_id="a")),
-            middleware=[
-                _SideInvokeMiddleware(
-                    _fake_model(_message(_usage(), message_id="decision")),
-                    "auto_mode_classifier",
-                )
-            ],
-        )
-
-        total_usd, _totals = await self._run(agent)
-
-        assert total_usd == pytest.approx(2 * self._one_call_usd())
-
-    async def test_subagent_spend_is_charged_once(self) -> None:
-        child = create_agent(
-            model=_fake_model(_message(_usage(), message_id="child")),
-            tools=[],
-            middleware=[CostTrackingMiddleware(nested=True)],
-        )
-
-        @tool
-        async def task(query: str, runtime: ToolRuntime) -> Command[Any]:
-            """Run a nested agent."""
-            result = await child.ainvoke({"messages": [HumanMessage(query)]})
-            return _subagent_command(result, runtime)
-
-        agent = self._agent(
-            model=_fake_model(
-                AIMessage(
-                    content="",
-                    id="parent-1",
-                    usage_metadata=_usage(),  # ty: ignore[invalid-argument-type]
-                    response_metadata={
-                        "model_name": KNOWN_MODEL,
-                        "model_provider": KNOWN_PROVIDER,
-                    },
-                    tool_calls=[{"name": "task", "args": {"query": "go"}, "id": "t1"}],
-                ),
-                _message(_usage(), message_id="parent-2"),
-            ),
-            tools=[task],
-        )
-
-        total_usd, _totals = await self._run(agent)
-
-        # Two parent steps and the one nested call, each counted exactly once.
-        assert total_usd == pytest.approx(3 * self._one_call_usd())
 
     async def test_parallel_subagents_are_each_charged_once(self) -> None:
         """Sibling nested graphs claim records from their own checkpoint scope."""
@@ -3990,19 +2386,640 @@ class TestGraphCostOwnership:
         # One more step with its two side calls, on top of the first turn.
         assert second_total_usd == pytest.approx(10 * self._one_call_usd())
 
-    async def test_unpriceable_model_leaves_the_total_alone(self) -> None:
-        agent = self._agent(
-            model=_fake_model(
-                _message(
-                    _usage(),
-                    model="definitely-not-a-real-model",
-                    provider="unknown-provider",
-                    message_id="a",
-                )
+
+async def test_side_question_cost_is_durable_without_another_turn(
+    recorder: _SessionCostRecorder,
+    side_cost_db: Path,
+) -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    from deepagents_code import offload_api
+    from deepagents_code.btw import BtwOperation
+    from deepagents_code.btw_cost import load_cost
+    from deepagents_code.client.remote_client import RemoteAgent
+
+    agent = create_agent(
+        model=_fake_model(
+            _message(_usage(), message_id="main-1"),
+            _message(_usage(), message_id="main-2"),
+        ),
+        tools=[],
+        middleware=[CostTrackingMiddleware()],
+        checkpointer=InMemorySaver(),
+    )
+    config: RunnableConfig = {"configurable": {"thread_id": THREAD_ID}}
+    await agent.ainvoke({"messages": [HumanMessage("main")]}, config)
+    checkpoint = await agent.aget_state(config)
+    before = cast("CostState", checkpoint.values)
+    one_call = before["_session_cost_usd"]
+    assert one_call > 0
+    operation = BtwOperation(
+        _fake_model(_message(_usage(), message_id="side")), "system", None
+    )
+    server = SimpleNamespace(backend=SimpleNamespace(_dcode_btw=operation))
+    threads = SimpleNamespace(get_state=AsyncMock(return_value={"values": before}))
+    with (
+        patch("deepagents_code.btw_api.require_thread_workspace", new=AsyncMock()),
+        patch.object(offload_api, "get_server_runtime", AsyncMock(return_value=server)),
+        patch.object(
+            offload_api, "_thread_client", return_value=SimpleNamespace(threads=threads)
+        ),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=offload_api.app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                f"/dcode/threads/{THREAD_ID}/btw",
+                json={"question": "side question", "workspace": {}},
             )
+    assert response.status_code == 200
+    cost = response.json()["cost"]
+    assert (await agent.aget_state(config)).values == before
+    assert recorder.drain(THREAD_ID) == []
+    assert cost is not None
+    assert cost["total_cost_usd"] == pytest.approx(one_call)
+
+    # Recreate the reader with no process-local accounting state. It must show
+    # the persisted side spend even though no subsequent graph turn occurred.
+    assert await asyncio.to_thread(side_cost_db.exists)
+    saved = await asyncio.to_thread(load_cost, THREAD_ID)
+    assert saved == cost
+    remote = RemoteAgent("http://test")
+    graph = MagicMock()
+    graph.aget_state = AsyncMock(return_value=checkpoint)
+
+    async def read_cost(path: str) -> dict[str, object]:
+        async with AsyncClient(
+            transport=ASGITransport(app=offload_api.app), base_url="http://test"
+        ) as client:
+            with patch.object(
+                offload_api,
+                "_thread_client",
+                side_effect=AssertionError("Side costs must not read graph state"),
+            ):
+                response = await client.get(path)
+        assert response.status_code == 200
+        return response.json()
+
+    graph.client.http.get = read_cost
+    remote._graph = graph
+    restored = await remote.aget_state(dict(config))
+    assert restored is checkpoint
+    display_cost = await remote.aget_session_cost(dict(config), checkpoint=before)
+    assert display_cost is not None
+    assert display_cost["total"] == pytest.approx(2 * one_call)
+    assert display_cost["breakdown"] is not None
+    assert display_cost["breakdown"]["request_count"] == 2
+
+    events = [
+        event
+        async for event in agent.astream(
+            {"messages": [HumanMessage("continue")]}, config, stream_mode="custom"
+        )
+    ]
+    totals = [event["total"] for event in events if event.get("type") == "session_cost"]
+    assert totals[-1] == pytest.approx(2 * one_call)
+    after = (await agent.aget_state(config)).values
+    display_cost = await remote.aget_session_cost(dict(config), checkpoint=after)
+    assert display_cost is not None
+    assert display_cost["total"] == pytest.approx(3 * one_call)
+    assert display_cost["breakdown"] is not None
+    assert display_cost["breakdown"]["request_count"] == 3
+    assert after["_session_cost_usd"] == pytest.approx(2 * one_call)
+    assert len(after["messages"]) == 4
+    assert recorder.drain(THREAD_ID) == []
+
+
+@pytest.mark.parametrize("history", ["new", "legacy", "accounted"])
+@pytest.mark.usefixtures("side_cost_db")
+async def test_side_question_cost_completeness_from_serialized_history(
+    history: str,
+) -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    from deepagents_code import offload_api
+    from deepagents_code.btw import BtwOperation
+    from deepagents_code.btw_cost import load_cost
+
+    messages = [HumanMessage("Main question").model_dump()]
+    if history != "new":
+        messages.append(AIMessage("Earlier answer").model_dump())
+    values: dict[str, object] = {"messages": messages}
+    if history == "accounted":
+        values["_session_cost_breakdown"] = cost_tracking._empty_cost_breakdown()
+    before = deepcopy(values)
+    operation = BtwOperation(
+        _fake_model(_message(_usage(), message_id="side")), "system", None
+    )
+    server = SimpleNamespace(backend=SimpleNamespace(_dcode_btw=operation))
+    threads = SimpleNamespace(get_state=AsyncMock(return_value={"values": values}))
+    with (
+        patch("deepagents_code.btw_api.require_thread_workspace", new=AsyncMock()),
+        patch.object(offload_api, "get_server_runtime", AsyncMock(return_value=server)),
+        patch.object(
+            offload_api, "_thread_client", return_value=SimpleNamespace(threads=threads)
+        ),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=offload_api.app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                f"/dcode/threads/{THREAD_ID}/btw",
+                json={"question": "side question", "workspace": {}},
+            )
+            display = await client.get(f"/dcode/threads/{THREAD_ID}/cost")
+
+    assert response.status_code == display.status_code == 200
+    cost = response.json()["cost"]
+    assert cost["total_cost_usd"] > 0
+    assert cost["request_count"] == 1
+    assert cost["historical_complete"] is (history != "legacy")
+    assert display.json()["cost"]["historical_complete"] is (history != "legacy")
+    assert await asyncio.to_thread(load_cost, THREAD_ID) == cost
+    assert values == before
+
+
+@pytest.fixture
+def side_cost_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Use a real, isolated sessions database for side-question accounting."""
+    from deepagents_code import btw_cost
+
+    path = tmp_path / "sessions.db"
+    monkeypatch.setattr(btw_cost, "_database_path", lambda: path)
+    monkeypatch.setattr(btw_cost, "_PENDING_COSTS", {})
+    return path
+
+
+@pytest.mark.parametrize("outcome", ["automatic", "rejected", "invalid", "switched"])
+@pytest.mark.usefixtures("side_cost_db")
+async def test_thread_naming_cost_is_durable_and_updates_display(
+    recorder: _SessionCostRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    from deepagents_code.app import DeepAgentsApp
+    from deepagents_code.btw_cost import load_cost
+    from deepagents_code.client.remote_client import RemoteAgent
+    from deepagents_code.config import ModelResult
+    from deepagents_code.tui.modals.session_cost import SessionCostWarningScreen
+
+    response = _message(_usage(), message_id="naming")
+    response.content = "" if outcome == "invalid" else "Cache repair"
+    # The dedicated naming model's identity must survive absent response metadata.
+    response.response_metadata = {}
+    model = _fake_model(response)
+    _set_configured_model_metadata(model, KNOWN_MODEL, KNOWN_PROVIDER)
+    monkeypatch.setattr(
+        "deepagents_code.config.create_model",
+        lambda *_args, **_kwargs: ModelResult(model, KNOWN_MODEL, KNOWN_PROVIDER),
+    )
+    state = {
+        "messages": [HumanMessage("Fix caching"), AIMessage("Here is the fix")],
+        "_model_spec": "other:chat-model",
+        "_session_cost_usd": 1.0,
+    }
+    app = DeepAgentsApp(thread_id=THREAD_ID)
+    remote = RemoteAgent("http://test")
+    remote._cost_tracker(THREAD_ID).update_graph(1.0, None)
+    monkeypatch.setattr(app, "_remote_agent", lambda: remote)
+    monkeypatch.setattr(app, "_get_thread_state_values", AsyncMock(return_value=state))
+    monkeypatch.setattr(app, "notify", MagicMock())
+    monkeypatch.setattr(app, "call_after_refresh", MagicMock())
+    monkeypatch.setattr(app, "_refresh_thread_name_selectors", MagicMock())
+    monkeypatch.setattr(
+        "deepagents_code.sessions.get_thread_name", AsyncMock(return_value=None)
+    )
+    rename = AsyncMock(return_value=True)
+    monkeypatch.setattr("deepagents_code.sessions.rename_thread", rename)
+    show_warning = MagicMock()
+    monkeypatch.setattr(app, "push_screen", show_warning)
+    app._session_cost_usd = 1.0
+    app._provisional_cost_usd = 0.5
+    app._session_cost_warning_threshold_usd = 1.0
+
+    # A main request awaiting settlement must not be drained with the title.
+    await _fake_model(_message(_usage(), message_id="main")).ainvoke(
+        [HumanMessage("main")], config={"metadata": {"thread_id": THREAD_ID}}
+    )
+    app._start_thread_name_generation(
+        THREAD_ID,
+        f"{KNOWN_PROVIDER}:{KNOWN_MODEL}",
+        automatic=outcome == "automatic",
+    )
+    if outcome == "switched":
+        app._lc_thread_id = "other-thread"
+    await asyncio.gather(*app._thread_name_tasks.values())
+
+    saved = await asyncio.to_thread(load_cost, THREAD_ID)
+    assert saved is not None
+    expected = estimate_cost(_usage(), KNOWN_MODEL, KNOWN_PROVIDER)
+    assert expected is not None
+    assert expected > 0
+    assert saved["total_cost_usd"] == pytest.approx(expected)
+    assert saved["request_count"] == 1
+    assert await asyncio.to_thread(load_cost, "other-thread") is None
+    assert [record.message_id for record in recorder.drain(THREAD_ID)] == ["main"]
+    assert cost_tracking._RECORDER.drain(THREAD_ID) == []
+    assert state["_session_cost_usd"] == pytest.approx(1.0)
+    assert app._provisional_cost_usd == pytest.approx(0.5)
+    cached = remote.get_cached_session_cost({"configurable": {"thread_id": THREAD_ID}})
+    assert cached is not None
+    assert cached["total"] == pytest.approx(1.0 + expected)
+    if outcome == "switched":
+        assert app._session_cost_usd == pytest.approx(1.0)
+        show_warning.assert_not_called()
+    else:
+        assert app._session_cost_usd == pytest.approx(1.0 + expected)
+        assert isinstance(show_warning.call_args.args[0], SessionCostWarningScreen)
+    if outcome == "automatic":
+        rename.assert_awaited_once_with(THREAD_ID, "Cache repair", only_if_unnamed=True)
+    else:
+        rename.assert_not_awaited()
+
+
+@pytest.mark.parametrize("saved_before_deletion", [False, True])
+async def test_thread_deletion_erases_cost_and_discards_late_settlements(
+    side_cost_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    saved_before_deletion: bool,
+) -> None:
+    from deepagents_code import btw_cost, sessions
+    from deepagents_code.btw import BtwOperation
+
+    monkeypatch.setattr(sessions, "get_db_path", lambda: side_cost_db)
+    operation = BtwOperation(_repeating_fake_model("answer"), "system", None)
+
+    async def answer(thread_id: str) -> tuple[str, cost_tracking.CostBreakdown | None]:
+        return await btw_cost.answer_with_cost(
+            operation.answer(thread_id, {}, "aside"),
+            thread_id=thread_id,
+            state={"messages": []},
         )
 
-        total_usd, totals = await self._run(agent)
+    if saved_before_deletion:
+        await answer(THREAD_ID)
+    with monkeypatch.context() as failure:
+        failure.setattr(
+            btw_cost,
+            "_read_cost",
+            MagicMock(side_effect=sqlite3.OperationalError("database is locked")),
+        )
+        text, cost = await answer(THREAD_ID)
+        assert text
+        assert cost is None
+    await sessions.delete_thread(THREAD_ID)
+    # Retrying an old charge and completing another answer cannot restore spend.
+    assert await asyncio.to_thread(btw_cost.load_cost, THREAD_ID) is None
+    text, cost = await answer(THREAD_ID)
+    assert text
+    assert cost is None
+    assert await asyncio.to_thread(btw_cost.load_cost, THREAD_ID) is None
+    _, other_cost = await answer("other-thread")
+    assert other_cost is not None
+    assert other_cost["request_count"] == 1
 
-        assert total_usd == pytest.approx(0.0)
-        assert totals == []
+
+@pytest.mark.parametrize("retry_with_answer", [False, True])
+async def test_failed_side_costs_remain_retryable(
+    recorder: _SessionCostRecorder,
+    side_cost_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    retry_with_answer: bool,
+) -> None:
+    from deepagents_code import btw_cost
+    from deepagents_code.btw import BtwOperation
+
+    await _fake_model(_message(_usage(), message_id="main")).ainvoke(
+        [HumanMessage("main")], config={"metadata": {"thread_id": THREAD_ID}}
+    )
+    operation = BtwOperation(
+        _fake_model(_message(_usage()), _message(_usage())), "system", None
+    )
+
+    async def answer() -> tuple[str, cost_tracking.CostBreakdown | None]:
+        return await btw_cost.answer_with_cost(
+            operation.answer(THREAD_ID, {}, "aside"),
+            thread_id=THREAD_ID,
+            state={"messages": []},
+        )
+
+    # Fail inside the transaction, after usage has been drained for pricing.
+    with monkeypatch.context() as failure:
+        failure.setattr(
+            btw_cost,
+            "_read_cost",
+            MagicMock(side_effect=sqlite3.OperationalError("database is locked")),
+        )
+        text, cost = await answer()
+        assert text
+        assert cost is None
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            await asyncio.to_thread(btw_cost.load_cost, THREAD_ID)
+
+    if retry_with_answer:
+        _, cost = await answer()
+    else:
+        # Concurrent readers must persist the recovered charge exactly once.
+        costs = await asyncio.gather(
+            *(asyncio.to_thread(btw_cost.load_cost, THREAD_ID) for _ in range(2))
+        )
+        cost = costs[0]
+        assert costs[1] == cost
+    assert await asyncio.to_thread(side_cost_db.exists)
+    assert cost is not None
+    count = 2 if retry_with_answer else 1
+    assert cost["request_count"] == count
+    estimate = estimate_cost(_usage(), KNOWN_MODEL, provider=KNOWN_PROVIDER)
+    assert estimate is not None
+    assert cost["total_cost_usd"] == pytest.approx(count * estimate)
+    assert await asyncio.to_thread(btw_cost.load_cost, THREAD_ID) == cost
+    assert await asyncio.to_thread(btw_cost.load_cost, "other-thread") is None
+    assert [record.message_id for record in recorder.drain(THREAD_ID)] == ["main"]
+
+
+@pytest.mark.parametrize("failure_stage", ["pricing", "persistence"])
+async def test_failed_side_costs_release_conversation(
+    side_cost_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    from deepagents_code import btw_cost
+    from deepagents_code.btw import BtwOperation
+
+    operation = BtwOperation(_fake_model(_message(_usage())), "system", None)
+    message = AIMessage("Earlier conversation with potentially large attachments")
+    reference = weakref.ref(message)
+    state: CostState = {"messages": [message]}
+    estimate = estimate_cost(_usage(), KNOWN_MODEL, provider=KNOWN_PROVIDER)
+    with monkeypatch.context() as failure:
+        failure.setattr(
+            btw_cost,
+            "_price_operation_records" if failure_stage == "pricing" else "_read_cost",
+            MagicMock(side_effect=OSError("temporarily unavailable")),
+        )
+        text, cost = await btw_cost.answer_with_cost(
+            operation.answer(THREAD_ID, {}, "aside"),
+            thread_id=THREAD_ID,
+            state=state,
+        )
+        assert text
+        assert cost is None
+
+    del state, message
+    gc.collect()
+    assert reference() is None
+    if failure_stage == "persistence":
+        # Saving an already priced charge must work even if pricing goes offline.
+        monkeypatch.setattr(
+            cost_tracking,
+            "_request_estimate",
+            MagicMock(side_effect=OSError("pricing unavailable")),
+        )
+    saved = await asyncio.to_thread(btw_cost.load_cost, THREAD_ID)
+    assert await asyncio.to_thread(side_cost_db.exists)
+    assert saved is not None
+    assert estimate is not None
+    assert saved["total_cost_usd"] == pytest.approx(estimate)
+    assert saved["request_count"] == 1
+    assert saved["historical_complete"] is False
+
+
+async def test_concurrent_side_costs_do_not_claim_main_run_usage(
+    recorder: _SessionCostRecorder, side_cost_db: Path
+) -> None:
+    from deepagents_code.btw import BtwOperation
+    from deepagents_code.btw_cost import answer_with_cost, load_cost
+
+    await _fake_model(_message(_usage(), message_id="main")).ainvoke(
+        [HumanMessage("main")], config={"metadata": {"thread_id": THREAD_ID}}
+    )
+    operation = BtwOperation(
+        _fake_model(_message(_usage()), _message(_usage())), "system", None
+    )
+    await asyncio.gather(
+        *(
+            answer_with_cost(
+                operation.answer(THREAD_ID, {}, "aside"),
+                thread_id=THREAD_ID,
+                state={"messages": []},
+            )
+            for _ in range(2)
+        )
+    )
+    assert await asyncio.to_thread(side_cost_db.exists)
+    saved = await asyncio.to_thread(load_cost, THREAD_ID)
+    assert saved is not None
+    assert saved["request_count"] == 2
+    assert saved["total_cost_usd"] > 0
+    assert await asyncio.to_thread(load_cost, "other-thread") is None
+    assert [record.message_id for record in recorder.drain(THREAD_ID)] == ["main"]
+
+
+async def test_cancelling_side_answer_finishes_started_cost_write(
+    recorder: _SessionCostRecorder, side_cost_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deepagents_code import btw_cost
+    from deepagents_code.btw import BtwOperation
+    from deepagents_code.btw_cost import answer_with_cost, load_cost
+
+    started = threading.Event()
+    release = threading.Event()
+    write = btw_cost._persist_cost
+
+    def blocked_write(
+        thread_id: str, charge: cost_tracking.CostBreakdown
+    ) -> cost_tracking.CostBreakdown | None:
+        started.set()
+        assert release.wait(5)
+        return write(thread_id, charge)
+
+    monkeypatch.setattr(btw_cost, "_persist_cost", blocked_write)
+    operation = BtwOperation(_fake_model(_message(_usage())), "system", None)
+    task = asyncio.create_task(
+        answer_with_cost(
+            operation.answer(THREAD_ID, {}, "aside"),
+            thread_id=THREAD_ID,
+            state={"messages": []},
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert await asyncio.to_thread(side_cost_db.exists)
+    saved = await asyncio.to_thread(load_cost, THREAD_ID)
+    assert saved is not None
+    assert saved["request_count"] == 1
+    assert recorder.drain(THREAD_ID) == []
+
+
+@pytest.mark.usefixtures("side_cost_db")
+async def test_streamed_side_answer_persists_completed_usage(
+    recorder: _SessionCostRecorder,
+) -> None:
+    from deepagents_code.btw import BtwOperation
+    from deepagents_code.btw_cost import answer_with_cost, load_cost
+
+    operation = BtwOperation(_ResponsesStyleStreamingModel(), "system", None)
+    on_text = AsyncMock()
+    text, cost = await answer_with_cost(
+        operation.answer(THREAD_ID, {}, "why", on_text=on_text),
+        thread_id=THREAD_ID,
+        state={"messages": [], "_model_spec": f"{KNOWN_PROVIDER}:{KNOWN_MODEL}"},
+    )
+    assert text == "done"
+    on_text.assert_awaited_once_with("done")
+    assert cost is not None
+    assert cost["request_count"] == 1
+    assert cost["total_cost_usd"] > 0
+    assert await asyncio.to_thread(load_cost, THREAD_ID) == cost
+    assert recorder.drain(THREAD_ID) == []
+
+
+async def _write_usage_checkpoint(path: Path, values: dict[str, object]) -> None:
+    """Commit one root checkpoint to a real SQLite checkpoint DB."""
+    from langgraph.checkpoint.base import empty_checkpoint
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    checkpoint = empty_checkpoint()
+    checkpoint["channel_values"] = values
+    config: RunnableConfig = {
+        "configurable": {"thread_id": THREAD_ID, "checkpoint_ns": ""}
+    }
+    async with AsyncSqliteSaver.from_conn_string(str(path)) as saver:
+        await saver.aput(config, checkpoint, {}, {})
+
+
+def _usage_reader(app: Starlette) -> Callable[[str], Awaitable[object]]:
+    """Serve `RemoteAgent` HTTP reads from the in-process dcode routes."""
+    from httpx import ASGITransport, AsyncClient
+
+    async def read(path: str) -> object:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.get(path)
+        assert response.status_code == 200
+        return response.json()
+
+    return read
+
+
+async def test_usage_route_settles_cost_and_cache_without_full_state(
+    side_cost_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import UTC, datetime
+
+    from deepagents_code import btw_api, btw_cost, offload_api
+    from deepagents_code.app import DeepAgentsApp
+    from deepagents_code.client.remote_client import RemoteAgent
+
+    monkeypatch.setattr(btw_api, "_database_path", lambda: side_cost_db)
+    requested_at = datetime.now(UTC).isoformat()
+    await _write_usage_checkpoint(
+        side_cost_db,
+        {
+            "messages": [HumanMessage("history " * 1000)],
+            "_session_cost_usd": 1.25,
+            "_last_model_request_at": requested_at,
+            "_last_cache_model_spec": f"{KNOWN_PROVIDER}:{KNOWN_MODEL}",
+            "goal": "not a usage channel",
+        },
+    )
+    side = cost_tracking._empty_cost_breakdown()
+    side.update(total_cost_usd=0.5, request_count=1)
+    await asyncio.to_thread(btw_cost._persist_cost, THREAD_ID, side)
+
+    remote = RemoteAgent("http://test")
+    remote._graph = MagicMock()
+    remote._graph.client.http.get = _usage_reader(offload_api.app)
+    app = DeepAgentsApp(agent=MagicMock(), thread_id=THREAD_ID)
+    monkeypatch.setattr(app, "_remote_agent", lambda: remote)
+    full_state = AsyncMock(side_effect=AssertionError("full state was read"))
+    monkeypatch.setattr(app, "_get_thread_state_values", full_state)
+    activity = AsyncMock()
+    monkeypatch.setattr("deepagents_code.sessions.refresh_thread_activity", activity)
+
+    await app._sync_session_cost_from_checkpoint()
+
+    full_state.assert_not_awaited()
+    assert app._displayed_cost_usd == pytest.approx(1.75)
+    assert app._last_model_request_at == requested_at
+    assert app._last_cache_model_spec == f"{KNOWN_PROVIDER}:{KNOWN_MODEL}"
+    activity.assert_awaited_once_with(THREAD_ID, datetime.fromisoformat(requested_at))
+    usage = await _usage_reader(offload_api.app)(f"/dcode/threads/{THREAD_ID}/usage")
+    assert usage == {
+        "cost": side,
+        "checkpoint": {
+            "_session_cost_usd": 1.25,
+            "_last_model_request_at": requested_at,
+            "_last_cache_model_spec": f"{KNOWN_PROVIDER}:{KNOWN_MODEL}",
+        },
+    }
+
+
+@pytest.mark.parametrize("database", ["missing", "empty", "other-thread"])
+async def test_usage_route_reports_no_channels_without_a_checkpoint(
+    database: str, side_cost_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deepagents_code import btw_api, offload_api
+
+    monkeypatch.setattr(btw_api, "_database_path", lambda: side_cost_db)
+    if database == "empty":
+        await asyncio.to_thread(lambda: sqlite3.connect(side_cost_db).close())
+    elif database == "other-thread":
+        await _write_usage_checkpoint(side_cost_db, {"_session_cost_usd": 1.0})
+    thread_id = "another-thread" if database == "other-thread" else THREAD_ID
+    usage = await _usage_reader(offload_api.app)(f"/dcode/threads/{thread_id}/usage")
+    assert usage == {"cost": None, "checkpoint": {}}
+
+
+async def test_server_without_usage_route_falls_back_to_full_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from httpx import Request, Response
+    from langgraph_sdk.errors import NotFoundError
+
+    from deepagents_code.app import DeepAgentsApp
+    from deepagents_code.client.remote_client import RemoteAgent
+
+    side = cost_tracking._empty_cost_breakdown()
+    side.update(total_cost_usd=0.5, request_count=1)
+
+    missing = NotFoundError(
+        "Not found",
+        response=Response(404, request=Request("GET", "http://test/usage")),
+        body=None,
+    )
+
+    def read(path: str) -> object:
+        if path.endswith("/usage"):
+            raise missing
+        return {"cost": side}
+
+    remote = RemoteAgent("http://test")
+    remote._graph = MagicMock()
+    http_get = AsyncMock(side_effect=read)
+    remote._graph.client.http.get = http_get
+    app = DeepAgentsApp(agent=MagicMock(), thread_id=THREAD_ID)
+    monkeypatch.setattr(app, "_remote_agent", lambda: remote)
+    full_state = AsyncMock(return_value={"_session_cost_usd": 2.0})
+    monkeypatch.setattr(app, "_get_thread_state_values", full_state)
+
+    for _ in range(2):
+        await app._sync_session_cost_from_checkpoint()
+
+    assert app._displayed_cost_usd == pytest.approx(2.5)
+    assert full_state.await_count == 2
+    # A missing route is remembered, so later turns skip the extra request.
+    routes = [call.args[0].rsplit("/", 1)[-1] for call in http_get.await_args_list]
+    assert routes == ["usage", "cost", "cost"]

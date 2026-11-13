@@ -4,8 +4,7 @@ okf_version: "0.2"
 
 # Files
 
-- [Quickstart & Wiki Map](quickstart.md) - Orientation to the Deep Agents monorepo layout under libs/ and a task-routing map that sends common jobs (build an agent, run dcode, benchmark, host, sandbox) to the right wiki section.
-- [Runtime Behavior & Findings (LangSmith)](runtime-behavior.md) - Consolidated home for production-trace evidence that complements the static docs — run shape, hotspots, failures, and code-vs-production divergences — plus the code-anchored runtime checks (limits, assumptions, retry paths) an agent should evaluate against each fresh LangSmith sample.
+- [Deep Agents Monorepo Quickstart](quickstart.md) - Route a Deep Agents monorepo change to its owning package, choose focused validation, and safely maintain published dependency constraints and package lockfiles. Use linked domain guides for runtime design, release operations, and detailed tests.
 
 # Directories
 

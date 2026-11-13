@@ -9,6 +9,7 @@ import argparse
 from rich.markup import escape
 
 from deepagents_code import theme
+from deepagents_code._constants import DEFAULT_AGENT_NAME, DEFAULT_THREAD_LIMIT
 from deepagents_code._paths import PATHS
 from deepagents_code._version import DOCS_URL, __version__
 from deepagents_code.config import (
@@ -150,12 +151,16 @@ def show_help() -> None:
     console.print(
         "  dcode uninstall NAME                      Remove an optional extra"
     )
+    console.print(
+        "  dcode completion <bash|zsh|fish>          Generate shell completions"
+    )
     console.print()
 
     console.print("[bold]Options:[/bold]", style=theme.PRIMARY)
     console.print(
         "  -r, --resume [ID]          Resume thread: -r for most recent, -r ID for specific"  # noqa: E501
     )
+    console.print("                             With -n, an ID is required")
     console.print("  -a, --agent NAME           Agent to use")
     console.print("  -M, --model MODEL          Model to use (e.g., gpt-5.5)")
     console.print(
@@ -215,6 +220,12 @@ def show_help() -> None:
     )
     console.print("  --no-mcp                   Disable all MCP tool loading")
     console.print(
+        "  --no-tracing               Disable LangSmith agent tracing for this session"
+    )
+    console.print(
+        "                             Keeps local history and model-provider requests"
+    )
+    console.print(
         "  --trust-project-mcp        Trust project MCP configs (skip approval prompt)"
     )
     console.print(
@@ -243,12 +254,21 @@ def show_help() -> None:
         "  --allow-fs-tools LIST      Filesystem tool allowlist: 'all' or "
         "comma-separated tool names (must include 'read_file')"
     )
-    console.print("  -n, --non-interactive MSG  Run a single task and exit")
+    console.print(
+        "  -n, --non-interactive MSG  Run one task and exit; no human approvals"
+    )
+    console.print(
+        "                             Can change files and access the network"
+    )
+    console.print(
+        "                             Shell off unless a shell allow-list is configured"
+    )
     console.print("  -q, --quiet                Clean output for piping (needs -n)")
     console.print(
         "  --no-stream                Buffer full response instead of streaming"
     )
     console.print("  --show-reasoning           Show provider-visible reasoning")
+    console.print("                             On in the TUI, off by default with -n")
     console.print(
         "  --max-turns N              Max agentic turns before stopping (needs -n)"
     )
@@ -423,7 +443,7 @@ def show_skills_help() -> None:
     console.print("  trust             Manage trusted skill directories")
     console.print()
     _print_option_section(
-        "  --agent <name>    Specify agent identifier (default: agent)",
+        f"  --agent <name>    Specify agent identifier (default: {DEFAULT_AGENT_NAME})",
         "  --project         Use project-level skills instead of user-level",
         title="Common options",
     )
@@ -462,6 +482,8 @@ def show_plugins_help() -> None:
     console.print("[bold]Commands:[/bold]", style=theme.PRIMARY)
     console.print("  list|ls                      List available plugins")
     console.print("  install <id>                 Install a marketplace plugin")
+    console.print("  reinstall <id>               Restore an installed plugin's files")
+    console.print("  update [<id>...] [--check]   Update installed plugins")
     console.print("  uninstall <id>               Uninstall a plugin")
     console.print("  enable <id>                  Enable an installed plugin")
     console.print("  disable <id>                 Disable a plugin")
@@ -474,6 +496,7 @@ def show_plugins_help() -> None:
     console.print("  dcode plugin marketplace add ./marketplace")
     console.print("  dcode plugin install quality-review-plugin@company-tools")
     console.print("  dcode plugin enable quality-review-plugin@company-tools")
+    console.print("  dcode plugin update --check")
     console.print()
 
 
@@ -484,7 +507,7 @@ def show_skills_list_help() -> None:
     console.print("  dcode skills list [options]")
     console.print()
     _print_option_section(
-        "  --agent NAME            Agent identifier (default: agent)",
+        f"  --agent NAME            Agent identifier (default: {DEFAULT_AGENT_NAME})",
         "  --project               Show only project-level skills",
     )
     console.print()
@@ -502,7 +525,7 @@ def show_skills_create_help() -> None:
     console.print("  dcode skills create <name> [options]")
     console.print()
     _print_option_section(
-        "  --agent NAME            Agent identifier (default: agent)",
+        f"  --agent NAME            Agent identifier (default: {DEFAULT_AGENT_NAME})",
         "  --project               Create in project directory "
         "instead of user directory",
     )
@@ -520,7 +543,7 @@ def show_skills_info_help() -> None:
     console.print("  dcode skills info <name> [options]")
     console.print()
     _print_option_section(
-        "  --agent NAME            Agent identifier (default: agent)",
+        f"  --agent NAME            Agent identifier (default: {DEFAULT_AGENT_NAME})",
         "  --project               Search only in project skills",
     )
     console.print()
@@ -537,7 +560,7 @@ def show_skills_delete_help() -> None:
     console.print("  dcode skills delete <name> [options]")
     console.print()
     _print_option_section(
-        "  --agent NAME            Agent identifier (default: agent)",
+        f"  --agent NAME            Agent identifier (default: {DEFAULT_AGENT_NAME})",
         "  --project               Search only in project skills",
         "  -f, --force             Skip confirmation prompt",
         "  --dry-run               Show what would happen without making changes",
@@ -629,6 +652,47 @@ def show_doctor_help() -> None:
         "     Run `dcode --version` (or `dcode -v`) for dependency versions.",
         style=theme.MUTED,
         highlight=False,
+    )
+    console.print()
+
+
+def show_completion_help() -> None:
+    """Show help information for the `completion` subcommand."""
+    console.print()
+    console.print("[bold]Usage:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode completion <bash|zsh|fish> [--prog NAME]")
+    console.print()
+    console.print("Print a shell completion script for dcode to stdout.")
+    console.print("Regenerate the script after upgrading dcode so new commands and")
+    console.print("options are completed.")
+    console.print()
+    console.print("[bold]Options:[/bold]", style=theme.PRIMARY)
+    console.print("  --prog NAME             Command name the script completes")
+    console.print(
+        "                          (repeatable; default: dcode and deepagents-code)"
+    )
+    console.print(_HELP_OPTION_LINE)
+    console.print()
+    console.print("[bold]Setup:[/bold]", style=theme.PRIMARY)
+    console.print("  Bash:")
+    console.print("    dcode completion bash > ~/.dcode-completion.bash")
+    console.print("    echo 'source ~/.dcode-completion.bash' >> ~/.bashrc")
+    console.print("    # macOS login shells read ~/.bash_profile instead of ~/.bashrc")
+    console.print()
+    console.print("  Zsh:")
+    console.print("    mkdir -p ~/.zfunc")
+    console.print("    dcode completion zsh > ~/.zfunc/_dcode")
+    console.print("    # in ~/.zshrc, in this order:")
+    console.print("    fpath=(~/.zfunc $fpath)")
+    console.print("    autoload -Uz compinit && compinit")
+    console.print()
+    console.print("  Fish:")
+    console.print("    # fish loads one file per command name")
+    console.print("    mkdir -p ~/.config/fish/completions")
+    console.print("    cd ~/.config/fish/completions")
+    console.print("    dcode completion fish --prog dcode > dcode.fish")
+    console.print(
+        "    dcode completion fish --prog deepagents-code > deepagents-code.fish"
     )
     console.print()
 
@@ -1037,7 +1101,8 @@ def show_threads_list_help() -> None:
         "  --branch TEXT             Filter by git branch name",
         "  --cwd [PATH]              Filter by working directory (no value = current)",
         "  --sort {created,updated}  Sort order (default: from config, or updated)",
-        "  -n, --limit N             Maximum threads to display (default: 20)",
+        "  -n, --limit N             Maximum threads to display "
+        f"(default: {DEFAULT_THREAD_LIMIT})",
         "  -v, --verbose             Show all columns (branch, created, prompt)",
         "  -r, --relative/--no-relative"
         "  Show relative timestamps (default: from config)",

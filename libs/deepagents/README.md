@@ -38,12 +38,13 @@ Deep Agents is an open source agent harness — an opinionated agent that runs o
 - **Skills** — reusable behaviors the agent can load on demand
 - **Tools** — bring your own functions or any MCP server
 
+> **Deep Agents Code** — a pre-built coding agent in your terminal, similar to Claude Code or Cursor, powered by any LLM. Install with `curl -LsSf https://langch.in/dcode | bash`. See the [documentation](https://docs.langchain.com/deepagents-code) for the full feature set.
+
 ```python
 from deepagents import create_deep_agent
 
 agent = create_deep_agent(
-    model="openai:gpt-5.5",
-    tools=[my_custom_tool],
+    model="openai:gpt-6-astra",
     system_prompt="You are a research assistant.",
 )
 result = agent.invoke({"messages": "Research LangGraph and write a summary"})
@@ -85,6 +86,8 @@ The layers compose: any LangGraph `CompiledStateGraph` can be passed in as a sub
 
 ## 📕 Releases & Versioning
 
+See the [changelog](https://github.com/langchain-ai/deepagents/blob/main/libs/deepagents/CHANGELOG.md) for release history.
+
 See our [Releases](https://docs.langchain.com/oss/python/release-policy) and [Versioning](https://docs.langchain.com/oss/python/versioning) policies.
 
 ## 🔒 Security
@@ -95,4 +98,4 @@ Deep Agents follows a "trust the LLM" model. The agent can do anything its tools
 
 As an open-source project in a rapidly developing field, we are extremely open to contributions, whether it be in the form of a new feature, improved infrastructure, or better documentation.
 
-For detailed information on how to contribute, see the [Contributing Guide](https://docs.langchain.com/oss/python/contributing/overview).
+For local setup and package-specific checks, see the [Development Guide](https://github.com/langchain-ai/deepagents/blob/main/libs/DEVELOPMENT.md). For contribution policy, see the [Contributing Guide](https://docs.langchain.com/oss/python/contributing/overview).

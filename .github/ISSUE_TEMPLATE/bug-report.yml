@@ -1,7 +1,6 @@
 name: "\U0001F41B Bug Report"
 description: Report a bug in Deep Agents. To report a security issue, please instead use the security option below. For questions, please use the Deep Agents forum (below).
-labels: ["bug"]
-type: bug
+labels: ["type:bug"]
 body:
   - type: markdown
     attributes:
@@ -39,6 +38,18 @@ body:
           required: true
         - label: I included a minimal reproducible example and steps to reproduce.
           required: true
+  - type: dropdown
+    id: discovery
+    attributes:
+      label: How did you discover this issue?
+      description: Select one. If you select "Other", please explain in the Description field below.
+      multiple: false
+      options:
+        - While building or running a project that uses Deep Agents
+        - Through source-code inspection or automated scanning, rather than use in a project
+        - Other — please explain
+    validations:
+      required: true
   - type: checkboxes
     id: package
     attributes:
@@ -50,7 +61,6 @@ body:
         - label: talon
         - label: acp
         - label: evals
-        - label: harbor
         - label: daytona
         - label: modal
         - label: quickjs

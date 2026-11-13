@@ -13,6 +13,9 @@ from typing import Final
 DEFAULT_AGENT_NAME: Final[str] = "agent"
 """Default agent / assistant identifier when no `-a` flag is given."""
 
+DEFAULT_THREAD_LIMIT: Final[int] = 100
+"""Fallback for `get_thread_limit()`, the thread switcher batch size."""
+
 FS_TOOL_NAMES: Final[frozenset[str]] = frozenset(
     {"ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "execute"}
 )
@@ -37,12 +40,27 @@ Hardcoded rather than read from `deepagents.middleware.rubric.RubricMiddleware`
 because this module is dependency-free and importing the SDK for a display
 string would violate the startup-performance rule (see AGENTS.md). This is a
 hand-maintained duplicate that can rot if the SDK bumps its default, so
-`test_reliable_rubric.py::TestReliableRubricMiddleware::test_displayed_max_iterations_default_matches_sdk`
+`test_reliable_rubric.py::TestRubricMiddlewareIntegration::test_displayed_max_iterations_default_matches_sdk`
 is the drift guard that fails when the two diverge.
 """
 
 FIREWORKS_PROVIDER_ID_PREFIX: Final[str] = "accounts/fireworks/"
 """Prefix used to infer Fireworks from fully-qualified IDs."""
+
+LANGSMITH_API_KEY_ENV: Final[str] = "LANGSMITH_API_KEY"
+"""Primary env var the LangSmith SDK reads for its API key."""
+
+LANGSMITH_API_KEY_FALLBACK_ENV_VARS: Final[tuple[str, ...]] = ("LANGCHAIN_API_KEY",)
+"""Legacy env vars the LangSmith SDK accepts after `LANGSMITH_API_KEY_ENV`."""
+
+LANGSMITH_API_KEY_ENV_VARS: Final[tuple[str, ...]] = (
+    LANGSMITH_API_KEY_ENV,
+    *LANGSMITH_API_KEY_FALLBACK_ENV_VARS,
+)
+"""Env vars LangSmith reads for its API key, in precedence order.
+
+Mirrors the SDK's own `LANGSMITH_`-then-`LANGCHAIN_` lookup.
+"""
 
 FIREWORKS_MODEL_ID_PREFIXES: Final[tuple[str, ...]] = (
     "accounts/fireworks/models/",
@@ -80,6 +98,13 @@ transcript and a thread's initial prompt. Shared here so the single producer
 
 LOCAL_CONTEXT_MESSAGE_SOURCE: Final[str] = "local_context"
 """Source for model-only local-context refresh messages."""
+
+TASK_INTERRUPTED_MESSAGE_SOURCE: Final[str] = "task_interrupted"
+"""Source for the cancellation notice saved when the user interrupts a turn.
+
+Lets readers outside the CLI tell it apart from user input without matching
+`SYSTEM_MESSAGE_PREFIX` text.
+"""
 
 DEFAULT_PLUGIN_DIRNAME: Final[str] = "plugins"
 """Directory name for plugin storage under the profile root.

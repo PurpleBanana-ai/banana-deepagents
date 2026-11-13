@@ -25,6 +25,17 @@ Do not add dependencies unless required. When adding one, justify its maintenanc
 
 Use inline `# noqa: RULE` with a justification for individual exceptions. Reserve `[tool.ruff.lint.per-file-ignores]` for categorical policies that apply to a whole class of files, such as tests not requiring docstrings. Do not hide a single violation with a file-wide ignore. If you cannot justify a suppression, the code is probably the problem. See [`libs/DEVELOPMENT.md`](libs/DEVELOPMENT.md#suppressing-ruff-rules) for worked examples.
 
+## Opening issues
+
+Before opening an issue on a user's behalf, suggest a reasonable priority from the existing repository labels and ask the user to confirm it:
+
+- `priority:triage`: no one has reviewed it; a maintainer should review and assign priority.
+- `priority:backlog`: not now.
+- `priority:medium`: planned, likely this sprint or next.
+- `priority:high`: important; will do now.
+
+Also ask whether it should be assigned to the user or someone else; if someone else, confirm who. Wait for their answers before creating the issue, apply the confirmed priority label, and use the confirmed assignee.
+
 ## PR conventions
 
 ### Titles and scope
@@ -35,6 +46,7 @@ Follow Conventional Commits and include a scope. Allowed types and scopes are de
 - Wrap class, function, method, parameter, and variable names in backticks.
 - Do not put Linear issue-closing markers in titles; put issue relationships in the PR body.
 - For version-branch syncs, use `chore(repo): sync main into vX.Y`; `release` is a type, not a scope.
+- PRs should generally leave `README.md` files unchanged, including root and package READMEs. Only modify them when explicitly requested or necessary to correct information made inaccurate by the PR; avoid incidental README edits.
 - Keep each bump-worthy PR to one releasable component. Put cross-package dependency or lockfile churn in a separate `chore(deps):` PR. See [multi-component fan-out](.github/RELEASING.md#multi-component-fan-out) and [lockfile churn fan-out](.github/RELEASING.md#lockfile-churn-fan-out).
 
 ### Branch naming
@@ -49,7 +61,6 @@ Follow [the PR template](.github/PULL_REQUEST_TEMPLATE.md).
 - For features and behavior-changing fixes, place one plain-English user-visible summary above `---`. It is the release note; do not add a release-note heading or repeat it below the divider. Omit it for chores, refactors, and test-only changes.
 - Below `---`, explain why the change is needed and why the approach is appropriate. Keep prose concise and public-reader friendly.
 - Do not cite line numbers. Prefer symbols or subsystems over full paths, and format code entities with backticks.
-- Add a collapsed test plan only for large or consequential changes. Call out areas needing careful review.
 
 ## Core development principles
 
@@ -77,11 +88,11 @@ When adding or updating model names in docs, examples, or defaults, verify the l
 
 ### Testing
 
-Every feature or bugfix needs unit coverage.
+Add unit coverage when it meaningfully protects changed observable behavior; do not add tests solely to accompany every change.
 
 - Put network-free tests in `tests/unit_tests/` and networked tests in `tests/integration_tests/`.
 - Do not add `@pytest.mark.asyncio`; packages use `asyncio_mode = "auto"`.
-- Test behavior rather than duplicating implementation logic. Cover edge cases and keep tests deterministic.
+- Test observable behavior rather than duplicating implementation logic. Do not add change-detector tests that merely restate the current code structure or assert incidental interactions, such as internal call order, without proving meaningful behavior. Refactors that preserve behavior should not require mechanical test updates; rewrite or remove tests that do. Cover edge cases and keep tests deterministic.
 
 #### Warnings are errors
 
@@ -134,6 +145,14 @@ Benchmarks live in `deepagents`, `code`, and `partners/quickjs`; other packages 
 ## CI and releases
 
 Use [`.github/RELEASING.md`](.github/RELEASING.md) for release-please behavior, version branches, changelog overrides, reverts, and release troubleshooting, including the CI guardrails that gate a release. Use [`.github/LAYOUT.md`](.github/LAYOUT.md) to find a workflow by what it does. Workflow files are authoritative for linting and labeling behavior.
+
+After changes land on `main`, wait for release-please and its lockfile updates before manually updating a release PR or drafting/applying its notes. Do not race the automation with a manual rebase; see [Waiting for a release PR refresh](.github/RELEASING.md#waiting-for-a-release-pr-refresh).
+
+Before merging a release PR:
+
+- Record its current `headRefOid` and inspect `ci.yml` runs for that SHA with `gh run list --workflow ci.yml --commit <head-sha>`. The PR check list alone can omit pending workflows. Missing runs, canceled runs without a successful replacement, and runs awaiting approval are not passing CI. Do not rely on an older successful run when a newer run is pending or failed.
+- Wait for the current CI workflow to finish and its CI Success check and other required checks to pass. For curated-notes-only commits, package jobs may be skipped, but the current head's CI Success check must still pass after validating the parent's result.
+- Use `--admin` only when explicitly requested. "Force merge after CI" does not authorize bypassing failed or unfinished CI. Pin the merge to the verified SHA with `--match-head-commit <verified-head-sha>`. If the head changes, repeat verification rather than dropping the flag or substituting an unverified SHA.
 
 Pin GitHub Actions to full-length commit SHAs; a tag reference is rejected. Verify whether a tag is annotated and dereference it before using its commit. Use the `gh` CLI to resolve one.
 

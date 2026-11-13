@@ -10,7 +10,11 @@ from typing import TYPE_CHECKING
 
 import pytest
 from deepagents_code.config import runtime_state
+from fastmcp import FastMCP
+from langchain.mcp import MCPAdapter
+from langchain_core.tools import BaseTool
 
+from deepagents_harbor.agent import DeepAgentsLangGraph
 from deepagents_harbor.langgraph_project import langgraph_agent
 
 if TYPE_CHECKING:
@@ -166,7 +170,7 @@ def test_langgraph_config_uses_harbor_env_for_fireworks_prereleases() -> None:
 
     dependencies = json.loads(config_path.read_text())["dependencies"]
 
-    assert "langchain-fireworks>=1.4.2,<1.5.0" in dependencies
+    assert "langchain-fireworks>=1.4.4" in dependencies
     assert not any(dependency.startswith("fireworks-ai") for dependency in dependencies)
 
 
@@ -746,14 +750,56 @@ def test_make_bare_graph_builds_sdk_deepagent_with_local_shell(
     assert "system_prompt" not in captured_create[0]
 
 
+def test_make_bare_graph_loads_task_skills(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured_create: list[dict[str, object]] = []
+    monkeypatch.setattr(langgraph_agent, "init_chat_model", lambda *_a, **_k: object())
+    monkeypatch.setattr(langgraph_agent, "create_deep_agent", lambda **k: captured_create.append(k))
+
+    langgraph_agent.make_bare_graph(
+        {
+            "configurable": {
+                "model": "p:m",
+                "cwd": str(tmp_path),
+                "skills_dir": "/app/.agents/skills",
+            }
+        }
+    )
+
+    assert captured_create[0]["skills"] == ["/app/.agents/skills"]
+
+
+@pytest.mark.parametrize("skills_dir", ["relative/skills", "/app/../etc", 3])
+def test_make_bare_graph_rejects_invalid_skills_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, skills_dir: object
+) -> None:
+    monkeypatch.setattr(langgraph_agent, "init_chat_model", lambda *_a, **_k: object())
+    monkeypatch.setattr(langgraph_agent, "create_deep_agent", lambda **_k: object())
+
+    with pytest.raises(ValueError, match="skills_dir"):
+        langgraph_agent.make_bare_graph(
+            {"configurable": {"model": "p:m", "cwd": str(tmp_path), "skills_dir": skills_dir}}
+        )
+
+
+def test_deepagents_langgraph_forwards_task_skills_dir(tmp_path: Path) -> None:
+    project = Path(langgraph_agent.__file__).parent
+    agent = DeepAgentsLangGraph(
+        project_path=project, logs_dir=tmp_path, skills_dir="/app/.agents/skills"
+    )
+    plain = DeepAgentsLangGraph(project_path=project, logs_dir=tmp_path)
+
+    assert agent.configurable["skills_dir"] == "/app/.agents/skills"
+    assert "skills_dir" not in plain.configurable
+
+
 def test_make_tau3_graph_does_not_inject_system_prompt(monkeypatch):
     captured_create: list[dict[str, object]] = []
 
-    class FakeMCPClient:
+    class FakeMCPAdapter:
         def __init__(self, connections: object) -> None:
             self._connections = connections
 
-        async def get_tools(self) -> list[str]:
+        async def list_tools(self) -> list[str]:
             return ["start_conversation", "send_message_to_user", "end_conversation"]
 
     def fake_init_chat_model(_model: str, **_kwargs: object) -> object:
@@ -764,7 +810,7 @@ def test_make_tau3_graph_does_not_inject_system_prompt(monkeypatch):
         return "graph"
 
     monkeypatch.setattr(langgraph_agent, "init_chat_model", fake_init_chat_model)
-    monkeypatch.setattr(langgraph_agent, "MultiServerMCPClient", FakeMCPClient)
+    monkeypatch.setattr(langgraph_agent, "MCPAdapter", FakeMCPAdapter)
     monkeypatch.setattr(langgraph_agent, "create_deep_agent", fake_create_deep_agent)
 
     result = asyncio.run(
@@ -799,6 +845,38 @@ def test_make_tau3_graph_does_not_inject_system_prompt(monkeypatch):
     ]
 
 
+async def test_tau3_tools_remain_callable_after_discovery(monkeypatch):
+    server = FastMCP("tau3-runtime")
+
+    @server.tool()
+    def send_message_to_user(message: str) -> str:
+        return message
+
+    def adapter(target):
+        assert target == {
+            "mcpServers": {"tau3-runtime": {"transport": "http", "url": "http://runtime/mcp"}}
+        }
+        return MCPAdapter(server)
+
+    monkeypatch.setattr(langgraph_agent, "MCPAdapter", adapter)
+    monkeypatch.setattr(langgraph_agent, "_build_model", lambda _: "model")
+    monkeypatch.setattr(langgraph_agent, "create_deep_agent", lambda **kwargs: kwargs["tools"])
+    tools = await langgraph_agent.make_tau3_graph(
+        {
+            "configurable": {
+                "mcp_servers": [
+                    {"name": "tau3-runtime", "transport": "http", "url": "http://runtime/mcp"}
+                ]
+            }
+        }
+    )
+    assert isinstance(tools, list)
+    assert isinstance(tools[0], BaseTool)
+    assert tools[0].name == "send_message_to_user"
+    result = await tools[0].ainvoke({"message": "hello"})
+    assert "hello" in str(result)
+
+
 def test_mcp_connections_maps_streamable_http_server() -> None:
     connections = langgraph_agent._mcp_connections(
         {
@@ -816,7 +894,7 @@ def test_mcp_connections_maps_streamable_http_server() -> None:
 
     assert connections == {
         "tau3-runtime": {
-            "transport": "streamable_http",
+            "transport": "http",
             "url": "http://tau3-runtime:8000/mcp",
         }
     }

@@ -476,7 +476,10 @@ class TestGitLogGeneration:
         )
 
         assert "<summary>Git log since example==1.0.0</summary>" in details
-        assert "newest first" in details
+        assert (
+            "The most recent commit is at the top; older commits follow below."
+            in details
+        )
         assert details.index(commits["hotfix"][:7]) < details.index(
             commits["feature"][:7]
         )
@@ -1705,8 +1708,12 @@ class TestCollectContributors:
         )
         assert community == []
 
+    # Both spellings: PRs merged before the label-taxonomy migration carry the
+    # retired `internal`, and release notes walk historical merged PRs, so
+    # losing either one republishes past maintainers as community contributors.
+    @pytest.mark.parametrize("label", ["org:internal", "internal"])
     def test_internal_label_routes_to_maintainers(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str
     ) -> None:
         head = self._repo(tmp_path)
         community, internal, _ = self._run(
@@ -1715,7 +1722,7 @@ class TestCollectContributors:
             {
                 "author": {"login": "maint", "is_bot": False},
                 "body": "Twitter: @maint",
-                "labels": [{"name": "internal"}],
+                "labels": [{"name": label}],
             },
             monkeypatch,
         )
@@ -1756,7 +1763,7 @@ class TestCollectContributors:
             "2": {
                 "author": {"login": "dual", "is_bot": False},
                 "body": "",
-                "labels": [{"name": "internal"}],
+                "labels": [{"name": "org:internal"}],
             },
         }
         calls = {"n": 0}
@@ -2151,7 +2158,7 @@ class TestIssueReporters:
             self._payload(
                 [{"number": 101}],
                 author={"login": "renovate[bot]", "is_bot": True},
-                labels=[{"name": "internal"}],
+                labels=[{"name": "org:internal"}],
             ),
             {101: "carol"},
             monkeypatch,
@@ -2361,7 +2368,7 @@ class TestIssueReporters:
             "2": self._payload(
                 [],
                 author={"login": "carol", "is_bot": False},
-                labels=[{"name": "internal"}],
+                labels=[{"name": "org:internal"}],
             ),
         }
         prs = iter(["1", "2"])
@@ -3321,15 +3328,19 @@ class TestBuildReleaseNotes:
         assert "Released by:" not in body
         assert any("Offline mode" in w for w in warnings)
 
-    def test_offline_with_changelog(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("package_path", ["libs/deepagents", "libs/partners/modal"])
+    def test_offline_with_changelog(self, tmp_path: Path, package_path: str) -> None:
         _init_repo(tmp_path)
         _commit(
-            tmp_path, PACKAGE_PATH / "module.py", "BASE = 1\n", "feat(example): base"
+            tmp_path,
+            Path(package_path) / "module.py",
+            "BASE = 1\n",
+            "feat(example): base",
         )
         _git(tmp_path, "tag", "example==1.0.0")
         _commit(
             tmp_path,
-            PACKAGE_PATH / "CHANGELOG.md",
+            Path(package_path) / "CHANGELOG.md",
             "## 1.0.1\n\n### Bug Fixes\n\n* fix something\n",
             "release(example): 1.0.1",
         )
@@ -3342,10 +3353,18 @@ class TestBuildReleaseNotes:
             release_sha=head,
             repository=REPOSITORY,
             offline=True,
-            working_dir=str(PACKAGE_PATH),
+            working_dir=package_path,
         )
         assert "### Bug Fixes" in body
         assert "* fix something" in body
+        link = (
+            f"[Full changelog](https://github.com/{REPOSITORY}/blob/"
+            f"{head}/{package_path}/CHANGELOG.md)"
+        )
+        assert link in body
+        assert (
+            body.index("* fix something") < body.index(link) < body.index("<details>")
+        )
         assert "<details>" in body
 
     def test_offline_prerelease(self, tmp_path: Path) -> None:
@@ -3367,6 +3386,10 @@ class TestBuildReleaseNotes:
         )
         assert "> [!WARNING]" in body
         assert "pip install example==1.1.0a1" in body
+        assert (
+            f"[Full changelog](https://github.com/{REPOSITORY}/blob/"
+            f"{head}/{PACKAGE_PATH}/CHANGELOG.md)"
+        ) in body
 
     def test_is_prerelease_override_forces_banner(self, tmp_path: Path) -> None:
         """The caller's flag wins over version sniffing.

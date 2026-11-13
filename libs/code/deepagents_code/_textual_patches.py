@@ -39,8 +39,9 @@ upstream.
 
 3. Double-click word selection. Stock Textual selects the entire widget on
     a click chain; these patches narrow a double-click (and double-click
-    drag) to word boundaries. No upstream issue tracks this yet, so it has
-    no removal criterion — it stays until Textual grows native word select.
+    drag) to word boundaries. Holding the third press selects whole blocks
+    while dragging across widgets. No upstream issue tracks this yet, so it
+    stays until Textual grows native word and block selection.
 
 4. Shift-click selection extension. Stock Textual replaces an existing text
     selection on every mouse press, so Shift+click cannot move the active end
@@ -76,6 +77,13 @@ upstream.
     `diff.clamp_selection`. No upstream issue tracks per-widget selection
     masking; it stays until Textual grows one.
 
+7. ASCII border rendering. Textual border styles are global character tables,
+    while dcode's charset preference is process-wide. In ASCII mode this patch
+    makes every border style render with Textual's `ascii` characters, including
+    third-party and dynamically mounted widgets, without replacing edge styles
+    or their resolved colors. It stays until Textual supports an application-wide
+    border character policy.
+
 Imported for side effect from `app.py` before any `App()` is created.
 
 Not every Textual-internals workaround lives here: subclasses that shadow a
@@ -109,10 +117,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+try:
+    from textual import _border  # noqa: PLC2701
+
+    from deepagents_code.config import is_ascii_mode
+except (ImportError, AttributeError) as exc:  # pragma: no cover - defensive
+    logger.warning("Textual ASCII border patch skipped: %s", exc)
+else:
+    if is_ascii_mode():
+        ascii_border = _border.BORDER_CHARS["ascii"]
+        for edge_type in _border.BORDER_CHARS:
+            if edge_type not in {*_border.INVISIBLE_EDGE_TYPES, "blank"}:
+                _border.BORDER_CHARS[edge_type] = ascii_border
+        _border.get_box.cache_clear()
+
 _ESC_PREFIX_LEN = 2
 _DOUBLE_CLICK_CHAIN = 2
 _TRIPLE_CLICK_CHAIN = 3
 _DEEPAGENTS_WORD_SELECT_ACTIVE = "_deepagents_word_select_active"
+_DEEPAGENTS_BLOCK_SELECT_ACTIVE = "_deepagents_block_select_active"
 
 try:
     from textual import events
@@ -270,6 +293,11 @@ else:
 
 
 def _rendered_text(widget: Widget) -> str | None:
+    # A widget that renders a custom visual (such as `FinalMarkdown`) can
+    # publish the text its selection offsets index into.
+    selectable = getattr(widget, "selectable_text", None)
+    if isinstance(selectable, str):
+        return selectable
     visual = widget._render()  # match Textual's get_selection path
     if isinstance(visual, (Content, Text)):
         return str(visual)
@@ -396,11 +424,10 @@ else:
 
     def _forward_event_with_word_select(self: Screen, event: Event) -> None:
         if isinstance(event, _events.MouseDown):
-            setattr(
-                self,
-                _DEEPAGENTS_WORD_SELECT_ACTIVE,
-                _is_word_select_start(self, event),
-            )
+            chained = _is_word_select_start(self, event)
+            block_select = chained and self.app._chained_clicks == _DOUBLE_CLICK_CHAIN
+            setattr(self, _DEEPAGENTS_BLOCK_SELECT_ACTIVE, block_select)
+            setattr(self, _DEEPAGENTS_WORD_SELECT_ACTIVE, chained and not block_select)
         try:
             _original_forward_event(self, event)
         finally:
@@ -417,6 +444,12 @@ else:
         # without forcing a same-day patch update.
         if isawaitable(result):
             await result
+        if getattr(self, _DEEPAGENTS_BLOCK_SELECT_ACTIVE, False) and select_state:
+            if select_state.end is None:
+                widget = select_state.start.content_widget
+                if widget is not None:
+                    self.selections = {widget: Selection(None, None)}
+            return
         if not getattr(self, _DEEPAGENTS_WORD_SELECT_ACTIVE, False):
             return
 
@@ -619,8 +652,13 @@ else:
         # Textual stores the new dict before invoking this watcher. Clamp that
         # object synchronously before returning the original watcher's awaitable;
         # assigning `self.selections` here would schedule this watcher again.
+        block_select = getattr(self, _DEEPAGENTS_BLOCK_SELECT_ACTIVE, False)
         for widget, selection in list(selections.items()):
-            clamped = clamp_selection(widget, selection)
+            # Expand before clamping: a partial endpoint at the first source
+            # column would otherwise be dropped as a gutter-only selection.
+            clamped = clamp_selection(
+                widget, Selection(None, None) if block_select else selection
+            )
             if clamped is None:
                 del selections[widget]
             elif clamped != selection:

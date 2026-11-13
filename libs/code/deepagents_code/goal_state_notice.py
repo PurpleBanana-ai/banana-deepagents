@@ -62,6 +62,8 @@ with bounded recovery guidance. Version 5 counts HTML-escaped embedded text in
 that budget, so version 4 notices with escape-heavy text are superseded.
 """
 _MALFORMED_EVENT_LOG_LIMIT: Final = 200
+PINNED_SKILL_MESSAGE_SOURCE: Final = "pinned_skill"
+"""`lc_source` the SDK sets on the message carrying pinned skill instructions."""
 _GOAL_MESSAGE_SCHEMA_KEY: Final = "goal_message_schema_version"
 _GOAL_MESSAGE_KIND_KEY: Final = "goal_message_kind"
 _GOAL_INTERNAL_SOURCES = frozenset(
@@ -243,6 +245,18 @@ def is_internal_message(message: object) -> bool:
     return message_text(message).startswith(SYSTEM_MESSAGE_PREFIX)
 
 
+def is_pinned_skill_message(message: object) -> bool:
+    """Return whether a message carries SDK-pinned skill instructions.
+
+    The SDK appends this message after the user prompt that requested the pin,
+    so lookups for the latest user turn must skip it.
+    """
+    return (
+        is_human_message(message)
+        and message_source(message) == PINNED_SKILL_MESSAGE_SOURCE
+    )
+
+
 def _goal_message_metadata(
     source: Literal["goal_control", "goal_state"],
     kind: Literal["continuation", "state_notice"],
@@ -336,6 +350,51 @@ def build_goal_continuation(
             goal_state_persisted=persisted,
         ),
     )
+
+
+def anchor_summarization_event[EventT](
+    event: EventT, messages: Sequence[object]
+) -> EventT:
+    """Return `event` with `cutoff_index` moved to where `cutoff_message_id` now sits.
+
+    Removing or re-adding messages before the cutoff shifts the stored index but
+    not the id. Rewriting the index here lets every index-based reader, including
+    SDK releases that predate `cutoff_message_id`, agree on the same cutoff.
+
+    Args:
+        event: A `_summarization_event` mapping as persisted in state, or `None`.
+        messages: Full persisted message list, as objects or serialized dicts.
+
+    Returns:
+        An anchored copy of `event`, or `event` unchanged when it has no
+            resolvable id.
+    """
+    if not isinstance(event, Mapping):
+        return event
+    cutoff_id = event.get("cutoff_message_id")
+    stored = event.get("cutoff_index")
+    if not cutoff_id or not isinstance(stored, int) or isinstance(stored, bool):
+        return event
+    index = next(
+        (
+            i
+            for i, message in enumerate(messages)
+            if (
+                message.get("id")
+                if isinstance(message, Mapping)
+                else getattr(message, "id", None)
+            )
+            == cutoff_id
+        ),
+        None,
+    )
+    if index is None or index == stored:
+        return event
+    anchored = {**event, "cutoff_index": index}
+    created_at = event.get("created_at_index")
+    if isinstance(created_at, int) and not isinstance(created_at, bool):
+        anchored["created_at_index"] = created_at + index - stored
+    return cast("EventT", anchored)
 
 
 def validated_summarization_cutoff(

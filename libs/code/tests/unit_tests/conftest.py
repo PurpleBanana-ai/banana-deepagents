@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import os
 import tempfile
+import zlib
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import pytest
@@ -21,7 +22,10 @@ os.environ["DEEPAGENTS_HOME"] = _TEST_PROFILE_HOME.name
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
     from pathlib import Path
+    from unittest.mock import MagicMock
 
+    from textual.css.model import RuleSet
+    from textual.css.types import CSSLocation
     from textual.pilot import Pilot
     from textual.screen import Screen
 
@@ -56,13 +60,49 @@ class WaitForModal(Protocol):
 _UPDATE_CHECK_SELF_MANAGED_MARK = "self_managed_update_check"
 
 
+@pytest.fixture
+def btw_app(monkeypatch: pytest.MonkeyPatch) -> tuple[DeepAgentsApp, MagicMock]:
+    """Build an app with an existing conversation and an isolated side-answer client."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from deepagents_code.app import DeepAgentsApp
+    from deepagents_code.client.remote_client import RemoteAgent
+
+    app = DeepAgentsApp(agent=MagicMock(), thread_id="btw-test")
+    monkeypatch.setattr(app, "_post_paint_init", AsyncMock())
+    monkeypatch.setattr(
+        app,
+        "_get_thread_state_values",
+        AsyncMock(return_value={"messages": [{"type": "human", "content": "main"}]}),
+    )
+    remote = MagicMock(spec=RemoteAgent)
+    remote.abtw.return_value = "Side answer"
+    remote.get_cached_session_cost.return_value = None
+    monkeypatch.setattr(app, "_remote_agent", lambda: remote)
+    return app, remote
+
+
+@pytest.fixture
+def posix_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Build and run uv commands the way dcode does on POSIX hosts.
+
+    On Windows, dcode double-quotes uv arguments for cmd.exe and defers every
+    install to the user's shell. Tests that assert the `shlex.quote`-d command
+    or drive an install through the subprocess pin the host here, so they pass
+    on Windows too.
+    """
+    from deepagents_code import update_check
+
+    monkeypatch.setattr(update_check, "_is_windows", lambda: False)
+
+
 def _self_manages_update_check(request: pytest.FixtureRequest) -> bool:
     """Return whether the test owns app-startup update-check setup."""
     return request.node.get_closest_marker(_UPDATE_CHECK_SELF_MANAGED_MARK) is not None
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _warm_model_caches() -> Generator[None, None, None]:
+def _warm_model_caches() -> Generator[None]:
     """Pre-populate model-config caches once per xdist worker.
 
     Tests like the model-selector UI tests call `get_available_models()` and
@@ -97,8 +137,42 @@ def _warm_model_caches() -> Generator[None, None, None]:
             os.environ[discovery_var] = original
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _share_css_parse_cache() -> Generator[None]:
+    """Share parsed Textual CSS across every `App` a worker boots.
+
+    Textual caches parsed rules per `Stylesheet`, so each `run_test()` re-parses
+    the app's CSS from scratch; across ~1,600 app boots that was ~18% of suite
+    wall time. Keying on the stylesheet variables keeps theme changes correct.
+    """
+    from textual.css.stylesheet import Stylesheet
+
+    original = Stylesheet._parse_rules
+    cache: dict[tuple[object, ...], list[RuleSet]] = {}
+
+    def _parse_rules(
+        self: Stylesheet,
+        css: str,
+        read_from: CSSLocation,
+        is_default_rules: bool = False,
+        tie_breaker: int = 0,
+        scope: str = "",
+    ) -> list[RuleSet]:
+        variables = tuple(sorted(self._variables.items()))
+        key = (css, read_from, is_default_rules, tie_breaker, scope, variables)
+        if key not in cache:
+            cache[key] = original(
+                self, css, read_from, is_default_rules, tie_breaker, scope
+            )
+        return cache[key]
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(Stylesheet, "_parse_rules", _parse_rules)
+        yield
+
+
 @pytest.fixture(autouse=True)
-def _restore_os_environ() -> Generator[None, None, None]:
+def _restore_os_environ() -> Generator[None]:
     """Snapshot and restore `os.environ` around every test.
 
     Production code under test (`_ensure_bootstrap`, `_load_dotenv`,
@@ -126,6 +200,36 @@ def _restore_os_environ() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
+def _restore_dotenv_loader_state() -> Generator[None]:
+    """Snapshot and restore the dotenv loader's module-level maps.
+
+    `_load_dotenv` records every value it injects in two module dicts
+    (`_dotenv_loaded_values` and its `_dotenv_provenance` sibling) so a later
+    reload can strip them and `dcode config` can name the file behind an
+    `env (...)` source. Tests that call the loader leave entries behind, and the
+    hand-rolled `try/finally ... _dotenv_loaded_values.clear()` idiom several of
+    them use clears only the first map, leaking `tmp_path` paths that no longer
+    exist into later tests. Restoring both here removes the need for callers to
+    know how many maps the loader keeps.
+
+    Reads the module attributes on teardown rather than holding the dicts, so a
+    test that swaps one out with `monkeypatch.setattr` (whose teardown runs
+    first) still gets the real map restored.
+    """
+    import deepagents_code.config as config_mod
+
+    loaded = dict(config_mod._dotenv_loaded_values)
+    provenance = dict(config_mod._dotenv_provenance)
+    try:
+        yield
+    finally:
+        config_mod._dotenv_loaded_values.clear()
+        config_mod._dotenv_loaded_values.update(loaded)
+        config_mod._dotenv_provenance.clear()
+        config_mod._dotenv_provenance.update(provenance)
+
+
+@pytest.fixture(autouse=True)
 def _clear_langsmith_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent LangSmith env vars loaded from .env from leaking into tests.
 
@@ -139,7 +243,35 @@ def _clear_langsmith_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     Each test that *needs* LangSmith variables should set them explicitly via
     `monkeypatch.setenv` or `patch.dict("os.environ", ...)`.
+
+    The launch snapshot is reset to "all unset" too. Pytest collection can
+    bootstrap `credentials` before this fixture runs, which captures the
+    developer's shell LangSmith exports. A reload then restores those exports
+    over the values a test sets, so a test can pass in CI and fail locally.
+
+    The user snapshot gets the same reset. Before bootstrap runs it is empty,
+    which the server-launch encoder rejects, so tests that spawn the server
+    would otherwise depend on whether an earlier test bootstrapped config.
+
+    The deferred-redaction flags are reset as well. A test that runs `cli_main`
+    down the TUI path sets them, and a later `create_model` would then install
+    the redacting client under that test's patched config.
     """
+    import deepagents_code.config as config_mod
+
+    monkeypatch.setattr(config_mod, "_reconciled_tracing_values", {})
+    monkeypatch.setattr(config_mod._bootstrap_state, "defer_redaction", False)
+    monkeypatch.setattr(config_mod._bootstrap_state, "redaction_pending", False)
+    monkeypatch.setattr(
+        config_mod._bootstrap_state,
+        "launch_langsmith_env",
+        config_mod._langsmith_selectors_from({}),
+    )
+    monkeypatch.setattr(
+        config_mod._bootstrap_state,
+        "user_langsmith_env",
+        config_mod._langsmith_selectors_from({}),
+    )
     for key in (
         "LANGSMITH_API_KEY",
         "LANGCHAIN_API_KEY",
@@ -170,6 +302,19 @@ def _disable_langsmith_batching(monkeypatch: pytest.MonkeyPatch) -> None:
         original_init(self, *args, **kwargs)
 
     monkeypatch.setattr(Client, "__init__", _init)
+
+
+@pytest.fixture(autouse=True)
+def _reset_langsmith_runtime_overrides() -> Iterator[None]:
+    """Remove any process-global LangSmith runtime override a test installed.
+
+    Server-graph startup installs one (see `deepagents_code._langsmith_runtime`).
+    Without a reset it leaks into every later test in the worker.
+    """
+    yield
+    from langsmith import set_runtime_overrides
+
+    set_runtime_overrides()
 
 
 @pytest.fixture(autouse=True)
@@ -303,7 +448,7 @@ def _clear_splash_tips_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _pin_invoked_name(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+def _pin_invoked_name(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
     """Pin the launch command name echoed by resume hints.
 
     `invoked_name()` derives from `sys.argv[0]`, which under test is the runner
@@ -430,6 +575,21 @@ def _disable_app_startup_update_checks(
 
 
 @pytest.fixture(autouse=True)
+def _disable_server_prespawn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep `run_textual_cli_async` tests from spawning a real server.
+
+    Those tests stub `run_textual_app`, but the prespawn runs before it and
+    would launch a `langgraph dev` subprocess. Tests that cover the prespawn
+    patch it back themselves.
+    """
+
+    async def _no_prespawn(*_: object, **__: object) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr("deepagents_code.main._prespawn_server", _no_prespawn)
+
+
+@pytest.fixture(autouse=True)
 def _skip_managed_tool_downloads(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep app startup from downloading the managed `rg` binary.
 
@@ -488,6 +648,29 @@ def _disable_terminal_escape(monkeypatch: pytest.MonkeyPatch) -> None:
     this var in its own fixture so its assertions still exercise the real path.
     """
     monkeypatch.setenv("DEEPAGENTS_CODE_NO_TERMINAL_ESCAPE", "1")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_clipboard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep clipboard backends in memory instead of touching the host or terminal."""
+    import pyperclip
+    from textual.app import App
+
+    from deepagents_code import clipboard
+
+    contents = ""
+
+    def copy(text: str) -> None:
+        nonlocal contents
+        contents = text
+
+    def copy_local(app: App, text: str) -> None:
+        app._clipboard = text
+
+    monkeypatch.setattr(pyperclip, "copy", copy)
+    monkeypatch.setattr(pyperclip, "paste", lambda: contents)
+    monkeypatch.setattr(App, "copy_to_clipboard", copy_local)
+    monkeypatch.setattr(clipboard, "_copy_osc52", lambda _text: None)
 
 
 @pytest.fixture(autouse=True)
@@ -660,6 +843,28 @@ def _isolate_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_session_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Redirect the session lock `cli_main` takes and release it afterwards.
+
+    Installation-scoped like `UPDATE_LOCK_FILE`, so unpatched it would register
+    tests as sessions of this checkout's real tool environment. Closing the
+    descriptor keeps one test's registration, and its stale lock path, from
+    leaking into the next.
+    """
+    from deepagents_code import _session_lock
+
+    monkeypatch.setattr(
+        _session_lock, "SESSION_LOCK_FILE", tmp_path / ".state" / "sessions.lock"
+    )
+    yield
+    if _session_lock._held_fd is not None:
+        os.close(_session_lock._held_fd)
+        _session_lock._held_fd = None
+
+
+@pytest.fixture(autouse=True)
 def _isolate_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Redirect ChatInput history to a temp file.
 
@@ -686,6 +891,18 @@ def _clear_kitty_kbd_probe_cache() -> None:
     from deepagents_code.terminal_capabilities import supports_kitty_keyboard_protocol
 
     supports_kitty_keyboard_protocol.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_deepagents_version_cache() -> None:
+    """Reset the process-lifetime cache on the SDK version lookup.
+
+    Tests patch `resolve_sdk_version` to drive `_get_deepagents_version`, so a
+    value cached by an earlier test would mask the patch.
+    """
+    from deepagents_code.config import _get_deepagents_version
+
+    _get_deepagents_version.cache_clear()
 
 
 @pytest.fixture
@@ -756,8 +973,29 @@ def wait_for_modal() -> WaitForModal:
     return _wait
 
 
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Keep only this CI shard's tests when `PYTEST_SHARD` is `INDEX/TOTAL`.
+
+    Splitting by a stable hash of the node ID (not by file) spreads the large
+    `test_app.py` module evenly across runners.
+    """
+    shard = os.environ.get("PYTEST_SHARD", "")
+    if not shard or shard == "1/1":
+        return
+    index, total = (int(part) for part in shard.split("/"))
+    selected: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        bucket = zlib.crc32(item.nodeid.encode()) % total
+        (selected if bucket == index - 1 else deselected).append(item)
+    config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
+
+
 @pytest.hookimpl(wrapper=True)
-def pytest_sessionfinish() -> Generator[None, None, None]:
+def pytest_sessionfinish() -> Generator[None]:
     """Close any debug-log file handlers still attached at session end.
 
     Companion to `_close_leaked_debug_handlers`, which is setup-only and so

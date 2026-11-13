@@ -1,12 +1,17 @@
 """Pure plugin manager content builders."""
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from textual.content import Content
 from textual.widgets.option_list import Option
 
 from deepagents_code.config import get_glyphs
-from deepagents_code.tui.modals.plugin_manager.models import _MarketplaceRow, _PluginRow
+
+if TYPE_CHECKING:
+    from deepagents_code.tui.modals.plugin_manager.models import (
+        _MarketplaceRow,
+        _PluginRow,
+    )
 
 
 def _plugin_options(
@@ -27,6 +32,8 @@ def _plugin_options(
 
 def _load_state_label(row: _PluginRow) -> str | None:
     glyphs = get_glyphs()
+    if row.load_state == "needs_repair":
+        return "needs repair"
     if row.load_state == "error":
         return "error"
     if row.load_state == "pending_reload":
@@ -46,8 +53,12 @@ def _plugin_prompt(row: _PluginRow, *, status: str | None) -> Content:
             meta_parts.append(Content.styled(load_label, "bold"))
         elif row.load_state == "error":
             meta_parts.append(Content.styled(load_label, "bold $error"))
+        elif row.load_state == "needs_repair":
+            meta_parts.append(Content.styled(load_label, "bold $warning"))
         else:
             meta_parts.append(Content.styled(load_label, "dim"))
+    if row.available_version:
+        meta_parts.append(Content.styled("update available", "bold $warning"))
     if row.skill_count:
         skill_label = "skill" if row.skill_count == 1 else "skills"
         meta_parts.append(Content.styled(f"{row.skill_count} {skill_label}", "dim"))
@@ -64,7 +75,7 @@ def _plugin_prompt(row: _PluginRow, *, status: str | None) -> Content:
         meta_parts.append(Content.styled(f"{glyphs.checkmark} connected", "dim"))
     if status:
         meta_parts.append(Content.styled(status, "dim"))
-    separator = Content.styled(" · ", "dim")
+    separator = Content.styled(f" {glyphs.separator} ", "dim")
     return Content.assemble(
         row.label,
         separator,
@@ -74,16 +85,41 @@ def _plugin_prompt(row: _PluginRow, *, status: str | None) -> Content:
     )
 
 
-def _install_details_options() -> list[Option]:
+def _install_details_options(
+    *, uninspected: bool = False, inspecting: bool = False
+) -> list[Option]:
+    options = (
+        [
+            Option(
+                "Inspect contents (downloads source)",
+                id="action:inspect",
+            )
+        ]
+        if uninspected and not inspecting
+        else []
+    )
     return [
-        Option("Install", id="action:install"),
+        *options,
+        Option("Install", id="action:install", disabled=inspecting),
         Option("Back to plugin list", id="details-back"),
     ]
 
 
 def _installed_details_options(row: _PluginRow, *, divider_width: int) -> list[Option]:
     glyphs = get_glyphs()
+    repair = (
+        [Option(Content.styled("Reinstall plugin", "bold"), id="action:reinstall")]
+        if row.needs_repair
+        else []
+    )
+    update = (
+        [Option(f"Update to {row.available_version}", id="action:update")]
+        if row.available_version
+        else []
+    )
     return [
+        *repair,
+        *update,
         Option(
             "Disable plugin" if row.enabled else "Enable plugin",
             id="action:toggle-enabled",
@@ -128,12 +164,7 @@ def _will_install_lines(row: _PluginRow) -> list[str]:
             _unsupported_summary(row.unsupported_components),
         ]
     if row.skill_count is None:
-        return [
-            (
-                "Skills, MCP servers, and hooks if present "
-                "(agents/ and commands/ are not loaded)."
-            )
-        ]
+        return ["Contents not inspected. Choose Inspect contents to preview."]
     return [
         "No supported components (skills/MCP/hooks).",
         "agents/ and commands/ are not loaded by deepagents-code.",
@@ -141,6 +172,8 @@ def _will_install_lines(row: _PluginRow) -> list[str]:
 
 
 def _installed_component_lines(row: _PluginRow) -> list[str]:
+    if row.needs_repair:
+        return ["Unavailable until the plugin is reinstalled."]
     lines = _component_summary_lines(row)
     if lines:
         if not row.has_supported_components and row.unsupported_components:
@@ -154,6 +187,18 @@ def _installed_component_lines(row: _PluginRow) -> list[str]:
 
 def _status_lines(row: _PluginRow) -> list[Content]:
     glyphs = get_glyphs()
+    if row.load_state == "needs_repair":
+        return [
+            Content.styled(
+                "Status: Needs repair — installed files are missing, so this "
+                "plugin's tools are unavailable.",
+                "$warning",
+            ),
+            Content.styled(
+                "Reinstall to restore its files, or disable it.",
+                "dim",
+            ),
+        ]
     if row.load_state == "error":
         detail = row.load_error or "Plugin failed to load."
         return [
@@ -168,13 +213,17 @@ def _status_lines(row: _PluginRow) -> list[Content]:
     if row.load_state == "pending_reload":
         if row.enabled:
             return [
-                Content.styled("Status: Installed · pending /reload", "dim"),
+                Content.styled(
+                    f"Status: Installed {glyphs.separator} pending /reload", "dim"
+                ),
                 Content.styled(
                     "Run /reload to load this plugin into the current session.", "dim"
                 ),
             ]
         return [
-            Content.styled("Status: Disabled · pending /reload", "dim"),
+            Content.styled(
+                f"Status: Disabled {glyphs.separator} pending /reload", "dim"
+            ),
             Content.styled(
                 "Run /reload to unload this plugin from the current session.", "dim"
             ),
@@ -190,7 +239,7 @@ def _status_lines(row: _PluginRow) -> list[Content]:
     return lines
 
 
-def _plugin_details_content(row: _PluginRow) -> Content:
+def _plugin_details_content(row: _PluginRow, *, inspecting: bool = False) -> Content:
     _, _, marketplace = row.plugin_id.partition("@")
     parts: list[Content | str] = [
         Content.styled("Plugin details", "bold"),
@@ -206,7 +255,12 @@ def _plugin_details_content(row: _PluginRow) -> Content:
     if row.author:
         parts.extend(["\n\n", Content.styled(f"By: {row.author}", "dim")])
     parts.extend(["\n\n", Content.styled("Will install:", "bold")])
-    for line in _will_install_lines(row):
+    lines = (
+        ["Downloading and inspecting contents..."]
+        if inspecting
+        else _will_install_lines(row)
+    )
+    for line in lines:
         parts.extend(["\n  ", Content.styled(line, "dim")])
     parts.extend(
         [
@@ -228,6 +282,15 @@ def _installed_plugin_details_content(row: _PluginRow) -> Content:
     ]
     if row.version:
         parts.extend(["\n", Content.styled(f"Version: {row.version}", "dim")])
+    if row.available_version:
+        parts.extend(
+            [
+                "\n",
+                Content.styled(
+                    f"Update available: {row.available_version}", "bold $warning"
+                ),
+            ]
+        )
     if row.description:
         parts.extend(["\n\n", row.description])
     if row.author:

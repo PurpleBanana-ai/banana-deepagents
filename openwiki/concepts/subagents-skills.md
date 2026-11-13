@@ -1,18 +1,11 @@
 ---
-type: concept
-title: Subagents & Skills
-description: How the deepagents SDK delegates work to isolated subagents via a task tool and loads reusable, on-demand skills into the system prompt through progressive disclosure.
-tags: [subagents, skills, delegation, middleware, progressive-disclosure, agent-protocol]
-verified:
-  - by: openwiki/0.4.0
-    at: 2026-08-26T21:35:57.774Z
+type: delegation and progressive-disclosure concept
+title: Subagents and Skills
+description: Deep Agents supports synchronous SDK child graphs and remote Agent Protocol tasks, while Talon adapts both to fresh local workers and conversation-owned background jobs. Skills progressively disclose instructions and selected tools; that visibility is distinct from permissions, approvals, and authority.
+tags: [deepagents, subagents, delegation, skills, talon, permissions]
 sources:
   - id: openwiki-source-05106e66a949150d557266a2
     resource: repo://libs/code/deepagents_code/agent.py
-  - id: openwiki-source-7f6b98925b5f1ba065df3a04
-    resource: repo://libs/code/deepagents_code/config.py
-  - id: openwiki-source-d6d6cad076201f4abeec2084
-    resource: repo://libs/code/deepagents_code/subagents.py
   - id: openwiki-source-0fc0e47059e4d07e23e50be2
     resource: repo://libs/deepagents/deepagents/graph.py
   - id: openwiki-source-e51c4102234507d1529a2440
@@ -21,199 +14,163 @@ sources:
     resource: repo://libs/deepagents/deepagents/middleware/skills.py
   - id: openwiki-source-114a1c7a58992fa867a94ef0
     resource: repo://libs/deepagents/deepagents/middleware/subagents.py
-generated: {by: "openwiki/0.4.0", at: "2026-08-26T21:35:57.774Z"}
+  - id: openwiki-source-454da083c2cc29febd156c7e
+    resource: repo://libs/deepagents/tests/unit_tests/middleware/test_subagent_middleware_init.py
+  - id: openwiki-source-917b61d56e652536ba962f3a
+    resource: repo://libs/deepagents/tests/unit_tests/test_subagent_refusal.py
+  - id: openwiki-source-ca8183c87e6002c442ee2d62
+    resource: repo://libs/deepagents/tests/unit_tests/test_subagents.py
+  - id: openwiki-source-cd45145a8c3a51b52eab3c2b
+    resource: repo://libs/talon/deepagents_talon/background.py
+  - id: openwiki-source-2d1f686d24d8182f60108ae7
+    resource: repo://libs/talon/deepagents_talon/subagents.py
+  - id: openwiki-source-82dab853903c3a574614fd1e
+    resource: repo://libs/talon/tests/unit_tests/test_background.py
+  - id: openwiki-source-a4cc4beb110c42a169caf195
+    resource: repo://libs/talon/tests/unit_tests/test_research_subagents.py
+verified:
+  - by: openwiki/0.4.2
+    at: 2026-11-13T08:03:55.116Z
+generated: { by: "openwiki/0.4.2", at: "2026-11-13T08:03:55.116Z" }
 ---
 
-# Subagents & Skills
+# Subagents and Skills
 
-Two complementary extension mechanisms let a deepagents agent scale beyond a
-single model loop: **subagents** delegate a bounded task to a separate agent
-with its own isolated context window, and **skills** inject reusable,
-domain-specific behaviors into the system prompt on demand. Both are delivered
-as middleware and plug into the [middleware stack](/openwiki/architecture/middleware-stack.md);
-their wiring is assembled by the graph builder described in
-[config layering](/openwiki/concepts/config-layering.md), and they build on the
-backend-portable filesystem described in
-[tools & filesystem](/openwiki/concepts/tools-filesystem.md).
+This page distinguishes four execution models that are easy to conflate:
 
-## Subagents
+| Model | Configuration owner | Invocation and result lifecycle | Context and policy boundary |
+| --- | --- | --- | --- |
+| SDK local `task` | A declarative `SubAgent` or caller-supplied `CompiledSubAgent` | Blocks for a child graph and returns a correlated tool result | SDK builds declarative children; compiled runnable remains caller-owned |
+| SDK remote async | `AsyncSubAgent` identifying an Agent Protocol graph | `start_async_task` returns a persistent remote task ID; async tools monitor, update, cancel, and list it | Remote deployment owns its graph, tools, credentials, persistence, and approval |
+| Deep Agents Code (dcode) local child | dcode assembles declarative SDK specs and child middleware | Still the SDK's synchronous `task` behavior | dcode must propagate its local safety configuration into children |
+| Talon local or remote delegation | Talon prepares fresh local roles or remote specs, then wraps task tools | Chat turns detach work into an in-memory job; scheduled turns wait inline | Talon makes fresh local graphs with explicit attachments and controls delivery to the owning conversation |
 
-### The `task` tool and delegation
+A skill is not a subagent. It is a progressive-disclosure source of instructions, and optionally a way to make a deferred tool visible to the model. Skill visibility does **not** itself grant filesystem access, approve an operation, authenticate to a service, or authorize an action.
 
-`SubAgentMiddleware` adds a single `task` tool to the main agent. The model
-calls it with a free-form `description` and a `subagent_type` naming which
-subagent to run. Each subagent runs to completion and returns exactly one final
-report; the tool description instructs the model to put full detail in the
-prompt, that each invocation is stateless, and that independent subagents may be
-launched concurrently in one message with multiple tool calls.
+## Delegation paths and result lifecycles
 
-Delegation is valuable because a subagent can perform a long, multi-step, or
-context-heavy task and then hand back a clean, concise result rather than
-polluting the main agent's context with intermediate work. Only the subagent's
-final assistant message (or its structured response) is forwarded to the parent.
+`create_deep_agent` partitions `subagents=` by shape. A declarative `SubAgent` and a `CompiledSubAgent` are attached to `SubAgentMiddleware` as the synchronous `task` tool. An `AsyncSubAgent` is attached to `AsyncSubAgentMiddleware` instead. The SDK can add a `general-purpose` synchronous child when no child of that name is supplied and the harness profile enables it.
+
+```mermaid
+flowchart TD
+    Parent["Parent agent"] --> Choice{"Delegation specification"}
+    Choice --> Local["SubAgent or CompiledSubAgent"]
+    Local --> Task["SDK task tool"]
+    Task --> Child["Local child runnable"]
+    Child --> LocalResult["Correlated tool result"]
+    Choice --> Remote["AsyncSubAgent with graph_id"]
+    Remote --> AsyncTools["Async task tools"]
+    AsyncTools --> Server["Remote Agent Protocol graph"]
+    Server --> Record["Task record and task ID"]
+    Parent --> Talon["Talon task wrapper"]
+    Talon --> Turn{"Turn type"}
+    Turn --> Chat["Chat background job"]
+    Turn --> Schedule["Scheduled inline result"]
+```
+
+*The SDK local and remote paths have different result ownership; Talon changes when the parent can receive either result.*
+
+### SDK local `task`: a child graph, not a background task
+
+`task` takes a description and a declared subagent type. The middleware requires a tool-call ID to correlate its result; an unknown type is returned as a tool error. Declarative specs are compiled by the SDK, while `CompiledSubAgent` runnables are used as supplied.
+
+By default, a local child receives a fresh `HumanMessage` containing the delegated description rather than the parent transcript. It can receive public custom state, but the boundary excludes messages, todos, structured output, skill metadata and pins, disclosed skill tools, rubric data, and middleware-private fields. On return, it excludes the same boundary-owned fields and unchanged inputs, avoiding duplicate additive updates and reducer conflicts when sibling tasks run in parallel.
+
+The child response is serialized into the parent call's correlated `ToolMessage`: a `structured_response` is JSON-serialized; otherwise the middleware selects the last non-empty AI text. A refusal content block or a `ModelRefusalError`/structured-output refusal becomes a bounded explanatory task result (including available category or explanation and a retry hint), rather than terminating the parent delegation. This behavior applies to synchronous `task`/`atask` invocation; it does not mean the parent model itself suppresses refusals by default.
+
+Experimental `mode="fork"` reconstructs the effective parent history after applying its summarization event, removes the in-flight spawning tool call, and appends a preamble plus the delegated description. A declarative fork retains its parent's system-prompt prefix and prompt-producing middleware (and carries non-excluded parent state, including private channels); its own `system_prompt` is delivered with the task to preserve the prefix cache. A compiled fork is opaque, so it receives only non-private, non-excluded state. Forks cannot define independent `skills`; they inherit the parent skill sources. The fork still has a `task` tool so its tool shape matches the parent, but a private fork marker makes nested `task` or `atask` return a refusal instructing it to complete the work itself. Forking shares context at invocation time; it is not recursive delegation.
+
+When a local child saves checkpoints, the returned `ToolMessage.artifact` carries its actual `checkpoint_ns`, allowing a client to inspect that child history under the parent thread. Compiled graphs are streamed to learn the namespace, including the namespace of a retry that actually completed; nested child namespaces retain their parent segments. There is no artifact when a graph configured with `checkpointer=False` saved nothing. A non-graph runnable uses the task call's fallback namespace. The known exception is a runnable wrapped with `.with_retry()`: it must be invoked for retry behavior, so the recorded fallback can name the failed run while the successful retry saved under a suffixed namespace.
+
+The SDK's policy inheritance is specific to declarative children: their filesystem permissions inherit the parent rules unless they specify replacement rules, and their `interrupt_on` configuration inherits the top-level configuration unless overridden. Compiled runnables and remote async graphs do not inherit those settings; callers configure them at their own boundary.
+
+### SDK remote async: durable remote work
+
+An `AsyncSubAgent` names a remote graph with `name`, `description`, and `graph_id`, with optional URL, headers, notification, webhook, update strategy, and experimental fork mode. `start_async_task` creates remote work and returns promptly with a task ID. `async_tasks` lives in parent state, so task records survive compaction and can be listed, checked, updated, or cancelled by the async task tools.
+
+The async middleware checks unfinished remote tasks in asynchronous runs and converts changed outcomes into messages for the parent. A remote run that is waiting for human input is `waiting`, not a successful result. Remote execution remains a deployment boundary: it does not inherit the local parent graph's filesystem, credentials, prompt, approval handlers, or persistence.
+
+## Dcode-defined local children
+
+Deep Agents Code is an assembly layer over SDK delegation, not a third SDK transport. `create_cli_agent` supplies dcode's own local policy and passes assembled subagent specifications to `create_deep_agent`; remote `async_subagents` remain remote specifications.
+
+A consequential example is filesystem restriction. With an explicit `--allow-fs-tools` list, dcode installs corresponding `FilesystemMiddleware` on each synchronous declarative child—including its general-purpose child—so `task` cannot bypass the parent allowlist. It rejects compiled children in that configuration because their already-built runnable cannot receive the required middleware. Remote async children are unaffected because they execute against their own backend.
+
+Dcode orders skill sources from built-in and plugin sources through user and project directories, with later sources taking precedence. Plugin discovery errors are logged rather than preventing subsequent local sources from being considered. See [Permissions and HITL](/openwiki/concepts/permissions-hitl.md) for the approval model and [Context management](/openwiki/concepts/context-management.md) for state and compaction context.
+
+## Talon: fresh roles plus background delivery
+
+Talon deliberately does not treat a configured local role as a normal SDK declarative child. `prepare_subagents` rejects fork mode and compiles a local `LocalSubAgent` into a fresh runnable. The fresh graph receives only the task message, its explicit attached tools, a research-oriented system contract, summarization, MCP middleware, and Talon subagent controls. There is no implicit parent history, memory, or skill inheritance.
+
+Talon can attach extra tools for one local task call. The requested names must be unique and present in the current non-delegation tool catalog; the added tools supplement rather than replace the role's configured tools. This is a per-task compilation choice, not a persistent mutation of the role. Talon's `get_agent_tools` inventory reports known tools for fresh roles, but treats compiled and remote roles as opaque.
+
+Talon applies its approval policy while compiling a fresh role: only configured attached tools appear in its `HumanInTheLoopMiddleware`. If policy protection is active, Talon refuses to run a precompiled child because it cannot enforce the policy inside an opaque runnable. A background worker has no operator to resolve a pause, so an interrupt becomes a result saying the protected action did not run; the worker also clears its authorization handler. These are operational safeguards, not evidence that a delegated response has authority to change policy.
 
 ```mermaid
 sequenceDiagram
-    participant Model as Main agent model
-    participant Task as task tool
-    participant Sub as Subagent (own graph + middleware)
-    Model->>Task: task(description, subagent_type)
-    Task->>Task: validate subagent_type, build isolated state
-    Task->>Sub: invoke({messages: [HumanMessage(description)]})
-    Sub-->>Task: result state (messages, structured_response?)
-    Task-->>Model: ToolMessage(final report)
+    participant Main as Talon main turn
+    participant Wrap as BackgroundSubagents
+    participant Worker as Fresh local worker or remote stream
+    participant Jobs as Owner scoped jobs
+    Main->>Wrap: task or start_async_task
+    alt conversational turn
+        Wrap->>Jobs: create owner scoped job
+        Wrap-->>Main: task ID
+        Jobs->>Worker: run with fresh worker thread
+        Worker-->>Jobs: bounded text result
+        Jobs-->>Main: deliver on a later owning turn
+    else scheduled turn
+        Wrap->>Worker: run inline
+        Worker-->>Wrap: bounded text result
+        Wrap-->>Main: same tool call result
+    end
 ```
 
-### Subagent types
+*Talon detaches conversational delegation for later owner-scoped delivery, but scheduled work consumes the result within the same turn.*
 
-The SDK supports several subagent shapes, distinguished structurally when the
-graph builder partitions the caller-supplied `subagents` list:
+### Conversational jobs
 
-- **`GENERAL_PURPOSE_SUBAGENT`** — a built-in `SubAgent` spec (`name:
-  "general-purpose"`) that the graph builder auto-adds unless the harness
-  profile disables it or the caller already supplied a spec with the same name.
-  The builder fills in the parent's model, tools, and default middleware stack.
-- **Declarative `SubAgent`** — a `TypedDict` describing a subagent by `name`,
-  `description`, and `system_prompt`, with optional `tools`, `model`,
-  `middleware`, `interrupt_on`, `skills`, `permissions`, and `response_format`.
-  It is compiled into a runnable via `create_agent`.
-- **`CompiledSubAgent`** — a caller-supplied `runnable` used as-is. Its state
-  schema must include a `messages` key so results can flow back; it does **not**
-  inherit `create_deep_agent(state_schema=...)`.
-- **`AsyncSubAgent` / remote** — a spec identified by `graph_id` that runs as a
-  background task on a remote Agent Protocol server via the LangGraph SDK.
+For ordinary conversational turns, `BackgroundSubagents` intercepts both local `task` and remote `start_async_task`, creates an in-memory job tied to the calling thread ID, and returns a Talon task ID immediately. The worker has a different thread ID, blocks nested delegation, disables approval operation and authorization handlers, and has a one-hour timeout. By default the process retains at most 128 jobs and permits four running workers globally; the runtime can configure the running limit.
 
-Because a `CompiledSubAgent` simply wraps a `runnable`, any LangGraph
-`CompiledStateGraph` (including one produced by LangChain's `create_agent`) can
-be registered as a subagent as long as its state schema exposes `messages`.
+Only the owner can list, inspect, message, cancel, or receive its jobs. Results are plain answer text—reasoning and non-text blocks are excluded—and are capped at 64,000 characters. `message_subagent` queues guidance for the next local worker model step rather than interrupting a running model or tool call; it is unavailable for remote or opaque workers.
 
-### Isolated context and per-subagent middleware
+Completion is separate from delivery. The runtime offers unacknowledged completed results as data to a later main-agent turn and acknowledges them only after that turn completes. If a host discards the completed reply, it can requeue just the result IDs consumed by that reply. Failed delivery attempts are counted; after three failures, the result is marked dropped rather than injected indefinitely.
 
-Each subagent runs in an isolated context window: the `task` tool builds a fresh
-state for the subagent whose messages are just a single `HumanMessage` carrying
-the delegation description, after stripping excluded keys (`messages`, `todos`,
-`structured_response`) and any private middleware state keys from the parent
-state. The parent's callbacks, tags, and `configurable` still reach the subagent
-because LangGraph seeds each run from the ambient parent config and merges it
-per key; the middleware only stamps `ls_agent_type="subagent"` for tracing.
+### Scheduled work stays inline
 
-Subagents carry their own middleware stacks. When compiling a declarative
-`SubAgent`, the graph builder prepends a default stack — `FilesystemMiddleware`,
-summarization, and `PatchToolCallsMiddleware` — before any custom `middleware`
-the spec supplies, appends a `SkillsMiddleware` when the spec declares `skills`,
-and applies the subagent's own harness profile. This means a subagent can have a
-different model, a narrower tool set, its own filesystem permissions, and its
-own skills, independent of the main agent.
+A scheduled turn has no later conversation turn that can consume a detached result. Talon therefore invokes both local `task` and remote work inline, returns the result through the same tool call, and leaves no job record. Inline calls use a separate semaphore (four slots by default) and queue fan-out over that ceiling rather than refuse it. Their default timeout is ten minutes, shorter than the detached-worker timeout; failure and timeout are converted to sanitized error results so a retryable exception does not escape and replay sibling calls.
 
-### Returning results
+## Skills: disclosure is not permission, approval, or authority
 
-When a subagent finishes, the `task` tool inspects the returned state. If
-`structured_response` is non-`None`, it is JSON-serialized (via
-`model_dump_json`, dataclass `asdict`, or `json.dumps`) and used as the
-`ToolMessage` content. Otherwise the tool walks back to the last non-empty
-`AIMessage` text — deliberately skipping a trailing empty `end_turn` message
-some providers emit. Non-excluded, non-private state keys returned by the
-subagent are merged back into the parent state alongside the `ToolMessage`. A
-`CompiledSubAgent` that returns a state without a `messages` key raises a
-`ValueError`.
+`SkillsMiddleware` indexes configured sources before an agent run. The model sees the skill name, description, optional annotations, and path in the system prompt; it must read `SKILL.md` to obtain the full instructions. The index is checkpointed: any list, including an empty list, is reused, while setting `skills_metadata` to `None` requests a reload. Sources are processed in order and later same-named skills replace earlier metadata. Pinning named skills appends their bodies without frontmatter as one-time messages before the next model call; unknown or unreadable names are skipped.
 
-### Structured output
+A skill can declare `metadata.include_tools`. Such tools are deliberately kept out of ordinary middleware tool registration. Reading the skill (or pinning it) allows the middleware to resolve and disclose those tools for that model call, and it records the disclosure needed to dispatch a later tool call. A tool is therefore not callable merely because a skill exists or is listed; a new model request recomputes disclosure from the applicable skill reads.
 
-Declarative subagents accept a `response_format` (a `ResponseFormat` strategy, a
-bare type, or a JSON-schema dict). Callers can also request a per-invocation
-dynamic response format by placing it under the
-`__deepagents_subagent_response_format` config key; this recompiles the raw spec
-for that call. Dynamic response formats are rejected for `CompiledSubAgent`
-entries, whose runnables the caller owns.
+Keep these independent decisions separate when designing or reviewing a system:
 
-## Async (remote) subagents
+1. **Disclosure** — the model has read instructions and, where configured, sees a tool schema. This is what skills control.
+2. **Availability and permissions** — a graph has registered the tool and its backend or filesystem rules allow the particular operation. SDK filesystem permission rules are evaluated by `FilesystemMiddleware`; they are not backend-wide authorization.
+3. **Approval** — a configured `HumanInTheLoopMiddleware` can pause a tool call for a human decision. Disclosure does not approve it, and dcode/Talon may apply child-specific approval boundaries.
+4. **Authority** — credentials, authenticated remote services, and the user or operator's authorization determine what an action may do. Instructions or data returned by a skill or subagent are untrusted input, not permission to alter scope, destinations, policy, or credentials.
 
-`AsyncSubAgentMiddleware` targets long-running or remote work. Instead of
-blocking, `start_async_task` creates a thread and run on a remote Agent
-Protocol server (LangGraph Platform or self-hosted) and returns a `task_id`
-immediately, so the main agent can keep working. The middleware exposes five
-tools: `start_async_task`, `check_async_task`, `update_async_task`,
-`cancel_async_task`, and `list_async_tasks`.
+For isolated SDK declarative children, skills are local: parent skill metadata, pins, and disclosed-tool state are filtered out. Such a child may configure its own skill sources. A fork instead uses parent skill sources to rebuild inherited context and cannot declare a competing skill configuration. Talon's fresh local workers likewise start without implicit parent skills; a caller may explicitly attach `read_file` and include skill instructions in the task.
 
-Tracked tasks are persisted in agent state under `async_tasks` (an
-`AsyncTask`-per-`task_id` dict with its own reducer) so they survive context
-compaction and can be inspected programmatically. Clients are lazily created and
-cached per `(url, headers)`; authentication for managed deployments is resolved
-by the SDK from environment variables, while self-hosted servers can pass custom
-`headers`. Omitting `url` uses in-process ASGI transport, which is only
-reachable through an async parent entrypoint (`ainvoke`) — the synchronous path
-requires a URL.
+## Tests and safe changes
 
-## Skills
+The focused tests make the intended boundaries executable:
 
-### Progressive disclosure
+- `libs/deepagents/tests/unit_tests/test_subagents.py` covers correlated local results, state isolation and parallel updates, fork context, and checkpoint artifacts. In particular, it verifies nested namespaces, retry-aware namespace reporting, `checkpointer=True` and `False`, and the `.with_retry()` namespace limitation.
+- `libs/deepagents/tests/unit_tests/test_subagent_refusal.py` verifies that declarative and compiled local children turn returned or raised model refusals—including structured-output refusals—into a task result, while a main agent still raises by default.
+- `libs/deepagents/tests/unit_tests/middleware/test_subagent_middleware_init.py` verifies the fork's inherited prompt prefix, its task-local instructions, skill prohibition, state distinctions, and recursion refusal.
+- `libs/talon/tests/unit_tests/test_background.py` covers owner isolation, capacity, cancellation, independent worker thread IDs, acknowledgement/requeue/drop delivery semantics, timeout and sanitized error behavior, result text projection, remote streaming, and scheduled inline fan-out.
+- `libs/talon/tests/unit_tests/test_research_subagents.py` covers fresh-context isolation, explicit attachments and per-task selection, no implicit general-purpose role, recursive-delegation denial, approval behavior for fresh versus compiled children, and rejection of Talon fork mode.
 
-`SkillsMiddleware` implements the Agent Skills pattern with **progressive
-disclosure**: the model always sees each skill's `name` and `description` in the
-system prompt, but only reads the full `SKILL.md` (and any supporting files) when
-a task matches. This keeps context small while making a large library of
-behaviors reachable on demand. The injected prompt instructs the model to read
-the listed `SKILL.md` path with `read_file` when a skill applies.
-
-### Skill structure and metadata
-
-Each skill is a directory containing a `SKILL.md` file whose YAML frontmatter is
-parsed into `SkillMetadata`. Required fields are `name` and `description`;
-optional fields include `license`, `compatibility`, `metadata`, and
-`allowed-tools`. Names are validated against the Agent Skills specification
-(lowercase alphanumeric plus single hyphens, ≤64 chars, matching the parent
-directory name); violations log a warning but the skill still loads for
-backwards compatibility. Oversized files, non-UTF8 content, malformed
-frontmatter, and over-limit descriptions/compatibility are handled defensively
-so a bad skill is skipped (with a log warning) rather than crashing prompt
-rendering.
-
-### Sources, layering, and loading
-
-Skills are loaded from one or more **sources**, each either a bare path or a
-`(path, label)` tuple. Sources are loaded in order and later sources override
-earlier ones when names collide (last one wins), enabling layering such as
-base → user → project → team. The middleware uses backend APIs exclusively (no
-direct filesystem access), so it works across StateBackend, FilesystemBackend,
-and remote backends alike. Loading happens once per session in
-`before_agent`/`abefore_agent` and is skipped if `skills_metadata` is already in
-state; results and any recoverable per-source load errors are stored as private
-state attributes that are not propagated to parent agents.
-
-Display labels are derived from the source: an explicit tuple label is used
-verbatim; a bare path capitalizes its leaf, with special cases where a
-`built_in_skills` leaf collapses to `Built-in` and a literal `skills` leaf
-climbs one level (so `~/.claude/skills` renders as `Claude`). The
-`deepagents_code` package ships bundled skills under its `built_in_skills/`
-directory (resolved by `Settings.get_built_in_skills_dir()`), registered as a
-`("...", "Built-in")` source.
-
-### Injecting skills into the prompt
-
-At model-call time the middleware formats the loaded metadata into a skills
-section — locations, the per-skill list (name, description, optional
-license/compatibility annotations, allowed tools, and the `SKILL.md` path to
-read), and any load warnings wrapped as untrusted diagnostics — and appends it
-to the system message. The system-prompt template requires the
-`{skills_locations}`, `{skills_load_warnings}`, and `{skills_list}` slots;
-passing `system_prompt=None` skips prompt injection while still loading skills
-into state.
-
-## Filesystem-defined subagents in the app package
-
-Beyond the SDK's programmatic specs, the `deepagents_code` app loads subagent
-definitions from the filesystem: markdown files at
-`.deepagents/agents/{name}/AGENTS.md` with YAML frontmatter. Unlike the Agent
-Skills spec (which requires `name`), the subagent loader treats `name` as
-optional and falls back to the folder name; the markdown body becomes the
-`system_prompt`. Stray files, missing `AGENTS.md`, invalid frontmatter, and name
-collisions are logged and skipped rather than failing the load.
+When changing delegation, preserve which component owns execution and policy: SDK declarative children are compiled locally; compiled runnables retain caller-owned internals; remote async work belongs to its deployment; and Talon jobs are in-memory and owner-scoped. Preserve the `ToolMessage` serialization and checkpoint artifact contract for local children, especially when changing retry or streaming behavior. When changing skills, do not turn disclosure into a bypass around tool registration, permissions, approval, or authorization.
 
 ## Related
 
-- For observed delegation frequency and subagent latency, see
-  [runtime behavior](/openwiki/runtime-behavior.md).
-- For how these middlewares are ordered and composed, see the
-  [middleware stack](/openwiki/architecture/middleware-stack.md).
-- For how models, tools, permissions, and profiles layer onto subagents, see
-  [config layering](/openwiki/concepts/config-layering.md).
+- [SDK construction and execution](/openwiki/architecture/sdk-construction-execution.md)
+- [Context management](/openwiki/concepts/context-management.md)
+- [Permissions and HITL](/openwiki/concepts/permissions-hitl.md)
+- [Talon scheduling](/openwiki/concepts/talon-scheduling.md)
+- [Talon integration](/openwiki/integrations/talon.md)

@@ -1,9 +1,11 @@
 """Tests for autocomplete fuzzy search functionality."""
 
-import asyncio
+import locale
 import logging
+import os
 import subprocess
-import threading
+import sys
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
@@ -13,77 +15,136 @@ import pytest
 from deepagents_code.command_registry import CommandEntry, get_slash_commands
 from deepagents_code.tui.widgets import autocomplete as autocomplete_module
 from deepagents_code.tui.widgets.autocomplete import (
-    MAX_SUGGESTIONS,
     CompletionController,
-    CompletionResult,
     FuzzyFileController,
     MultiCompletionManager,
     SlashCommandController,
+    ThreadCompletionController,
     _fuzzy_score,
     _fuzzy_search,
     _get_git_executable,
     _get_project_files,
-    _is_dotpath,
-    _path_depth,
     _run_git_ls_files,
     _scope_files_to_cwd,
 )
 
+_RANKING_CORPUS = [
+    "README.md",
+    "Makefile",
+    "pyproject.toml",
+    "setup.py",
+    "src/main.py",
+    "src/utils.py",
+    "src/chat_models.py",
+    "src/chat-model-base.py",
+    "src/helpers/string_utils.py",
+    "src/helpers/__init__.py",
+    "src/models/chat/openai.py",
+    "src/models/llms/base.py",
+    "src/Runnables/RunnableConfig.py",
+    "libs/core/langchain_core/messages/ai.py",
+    "libs/core/langchain_core/runnables/base.py",
+    "libs/core/tests/unit_tests/test_messages.py",
+    "tests/test_main.py",
+    "tests/test_utils.py",
+    "tests/integration/test_chat.py",
+    "docs/api.md",
+    "docs/how_to/streaming.md",
+    "docs/Ça_va.md",
+    "web/src/components/ChatInput.tsx",
+    "web/src/components/chat-input.css",
+    "a/b/c/d/e/f/g/deeply_nested_file_name.txt",
+    "x.py",
+    "xx",
+    "win\\Src\\Path_Utils.py",
+    ".github/workflows/ci.yml",
+    ".gitignore",
+    ".env.example",
+]
+"""Fixed file list for comparing `_fuzzy_search` with `_reference_fuzzy_search`."""
+
+_RANKING_QUERIES = [
+    "",
+    *"acmpstx._-/",
+    "chat",
+    "chatmod",
+    "cht",
+    "tst_cht",
+    "mdoel",
+    "bse",
+    "runnablez",
+    "readme",
+    "READ",
+    "Init",
+    "libs/core",
+    "src/m",
+    "py",
+    "a.b",
+    "ça",
+    "xyzq",
+    "deepnest",
+    "nested_file",
+    ".git",
+    "ci",
+    "streamin",
+    "toml",
+    "x",
+    "xx",
+]
+"""Queries that cover substring, word-boundary, fuzzy, and no-match paths."""
+
+
+def _reference_score(query: str, candidate: str) -> float:
+    """Score a file the plain way, with `ratio()` on every fuzzy candidate.
+
+    Returns:
+        The score; callers drop values below 15.
+    """
+    query_lower = query.lower()
+    normalized = candidate.replace("\\", "/")
+    candidate_lower = normalized.lower()
+    filename = normalized.rsplit("/", 1)[-1].lower()
+    filename_start = candidate_lower.rfind("/") + 1
+    bonus = 1 / len(candidate)
+    if query_lower in filename:
+        idx = filename.find(query_lower)
+        if idx == 0:
+            return 150 + bonus
+        return (120 if filename[idx - 1] in "_-." else 100) + bonus
+    if query_lower in candidate_lower:
+        idx = candidate_lower.find(query_lower)
+        if idx == filename_start:
+            return 80 + bonus
+        boundary = idx == 0 or candidate[idx - 1] in "/_-."
+        return (60 if boundary else 40) + bonus
+    filename_ratio = SequenceMatcher(None, query_lower, filename).ratio()
+    if filename_ratio > 0.4:  # reference threshold
+        return filename_ratio * 30
+    return SequenceMatcher(None, query_lower, candidate_lower).ratio() * 15
+
+
+def _reference_fuzzy_search(
+    query: str, candidates: list[str], *, include_dotfiles: bool
+) -> list[str]:
+    """Rank files with `_reference_score`.
+
+    Returns:
+        Up to 50 paths, best match first.
+    """
+    if not include_dotfiles:
+        candidates = [
+            c for c in candidates if not any(p.startswith(".") for p in c.split("/"))
+        ]
+    if not query:
+        return sorted(candidates, key=lambda p: (p.count("/"), p.lower()))[:50]
+    scored = [(_reference_score(query, c), c) for c in candidates]
+    scored = [item for item in scored if item[0] >= 15]  # reference threshold
+    scored.sort(key=lambda item: -item[0])
+    return [c for _, c in scored[:50]]
+
 
 class TestFuzzyScore:
     """Tests for the _fuzzy_score function."""
-
-    def test_exact_filename_match_at_start(self):
-        """Exact match at start of filename gets highest score."""
-        score = _fuzzy_score("main", "src/main.py")
-        assert score > 140  # Should be ~150
-
-    def test_exact_filename_match_anywhere(self):
-        """Exact match anywhere in filename."""
-        score = _fuzzy_score("test", "src/my_test_file.py")
-        assert score > 90  # Should be ~100
-
-    def test_word_boundary_match(self):
-        """Match at word boundary (after _, -, .) gets bonus."""
-        score_boundary = _fuzzy_score("test", "src/my_test.py")
-        score_middle = _fuzzy_score("est", "src/mytest.py")
-        assert score_boundary > score_middle
-
-    def test_path_match_lower_than_filename(self):
-        """Match in path scores lower than filename match."""
-        filename_score = _fuzzy_score("utils", "utils.py")
-        path_score = _fuzzy_score("utils", "src/utils/helper.py")
-        assert filename_score > path_score
-
-    def test_no_match_returns_low_score(self):
-        """Completely unrelated strings get very low scores."""
-        score = _fuzzy_score("xyz", "abc.py")
-        assert score < 15  # Below MIN_FUZZY_SCORE threshold
-
-    def test_case_insensitive(self):
-        """Matching is case insensitive."""
-        score_lower = _fuzzy_score("main", "Main.py")
-        score_upper = _fuzzy_score("MAIN", "main.py")
-        assert score_lower > 100
-        assert score_upper > 100
-
-    def test_shorter_paths_preferred(self):
-        """Shorter paths get slightly higher scores for same match."""
-        short_score = _fuzzy_score("test", "test.py")
-        long_score = _fuzzy_score("test", "very/long/path/to/test.py")
-        assert short_score > long_score
-
-    def test_backslash_normalization(self):
-        """Backslash-separated paths score the same as forward-slash paths."""
-        forward = _fuzzy_score("helper", "src/utils/helper.py")
-        backward = _fuzzy_score("helper", "src\\utils\\helper.py")
-        assert backward == forward
-        assert backward > 100  # Should be a strong filename match
-
-    def test_mixed_separator_normalization(self):
-        """Mixed forward/backslash paths are normalized before scoring."""
-        score = _fuzzy_score("helper", "src/utils\\helper.py")
-        assert score > 100  # Should extract filename correctly
 
 
 class TestFuzzySearch:
@@ -105,66 +166,26 @@ class TestFuzzySearch:
             "docs/api.md",
         ]
 
-    def test_empty_query_returns_root_files_first(self, sample_files):
-        """Empty query returns files sorted by depth, then name."""
-        results = _fuzzy_search("", sample_files, limit=5)
-        # Root level files should come first
-        assert results[0] in ["README.md", "setup.py"]
-        assert all("/" not in r for r in results[:2])  # First items are root level
+    @pytest.mark.parametrize("include_dotfiles", [False, True])
+    def test_matches_reference_ranking(self, include_dotfiles: bool) -> None:
+        """Ranked results match a plain scorer that runs `ratio()` on every file.
 
-    def test_exact_match_ranked_first(self, sample_files):
-        """Exact filename matches are ranked first."""
-        results = _fuzzy_search("main", sample_files, limit=5)
-        assert "src/main.py" in results[:2]
-
-    def test_filters_dotfiles_by_default(self, sample_files):
-        """Dotfiles are filtered out by default."""
-        results = _fuzzy_search("git", sample_files, limit=10)
-        assert not any(".git" in r for r in results)
-
-    def test_includes_dotfiles_when_query_starts_with_dot(self, sample_files):
-        """Dotfiles included when query starts with '.'."""
-        results = _fuzzy_search(".git", sample_files, limit=10, include_dotfiles=True)
-        assert any(".git" in r for r in results)
-
-    def test_respects_limit(self, sample_files):
-        """Results respect the limit parameter."""
-        results = _fuzzy_search("", sample_files, limit=3)
-        assert len(results) <= 3
-
-    def test_filters_low_score_matches(self, sample_files):
-        """Low score matches are filtered out."""
-        results = _fuzzy_search("xyznonexistent", sample_files, limit=10)
-        assert len(results) == 0
-
-    def test_utils_matches_multiple_files(self, sample_files):
-        """Query matching multiple files returns all matches."""
-        results = _fuzzy_search("utils", sample_files, limit=10)
-        assert len(results) >= 2
-        assert any("utils.py" in r for r in results)
+        `_fuzzy_search` skips `SequenceMatcher.ratio()` when a cheap upper bound
+        shows a file cannot reach `_MIN_FUZZY_SCORE`. The skip must never change
+        which files are returned or their order.
+        """
+        for query in _RANKING_QUERIES:
+            expected = _reference_fuzzy_search(
+                query, _RANKING_CORPUS, include_dotfiles=include_dotfiles
+            )
+            actual = _fuzzy_search(
+                query, _RANKING_CORPUS, limit=50, include_dotfiles=include_dotfiles
+            )
+            assert actual == expected, query
 
 
 class TestHelperFunctions:
     """Tests for helper functions."""
-
-    def test_is_dotpath_detects_dotfiles(self):
-        """_is_dotpath correctly identifies dotfiles."""
-        assert _is_dotpath(".gitignore") is True
-        assert _is_dotpath(".github/workflows/ci.yml") is True
-        assert _is_dotpath("src/.hidden/file.py") is True
-
-    def test_is_dotpath_allows_normal_files(self):
-        """_is_dotpath returns False for normal files."""
-        assert _is_dotpath("src/main.py") is False
-        assert _is_dotpath("README.md") is False
-        assert _is_dotpath("tests/test_main.py") is False
-
-    def test_path_depth_counts_slashes(self):
-        """_path_depth correctly counts directory depth."""
-        assert _path_depth("file.py") == 0
-        assert _path_depth("src/file.py") == 1
-        assert _path_depth("src/utils/file.py") == 2
-        assert _path_depth("a/b/c/d/file.py") == 4
 
 
 class TestSlashCommandController:
@@ -180,89 +201,14 @@ class TestSlashCommandController:
         """Create a SlashCommandController with mock view."""
         return SlashCommandController(get_slash_commands(), mock_view)
 
-    def test_can_handle_slash_prefix(self, controller):
-        """Handles text starting with /."""
-        assert controller.can_handle("/", 1) is True
-        assert controller.can_handle("/hel", 4) is True
-        assert controller.can_handle("/help", 5) is True
+    @pytest.mark.parametrize("query", ["/res", "/resume"])
+    def test_resume_ranks_threads_first(self, controller, mock_view, query):
+        controller.on_text_changed(query, len(query))
 
-    def test_cannot_handle_non_slash(self, controller):
-        """Does not handle text not starting with /."""
-        assert controller.can_handle("hello", 5) is False
-        assert controller.can_handle("", 0) is False
-        assert controller.can_handle("test /cmd", 9) is False
-
-    def test_filters_commands_by_prefix(self, controller, mock_view):
-        """Filters commands based on typed prefix."""
-        controller.on_text_changed("/hel", 4)
-
-        # Should have called render with /help suggestion
-        mock_view.render_completion_suggestions.assert_called()
         suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert any("/help" in s[0] for s in suggestions)
-
-    def test_filters_version_command_by_prefix(self, controller, mock_view):
-        """Filters /version command based on typed prefix."""
-        controller.on_text_changed("/ver", 4)
-
-        mock_view.render_completion_suggestions.assert_called()
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert any("/version" in s[0] for s in suggestions)
-
-    def test_shows_all_commands_on_slash_only(self, controller, mock_view):
-        """Shows all commands when just / is typed."""
-        controller.on_text_changed("/", 1)
-
-        mock_view.render_completion_suggestions.assert_called()
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert len(suggestions) == min(len(get_slash_commands()), MAX_SUGGESTIONS)
-
-    def test_clears_on_no_match(self, controller, mock_view):
-        """Clears suggestions when no commands match after having suggestions."""
-        # First get some suggestions
-        controller.on_text_changed("/h", 2)
-        mock_view.render_completion_suggestions.assert_called()
-
-        # Now type something that doesn't match - should clear
-        controller.on_text_changed("/xyz", 4)
-        mock_view.clear_completion_suggestions.assert_called()
-
-    def test_reset_clears_state(self, controller, mock_view):
-        """Reset clears suggestions and state."""
-        controller.on_text_changed("/h", 2)
-        controller.reset()
-
-        mock_view.clear_completion_suggestions.assert_called()
-
-    def test_suggestions_return_after_reset(self, controller, mock_view):
-        """Suggestions reappear when text is re-entered after a reset."""
-        controller.on_text_changed("/", 1)
-        mock_view.render_completion_suggestions.assert_called()
-
-        controller.reset()
-        mock_view.reset_mock()
-
-        # Re-entering "/" should show suggestions again
-        controller.on_text_changed("/", 1)
-        mock_view.render_completion_suggestions.assert_called()
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert len(suggestions) == min(len(get_slash_commands()), MAX_SUGGESTIONS)
-
-    def test_hidden_keyword_match_continue(self, controller, mock_view):
-        """Typing 'continue' surfaces /threads via hidden keyword."""
-        controller.on_text_changed("/continue", 9)
-
-        mock_view.render_completion_suggestions.assert_called()
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert any("/threads" in s[0] for s in suggestions)
-
-    def test_substring_description_match_exit(self, controller, mock_view):
-        """Typing 'exit' surfaces /quit via substring match on 'Exit app'."""
-        controller.on_text_changed("/exit", 5)
-
-        mock_view.render_completion_suggestions.assert_called()
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert any("/quit" in s[0] for s in suggestions)
+        assert suggestions[0][0] == "/threads"
+        assert sum(label == "/threads" for label, _ in suggestions) == 1
+        assert controller._suggestion_names[0] == "/threads"
 
     def test_substring_description_match_fresh(self, controller, mock_view):
         """Typing 'fresh' surfaces /clear via substring on 'Start a fresh thread'."""
@@ -272,124 +218,6 @@ class TestSlashCommandController:
         suggestions = mock_view.render_completion_suggestions.call_args[0][0]
         assert any("/clear" in s[0] for s in suggestions)
 
-    def test_substring_name_match(self, controller, mock_view):
-        """Substring of command name (not prefix) surfaces the command."""
-        controller.on_text_changed("/flo", 4)
-
-        mock_view.render_completion_suggestions.assert_called()
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert any("/offload" in s[0] for s in suggestions)
-
-    def test_true_fuzzy_match_via_misspelling(self, controller, mock_view):
-        """Misspelled command surfaces via SequenceMatcher ratio."""
-        controller.on_text_changed("/hlep", 5)
-
-        mock_view.render_completion_suggestions.assert_called()
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert any("/help" in s[0] for s in suggestions)
-
-    def test_prefix_ties_follow_registry_order_for_re_commands(self, mock_view) -> None:
-        """Equal-score prefixes keep registry order (`re`/`rel` disambiguation)."""
-        controller = SlashCommandController(get_slash_commands(), mock_view)
-        assert any(entry.name == "/reload" for entry in controller._commands)
-
-        controller.on_text_changed("/re", 3)
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert suggestions[0][0].startswith("/remember")
-
-        controller.on_text_changed("/rel", 4)
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert suggestions[0][0].startswith("/reload")
-
-    def test_prefix_match_ranks_first(self, controller, mock_view):
-        """Prefix matches on command name rank above description matches."""
-        controller.on_text_changed("/he", 3)
-
-        mock_view.render_completion_suggestions.assert_called()
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        # /help is a prefix match — should be first
-        assert suggestions[0][0] == "/help"
-
-    def test_no_match_clears(self, controller, mock_view):
-        """Completely unrelated input clears suggestions."""
-        controller.on_text_changed("/h", 2)
-        mock_view.render_completion_suggestions.assert_called()
-
-        controller.on_text_changed("/zzzzzzzzz", 10)
-        mock_view.clear_completion_suggestions.assert_called()
-
-    def test_space_dismisses_suggestions(self, controller, mock_view):
-        """Typing a space after a command name dismisses the popup."""
-        controller.on_text_changed("/model", 6)
-        mock_view.render_completion_suggestions.assert_called()
-
-        controller.on_text_changed("/model ", 7)
-        mock_view.clear_completion_suggestions.assert_called()
-
-    def test_space_with_args_stays_dismissed(self, controller, mock_view):
-        """Suggestions stay dismissed while typing arguments after a space."""
-        # First show suggestions, then dismiss with space
-        controller.on_text_changed("/model", 6)
-        mock_view.render_completion_suggestions.assert_called()
-        mock_view.reset_mock()
-
-        controller.on_text_changed("/model gpt-5.5", 13)
-        mock_view.render_completion_suggestions.assert_not_called()
-
-    def test_bare_slash_space_dismisses(self, controller, mock_view):
-        """Typing '/ ' (slash then space, no command) dismisses the popup."""
-        controller.on_text_changed("/", 1)
-        mock_view.render_completion_suggestions.assert_called()
-
-        controller.on_text_changed("/ ", 2)
-        mock_view.clear_completion_suggestions.assert_called()
-
-    def test_backspace_from_space_restores_suggestions(self, controller, mock_view):
-        """Deleting the space after '/model ' re-shows suggestions."""
-        controller.on_text_changed("/model", 6)
-        mock_view.render_completion_suggestions.assert_called()
-
-        controller.on_text_changed("/model ", 7)
-        mock_view.clear_completion_suggestions.assert_called()
-        mock_view.reset_mock()
-
-        # Simulate backspace back to "/model"
-        controller.on_text_changed("/model", 6)
-        mock_view.render_completion_suggestions.assert_called()
-
-    @pytest.mark.usefixtures("mock_view")
-    def test_double_reset_is_safe(self, controller):
-        """Calling reset twice does not raise or double-clear."""
-        controller.on_text_changed("/", 1)
-        controller.reset()
-        # Second reset should be a no-op (suggestions already empty)
-        controller.reset()
-
-    def test_space_key_applies_selected_completion(self, controller, mock_view) -> None:
-        """Pressing space with active suggestions applies the completion."""
-        controller.on_text_changed("/hel", 4)
-        mock_view.render_completion_suggestions.assert_called()
-
-        event = MagicMock()
-        event.key = "space"
-        result = controller.on_key(event, "/hel", 4)
-
-        assert result == CompletionResult.HANDLED
-        mock_view.replace_completion_range.assert_called_once()
-        # First positional arg is start=0, second is cursor_index=4,
-        # third is the completed command name.
-        args = mock_view.replace_completion_range.call_args[0]
-        assert args[0] == 0
-        assert args[1] == 4
-        assert args[2] == "/help"
-
-    def test_space_key_ignored_without_suggestions(self, controller) -> None:
-        """Space returns IGNORED when there are no active suggestions."""
-        event = MagicMock()
-        event.key = "space"
-        result = controller.on_key(event, "/zzz", 4)
-        assert result == CompletionResult.IGNORED
-
 
 class TestScoreCommand:
     """Direct unit tests for SlashCommandController._score_command."""
@@ -398,54 +226,6 @@ class TestScoreCommand:
     def score(search: str, cmd: str, desc: str, keywords: str = "") -> float:
         """Proxy score helper with explicit type signature for static analysis."""
         return SlashCommandController._score_command(search, cmd, desc, keywords)
-
-    def test_prefix_returns_200(self):
-        assert self.score("hel", "/help", "Show help") == 200
-
-    def test_substring_name_returns_150(self):
-        assert self.score("omp", "/compact", "Offload conversation") == 150
-
-    def test_substring_desc_word_boundary_returns_110(self):
-        assert self.score("exit", "/quit", "Exit app") == 110
-
-    def test_substring_desc_mid_word_returns_90(self):
-        desc = "Free up context window space by offloading older messages"
-        assert self.score("ex", "/offload", desc) == 90
-
-    def test_no_match_returns_zero(self):
-        assert self.score("zzzzz", "/help", "Show help") == 0
-
-    def test_fuzzy_above_threshold(self):
-        score = self.score("hlep", "/help", "Show help")
-        assert 0 < score < 100  # fuzzy tier, not substring/prefix
-
-    def test_hidden_keyword_prefix_match(self):
-        assert (
-            self.score("cont", "/threads", "Browse threads", "continue history") == 120
-        )
-
-    def test_hidden_keyword_substring_match(self):
-        assert (
-            self.score("hist", "/threads", "Browse threads", "continue history") == 120
-        )
-
-    def test_hidden_keyword_ignored_when_empty(self):
-        assert self.score("cont", "/threads", "Browse threads", "") == 0
-
-    def test_hidden_keyword_requires_min_length(self):
-        """Single-char queries do not match hidden keywords."""
-        assert self.score("c", "/threads", "Browse threads", "continue") == 0
-
-    def test_tiers_ordering(self):
-        """Prefix > substring-name > keyword > substring-desc > fuzzy."""
-        prefix = self.score("hel", "/help", "Show help")
-        substr_name = self.score("omp", "/compact", "Offload conversation")
-        keyword = self.score("cont", "/threads", "Browse threads", "continue")
-        desc_boundary = self.score("exit", "/quit", "Exit app")
-        offload_desc = "Free up context window space by offloading older messages"
-        desc_mid = self.score("ex", "/offload", offload_desc)
-        fuzzy = self.score("hlep", "/help", "Show help")
-        assert prefix > substr_name > keyword > desc_boundary > desc_mid > fuzzy > 0
 
 
 class TestFuzzyFileControllerCanHandle:
@@ -461,36 +241,141 @@ class TestFuzzyFileControllerCanHandle:
         """Create a FuzzyFileController."""
         return FuzzyFileController(mock_view, cwd=tmp_path)
 
-    def test_handles_at_symbol(self, controller):
-        """Handles text with @ symbol."""
-        assert controller.can_handle("@", 1) is True
-        assert controller.can_handle("@file", 5) is True
-        assert controller.can_handle("look at @src/main.py", 20) is True
-
-    def test_handles_at_mid_text(self, controller):
-        """Handles @ in middle of text."""
-        assert controller.can_handle("check @file", 11) is True
-        assert controller.can_handle("see @", 5) is True
-
-    def test_no_handle_without_at(self, controller):
-        """Does not handle text without @."""
-        assert controller.can_handle("hello", 5) is False
-        assert controller.can_handle("", 0) is False
-
-    def test_no_handle_at_after_cursor(self, controller):
-        """Does not handle @ that's after cursor position."""
-        assert controller.can_handle("hello @file", 5) is False
-
-    def test_no_handle_space_after_at(self, controller):
-        """Does not handle @ followed by space before cursor."""
-        assert controller.can_handle("@ file", 6) is False
-        assert controller.can_handle("@file name", 10) is False
-
     def test_invalid_cursor_positions(self, controller):
         """Handles invalid cursor positions gracefully."""
         assert controller.can_handle("@file", 0) is False
         assert controller.can_handle("@file", -1) is False
         assert controller.can_handle("@file", 100) is False
+
+
+class TestThreadCompletionController:
+    """Tests for durable `@@` thread references."""
+
+    @pytest.fixture
+    def mock_view(self) -> MagicMock:
+        return MagicMock()
+
+    @pytest.fixture
+    def controller(self, mock_view: MagicMock) -> ThreadCompletionController:
+        controller = ThreadCompletionController(mock_view)
+        controller.update_threads(
+            [
+                {
+                    "thread_id": "11111111-2222-3333-4444-555555555555",
+                    "agent_name": "coder",
+                    "updated_at": "2026-04-14T12:00:00Z",
+                    "initial_prompt": "Fix the parser",
+                    "git_branch": "feature/parser",
+                    "cwd": "/workspace/project",
+                },
+                {
+                    "thread_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "agent_name": "researcher",
+                    "updated_at": "2026-04-13T12:00:00Z",
+                    "initial_prompt": "Research caching",
+                    "git_branch": "main",
+                    "cwd": "/workspace/docs",
+                },
+            ]
+        )
+        return controller
+
+    def test_handles_double_at_but_file_controller_does_not(
+        self,
+        controller: ThreadCompletionController,
+        mock_view: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        assert controller.can_handle("see @@pars", 10)
+        assert controller.can_handle("(@@pars", 7)
+        assert not controller.can_handle("email@@pars", 11)
+        assert not controller.can_handle("compare @@(thread:abc)", 21)
+        assert not FuzzyFileController(mock_view, cwd=tmp_path).can_handle("@@pars", 6)
+
+    def test_searches_thread_metadata_and_inserts_token(
+        self, controller: ThreadCompletionController, mock_view: MagicMock
+    ) -> None:
+        controller.on_text_changed("compare @@feature", 17)
+        suggestions = mock_view.render_completion_suggestions.call_args.args[0]
+        assert suggestions[0][0] == "Fix the parser"
+        assert suggestions[0][1].endswith(" · 11111111")
+
+        assert controller.apply_selection(0, "compare @@feature", 17)
+        mock_view.replace_completion_range.assert_called_once_with(
+            8,
+            17,
+            "@@(thread:11111111-2222-3333-4444-555555555555)",
+        )
+
+    def test_multiword_query_matches_initial_prompt(
+        self, controller: ThreadCompletionController, mock_view: MagicMock
+    ) -> None:
+        controller.on_text_changed("compare @@fix parser", 20)
+        suggestions = mock_view.render_completion_suggestions.call_args.args[0]
+        assert suggestions[0][0] == "Fix the parser"
+
+    @pytest.mark.parametrize("query", ["release AUDIT", "fix parser", "feature/parser"])
+    def test_saved_name_search_and_label(
+        self,
+        controller: ThreadCompletionController,
+        mock_view: MagicMock,
+        query: str,
+    ) -> None:
+        thread_id = "11111111-2222-3333-4444-555555555555"
+        controller.update_threads(
+            [
+                {
+                    "thread_id": thread_id,
+                    "agent_name": "coder",
+                    "updated_at": None,
+                    "thread_name": "Release audit",
+                    "initial_prompt": "Fix the parser",
+                    "git_branch": "feature/parser",
+                }
+            ]
+        )
+        text = f"compare @@{query}"
+        controller.on_text_changed(text, len(text))
+        mock_view.render_completion_suggestions.assert_called_once()
+        suggestions = mock_view.render_completion_suggestions.call_args.args[0]
+        assert suggestions[0][0] == "Release audit"
+        assert controller.apply_selection(0, text, len(text))
+        mock_view.replace_completion_range.assert_called_once_with(
+            8, len(text), f"@@(thread:{thread_id})"
+        )
+
+    @pytest.mark.parametrize(
+        ("name", "prompt", "label"),
+        [
+            (None, "Fix the parser", "Fix the parser"),
+            ("", "Fix the parser", "Fix the parser"),
+            (None, None, "11111111"),
+            ("Release\n\taudit\x00", "Fix the parser", "Release audit"),
+            ("a" * 100, "Fix the parser", "a" * 77 + "..."),
+        ],
+    )
+    def test_label_sanitization_and_fallback(
+        self,
+        controller: ThreadCompletionController,
+        mock_view: MagicMock,
+        name: str | None,
+        prompt: str | None,
+        label: str,
+    ) -> None:
+        controller.update_threads(
+            [
+                {
+                    "thread_id": "11111111-2222-3333-4444-555555555555",
+                    "agent_name": "coder",
+                    "updated_at": None,
+                    "thread_name": name,
+                    "initial_prompt": prompt,
+                }
+            ]
+        )
+        controller.on_text_changed("@@", 2)
+        suggestions = mock_view.render_completion_suggestions.call_args.args[0]
+        assert suggestions[0][0] == label
 
 
 class TestMultiCompletionManager:
@@ -512,58 +397,6 @@ class TestMultiCompletionManager:
         controllers = cast("list[CompletionController]", [slash_ctrl, file_ctrl])
         return MultiCompletionManager(controllers)
 
-    def test_activates_slash_controller_for_slash(self, manager):
-        """Activates slash controller for / prefix."""
-        manager.on_text_changed("/help", 5)
-        assert manager._active is not None
-        assert isinstance(manager._active, SlashCommandController)
-
-    def test_activates_file_controller_for_at(self, manager):
-        """Activates file controller for @ prefix."""
-        manager.on_text_changed("@file", 5)
-        assert manager._active is not None
-        assert isinstance(manager._active, FuzzyFileController)
-
-    def test_no_active_for_plain_text(self, manager):
-        """No controller active for plain text."""
-        manager.on_text_changed("hello world", 11)
-        assert manager._active is None
-
-    def test_switches_controllers(self, manager):
-        """Switches between controllers as input changes."""
-        manager.on_text_changed("/cmd", 4)
-        assert isinstance(manager._active, SlashCommandController)
-
-        manager.on_text_changed("@file", 5)
-        assert isinstance(manager._active, FuzzyFileController)
-
-    def test_reset_clears_active(self, manager):
-        """Reset clears active controller."""
-        manager.on_text_changed("/cmd", 4)
-        manager.reset()
-        assert manager._active is None
-
-    def test_reactivates_after_reset(self, manager, mock_view):
-        """Controller reactivates for new input after a full reset."""
-        manager.on_text_changed("/", 1)
-        assert isinstance(manager._active, SlashCommandController)
-
-        manager.reset()
-        assert manager._active is None
-        mock_view.reset_mock()
-
-        # Typing "/" again should reactivate the slash controller
-        manager.on_text_changed("/", 1)
-        assert isinstance(manager._active, SlashCommandController)
-        mock_view.render_completion_suggestions.assert_called()
-
-    def test_double_reset_is_safe(self, manager):
-        """Calling reset when already inactive is a no-op."""
-        manager.on_text_changed("/cmd", 4)
-        manager.reset()
-        manager.reset()
-        assert manager._active is None
-
 
 class TestSlashCommandControllerUpdateCommands:
     """Tests for SlashCommandController.update_commands()."""
@@ -571,48 +404,6 @@ class TestSlashCommandControllerUpdateCommands:
     @pytest.fixture
     def mock_view(self) -> MagicMock:
         return MagicMock()
-
-    def test_update_replaces_commands(self, mock_view: MagicMock) -> None:
-        """update_commands() replaces the internal commands list."""
-        initial = [CommandEntry("/help", "Show help", "", "")]
-        controller = SlashCommandController(initial, mock_view)
-
-        new_commands = [
-            CommandEntry("/help", "Show help", "", ""),
-            CommandEntry("/skill:web-research", "Research topics", "web-research", ""),
-        ]
-        controller.update_commands(new_commands)
-
-        # Typing /skill: should now show the skill command
-        controller.on_text_changed("/skill:", 7)
-        mock_view.render_completion_suggestions.assert_called()
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert any("/skill:web-research" in s[0] for s in suggestions)
-
-    def test_update_resets_suggestions(self, mock_view: MagicMock) -> None:
-        """update_commands() clears any active suggestions."""
-        commands = [CommandEntry("/help", "Show help", "", "")]
-        controller = SlashCommandController(commands, mock_view)
-        controller.on_text_changed("/h", 2)
-        mock_view.render_completion_suggestions.assert_called()
-
-        controller.update_commands([CommandEntry("/quit", "Exit", "", "")])
-        mock_view.clear_completion_suggestions.assert_called()
-
-    def test_skill_commands_fuzzy_match(self, mock_view: MagicMock) -> None:
-        """Skill commands match via hidden keywords."""
-        commands = [
-            CommandEntry("/help", "Show help", "", ""),
-            CommandEntry(
-                "/skill:code-review", "Review code changes", "code-review", ""
-            ),
-        ]
-        controller = SlashCommandController(commands, mock_view)
-        controller.on_text_changed("/code", 5)
-
-        mock_view.render_completion_suggestions.assert_called()
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert any("/skill:code-review" in s[0] for s in suggestions)
 
 
 class TestSlashCommandControllerDisplaySeparation:
@@ -635,290 +426,55 @@ class TestSlashCommandControllerDisplaySeparation:
         ]
         return SlashCommandController(commands, mock_view)
 
-    def test_popup_shows_short_label(
-        self, controller: SlashCommandController, mock_view: MagicMock
-    ) -> None:
-        """The suggestion popup renders the short display label."""
-        controller.on_text_changed("/skill:rev", 10)
 
-        mock_view.render_completion_suggestions.assert_called()
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert suggestions[0][0] == "/skill:review"
+@pytest.mark.parametrize(
+    "control",
+    ["\n", "\t", "\x1b", "\x85", "\u2028", "\u2029", "\u202e", "\u200b", "\u034f"],
+)
+@pytest.mark.parametrize("warm", [False, True])
+async def test_file_completion_rejects_unsafe_names(
+    control: str, warm: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unsafe repository filenames never enter the popup or chat input."""
+    view = MagicMock()
+    controller = FuzzyFileController(view, cwd=tmp_path)
+    monkeypatch.setattr(
+        autocomplete_module,
+        "_get_project_files",
+        lambda _root: [f"unsafe{control}@secret.txt", "re\u0301sume\u0301.md"],
+    )
 
-    def test_completion_inserts_machine_name(
-        self, controller: SlashCommandController, mock_view: MagicMock
-    ) -> None:
-        """Applying the completion inserts the full namespaced name."""
-        controller.on_text_changed("/skill:rev", 10)
-        applied = controller._apply_selected_completion(10)
-
-        assert applied is True
-        mock_view.replace_completion_range.assert_called_once_with(
-            0, 10, "/skill:my-plugin:review"
-        )
-
-    def test_terminal_segment_fuzzy_matches_plugin_skill(
-        self, controller: SlashCommandController, mock_view: MagicMock
-    ) -> None:
-        """Typing just the terminal segment surfaces the plugin skill."""
-        controller.on_text_changed("/review", 7)
-
-        mock_view.render_completion_suggestions.assert_called()
-        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
-        assert suggestions[0][0] == "/skill:review"
+    if warm:
+        await controller.warm_cache(force=True)
+    controller.on_text_changed("@", 1)
+    view.render_completion_suggestions.assert_called_once_with(
+        [("@re\u0301sume\u0301.md", "md")], 0
+    )
+    assert controller.apply_selection(0, "@", 1)
+    view.replace_completion_range.assert_called_once_with(
+        0, 1, "@re\u0301sume\u0301.md"
+    )
 
 
-class TestFuzzyFileControllerSetCwd:
-    """Tests for FuzzyFileController.set_cwd switching completion roots."""
+async def test_file_completion_uses_refreshed_file_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Suggestions follow the file list after a forced background refresh."""
+    view = MagicMock()
+    controller = FuzzyFileController(view, cwd=tmp_path)
+    files = ["old_module.py"]
+    monkeypatch.setattr(autocomplete_module, "_get_project_files", lambda _root: files)
 
-    def test_set_cwd_defers_project_root_off_event_loop(self, tmp_path):
-        """set_cwd roots at cwd immediately and defers project-root discovery."""
-        proj = tmp_path / "proj"
-        (proj / ".git").mkdir(parents=True)
-        sub = proj / "sub"
-        sub.mkdir()
-        controller = FuzzyFileController(MagicMock(), cwd=tmp_path)
+    controller.on_text_changed("@module", 7)
+    assert view.render_completion_suggestions.call_args[0][0] == [
+        ("@old_module.py", "py")
+    ]
 
-        controller.set_cwd(sub)
-
-        # No blocking filesystem walk here: cwd is the provisional root and the
-        # real root is resolved later in warm_cache().
-        assert controller._cwd == sub
-        assert controller._project_root == sub
-        assert controller._project_root_pending is True
-
-    async def test_warm_cache_resolves_pending_project_root(self, tmp_path):
-        """warm_cache resolves the deferred project root to the git root."""
-        proj = tmp_path / "proj"
-        (proj / ".git").mkdir(parents=True)
-        sub = proj / "sub"
-        sub.mkdir()
-        controller = FuzzyFileController(MagicMock(), cwd=tmp_path)
-        controller.set_cwd(sub)
-
-        await controller.warm_cache()
-
-        assert controller._project_root == proj.resolve()
-        assert controller._project_root_pending is False
-
-
-class TestFuzzyFileControllerWarmCacheRace:
-    """Overlapping cwd warmers must not let stale results win.
-
-    Warmers are scheduled with `exclusive=False`, so a slow warmer for an old
-    cwd can finish after a newer cwd switch. These tests force that ordering and
-    assert the controller stays rooted/cache-warmed for the newest cwd.
-    """
-
-    async def test_stale_warmer_does_not_overwrite_project_root(
-        self, tmp_path, monkeypatch
-    ):
-        """An older project-root lookup finishing last must not win."""
-        proj_a = tmp_path / "a"
-        sub_a = proj_a / "sub"
-        sub_a.mkdir(parents=True)
-        proj_b = tmp_path / "b"
-        sub_b = proj_b / "sub"
-        sub_b.mkdir(parents=True)
-
-        entered_a = threading.Event()
-        release_a = threading.Event()
-
-        def fake_find(path: Path) -> Path | None:
-            if path == sub_a:
-                entered_a.set()
-                release_a.wait(timeout=5)
-                return proj_a
-            if path == sub_b:
-                return proj_b
-            return None
-
-        monkeypatch.setattr(autocomplete_module, "find_project_root", fake_find)
-        monkeypatch.setattr(
-            autocomplete_module,
-            "_get_project_files",
-            lambda root: [f"sub/{root.name}.py"],
-        )
-
-        controller = FuzzyFileController(MagicMock(), cwd=tmp_path)
-
-        controller.set_cwd(sub_a)
-        task_a = asyncio.create_task(controller.warm_cache())
-        await asyncio.to_thread(entered_a.wait, 5)
-
-        controller.set_cwd(sub_b)
-        await controller.warm_cache()
-
-        # The newer warmer fully resolved before the stale one is released.
-        assert controller._project_root == proj_b
-        assert controller._project_root_pending is False
-        assert controller._file_cache == ["b.py"]
-
-        release_a.set()
-        await task_a
-
-        # The stale warmer finished last but left the newer state untouched.
-        assert controller._project_root == proj_b
-        assert controller._project_root_pending is False
-        assert controller._file_cache == ["b.py"]
-
-    async def test_stale_warmer_does_not_overwrite_file_cache(
-        self, tmp_path, monkeypatch
-    ):
-        """An older file-cache warm finishing last must not win."""
-        sub_a = tmp_path / "a"
-        sub_a.mkdir()
-        sub_b = tmp_path / "b"
-        sub_b.mkdir()
-
-        entered_a = threading.Event()
-        release_a = threading.Event()
-
-        def fake_files(root: Path) -> list[str]:
-            if root == sub_a:
-                entered_a.set()
-                release_a.wait(timeout=5)
-                return ["a/file.py"]
-            return ["b/file.py"]
-
-        monkeypatch.setattr(autocomplete_module, "find_project_root", lambda _: None)
-        monkeypatch.setattr(autocomplete_module, "_get_project_files", fake_files)
-
-        controller = FuzzyFileController(MagicMock(), cwd=tmp_path)
-
-        controller.set_cwd(sub_a)
-        task_a = asyncio.create_task(controller.warm_cache())
-        await asyncio.to_thread(entered_a.wait, 5)
-
-        controller.set_cwd(sub_b)
-        await controller.warm_cache()
-
-        # The newer warmer fully resolved before the stale one is released.
-        assert controller._project_root == sub_b
-        assert controller._project_root_pending is False
-        assert controller._file_cache == ["b/file.py"]
-
-        release_a.set()
-        await task_a
-
-        # The stale warmer finished last but left the newer state untouched.
-        assert controller._project_root == sub_b
-        assert controller._project_root_pending is False
-        assert controller._file_cache == ["b/file.py"]
-
-    async def test_aba_stale_warmer_does_not_overwrite_file_cache(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """An older A warmer must not win after an A-to-B-to-A switch."""
-        sub_a = tmp_path / "a"
-        sub_a.mkdir()
-        sub_b = tmp_path / "b"
-        sub_b.mkdir()
-
-        entered_old_a = threading.Event()
-        release_old_a = threading.Event()
-        lock = threading.Lock()
-        a_calls = 0
-
-        def fake_files(root: Path) -> list[str]:
-            nonlocal a_calls
-
-            if root == sub_a:
-                with lock:
-                    a_calls += 1
-                    call = a_calls
-                if call == 1:
-                    entered_old_a.set()
-                    release_old_a.wait(timeout=5)
-                    return ["a/old.py"]
-                return ["a/new.py"]
-            return ["b/file.py"]
-
-        monkeypatch.setattr(autocomplete_module, "find_project_root", lambda _: None)
-        monkeypatch.setattr(autocomplete_module, "_get_project_files", fake_files)
-
-        controller = FuzzyFileController(MagicMock(), cwd=tmp_path)
-
-        controller.set_cwd(sub_a)
-        old_task_a = asyncio.create_task(controller.warm_cache())
-        await asyncio.to_thread(entered_old_a.wait, 5)
-
-        controller.set_cwd(sub_b)
-        await controller.warm_cache()
-
-        controller.set_cwd(sub_a)
-        await controller.warm_cache()
-        assert controller._file_cache == ["a/new.py"]
-
-        release_old_a.set()
-        await old_task_a
-
-        assert controller._project_root == sub_a
-        assert controller._project_root_pending is False
-        assert controller._file_cache == ["a/new.py"]
-
-    async def test_force_warmer_does_not_overwrite_newer_cwd(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A force refresh superseded mid-walk must not clobber a newer cwd.
-
-        `force=True` is a new way to reach the file-walk-and-swap block on an
-        already-populated cache (a populated cache otherwise short-circuits), so
-        a background refresh racing a `set_cwd` is a genuinely new scenario.
-        """
-        sub_a = tmp_path / "a"
-        sub_a.mkdir()
-        sub_b = tmp_path / "b"
-        sub_b.mkdir()
-
-        entered_force = threading.Event()
-        release_force = threading.Event()
-        lock = threading.Lock()
-        a_calls = 0
-
-        def fake_files(root: Path) -> list[str]:
-            nonlocal a_calls
-
-            if root == sub_a:
-                with lock:
-                    a_calls += 1
-                    call = a_calls
-                if call == 1:
-                    # Initial warm populates the cache and returns immediately.
-                    return ["a/file.py"]
-                # The forced background refresh; block it mid-walk so a newer
-                # cwd switch can supersede it.
-                entered_force.set()
-                release_force.wait(timeout=5)
-                return ["a/stale.py"]
-            return ["b/file.py"]
-
-        monkeypatch.setattr(autocomplete_module, "find_project_root", lambda _: None)
-        monkeypatch.setattr(autocomplete_module, "_get_project_files", fake_files)
-
-        controller = FuzzyFileController(MagicMock(), cwd=tmp_path)
-        controller.set_cwd(sub_a)
-        await controller.warm_cache()
-        assert controller._file_cache == ["a/file.py"]
-
-        force_task = asyncio.create_task(controller.warm_cache(force=True))
-        await asyncio.to_thread(entered_force.wait, 5)
-
-        # The prior cache stays visible while the forced walk is in flight.
-        assert controller._file_cache == ["a/file.py"]
-
-        # A newer cwd switch supersedes the in-flight forced refresh.
-        controller.set_cwd(sub_b)
-        await controller.warm_cache()
-        assert controller._file_cache == ["b/file.py"]
-
-        release_force.set()
-        await force_task
-
-        # The stale forced walk finished last but dropped its result.
-        assert controller._project_root == sub_b
-        assert controller._project_root_pending is False
-        assert controller._file_cache == ["b/file.py"]
+    files.append("new_module.py")
+    await controller.warm_cache(force=True)
+    controller.on_text_changed("@module", 7)
+    labels = {label for label, _ in view.render_completion_suggestions.call_args[0][0]}
+    assert labels == {"@old_module.py", "@new_module.py"}
 
 
 class TestGetProjectFiles:
@@ -987,6 +543,59 @@ class TestGetProjectFiles:
         files = _get_project_files(tmp_path)
 
         assert files == []
+
+    def test_non_ascii_names_are_returned_verbatim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression test for #6965: non-ASCII names come back as real paths.
+
+        Under `core.quotePath`, plain `git ls-files` prints such names C-quoted
+        with octal escapes. Unquoted output must still be decoded as UTF-8: a
+        legacy Windows code page is simulated through `locale.getencoding`,
+        which `subprocess` consults when no encoding is given.
+        """
+        self._init_repo(tmp_path)
+        # Pin git's default so a global `core.quotePath=false` can't mask it.
+        subprocess.run(
+            ["git", "config", "core.quotePath", "true"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        (tmp_path / "résumé.md").write_text("tracked\n")
+        subprocess.run(
+            ["git", "add", "résumé.md"], cwd=tmp_path, check=True, capture_output=True
+        )
+        (tmp_path / "naïve.py").write_text("untracked\n")
+        monkeypatch.setattr(locale, "getencoding", lambda: "cp1252")
+
+        files = _get_project_files(tmp_path)
+
+        assert files == ["résumé.md", "naïve.py"]
+
+    @pytest.mark.skipif(
+        os.name == "nt" or sys.platform == "darwin",
+        reason="Windows and macOS (APFS) require Unicode filenames",
+    )
+    def test_non_utf8_names_do_not_alias_valid_files(self, tmp_path: Path) -> None:
+        """Invalid UTF-8 names must not become a different selectable filename."""
+        self._init_repo(tmp_path)
+        invalid_name = os.fsdecode(b"bad-\xff.md")
+        valid_name = "bad-\ufffd.md"
+        (tmp_path / invalid_name).write_text("invalid name")
+        (tmp_path / valid_name).write_text("valid name")
+
+        files = _get_project_files(tmp_path)
+        assert set(files) == {invalid_name, valid_name}
+
+        view = MagicMock()
+        controller = FuzzyFileController(view, cwd=tmp_path)
+        controller.on_text_changed("@", 1)
+        view.render_completion_suggestions.assert_called_once_with(
+            [(f"@{valid_name}", "md")], 0
+        )
+        assert controller.apply_selection(0, "@", 1)
+        view.replace_completion_range.assert_called_once_with(0, 1, f"@{valid_name}")
 
     def test_deduplicates_repeated_paths(self, tmp_path: Path) -> None:
         """A path emitted more than once by git ls-files appears only once.
@@ -1292,53 +901,6 @@ class TestFuzzyFileControllerScope:
 
         controller = FuzzyFileController(mock_view, cwd=symlink_cwd)
         assert controller._get_files() == ["main.py", "utils/helpers.py"]
-
-    async def test_warm_cache_scopes_file_list_to_cwd(
-        self, mock_view, monkeypatch, tmp_path
-    ):
-        """warm_cache scopes the cached file list to the resolved cwd subtree."""
-        project_root = tmp_path
-        (project_root / ".git").mkdir()
-        cwd = project_root / "apps" / "cli"
-        cwd.mkdir(parents=True)
-
-        mock_files = [
-            "README.md",
-            "apps/cli/main.py",
-            "apps/web/index.ts",
-        ]
-        monkeypatch.setattr(
-            autocomplete_module, "_get_project_files", lambda _root: mock_files
-        )
-
-        controller = FuzzyFileController(mock_view, cwd=project_root)
-        controller.set_cwd(cwd)
-        await controller.warm_cache()
-
-        assert controller._file_cache == ["main.py"]
-
-    async def test_warm_cache_force_refreshes_populated_cache(
-        self, mock_view, monkeypatch, tmp_path
-    ):
-        """warm_cache(force=True) re-walks and swaps in a fresh list."""
-        project_root = tmp_path
-        (project_root / ".git").mkdir()
-
-        files = ["main.py"]
-        monkeypatch.setattr(
-            autocomplete_module, "_get_project_files", lambda _root: list(files)
-        )
-
-        controller = FuzzyFileController(mock_view, cwd=project_root)
-        await controller.warm_cache()
-        assert controller._file_cache == ["main.py"]
-
-        files.append("added.py")
-        await controller.warm_cache()
-        assert controller._file_cache == ["main.py"]
-
-        await controller.warm_cache(force=True)
-        assert controller._file_cache == ["main.py", "added.py"]
 
     def test_excludes_sibling_with_shared_prefix(
         self, mock_view, monkeypatch, tmp_path

@@ -42,7 +42,7 @@ PYTHON_MINOR_PROBE_LIMIT = 100
 # the next minor yet" upper bound (warning) from a cap that excludes an
 # interpreter users actually run (hard failure). Pinned to the interpreter
 # `check_dep_freshness.yml` runs this script under; bump both together.
-CURRENT_CPYTHON_MINOR = 14
+CURRENT_CPYTHON_MINOR = 15
 RELEASE_TITLE = re.compile(r"^release\(([^)]+)\):\s+\S+")
 MARKER_VARIABLES = (
     "implementation_name",
@@ -187,15 +187,15 @@ def _intersection_omits_only_unreleased_minors(
     wheel_requires_python: str,
     published_constraints: Sequence[str],
     *,
-    current_minor: int = CURRENT_CPYTHON_MINOR,
+    current_minor: int | None = None,
 ) -> bool:
     """Whether the dependency's Python coverage gap touches no existing minor.
 
     A minor line is installable when at least one of its probed versions
     satisfies both the wheel's `Requires-Python` and every published file
-    constraint. The gap must then start at the first unreleased minor and
-    extend contiguously to the wheel's own ceiling, i.e. a "not tested on the
-    next minor yet" upper bound such as `<3.15`. A gap at the wheel's minimum
+    constraint. The gap must then start at or after the first unreleased minor
+    and extend contiguously to the wheel's own ceiling, i.e. a "not tested on a
+    future minor yet" upper bound such as `<3.16`. A gap at the wheel's minimum
     (the dependency rejects the release's install floor), in the middle of the
     claimed range, or covering already-released minors still fails.
 
@@ -209,13 +209,15 @@ def _intersection_omits_only_unreleased_minors(
         wheel_requires_python: `Requires-Python` declared by the release wheel.
         published_constraints: `requires_python` values from the published files.
         current_minor: Minor version of the newest released CPython line (e.g.
-            14 when 3.14 is current). Defaults to `CURRENT_CPYTHON_MINOR`;
+            15 when 3.15 is current). Defaults to `CURRENT_CPYTHON_MINOR`;
             tests override it to stay independent of the runner interpreter.
 
     Returns:
-        `True` when only the next unreleased CPython minor and later are
-        excluded by the dependency's upper bound.
+        `True` when the dependency's upper bound excludes only a contiguous
+        suffix of unreleased CPython minors.
     """
+    if current_minor is None:
+        current_minor = CURRENT_CPYTHON_MINOR
     wheel_specifier = SpecifierSet(wheel_requires_python)
     dep_specifiers = tuple(
         SpecifierSet(constraint) for constraint in published_constraints if constraint
@@ -249,9 +251,10 @@ def _intersection_omits_only_unreleased_minors(
     )
     if missing[0][1] <= floor:
         return False
-    return missing[0][1] == first_unreleased and [
-        minor for minor in sorted(wheel_minors) if minor[1] >= first_unreleased
-    ] == missing
+    return (
+        missing[0][1] >= first_unreleased
+        and [minor for minor in sorted(wheel_minors) if minor >= missing[0]] == missing
+    )
 
 
 def _escape_command(value: object) -> str:
@@ -357,7 +360,7 @@ def release_python_version(package_name: str) -> str:
         Python minor version used for release artifact tests.
     """
     if package_name in {"deepagents-code", "deepagents-talon"}:
-        return "3.12"
+        return "3.14"
     return "3.11"
 
 
@@ -715,6 +718,32 @@ def _file_python_constraints(files: Sequence[object]) -> tuple[str, ...]:
     return tuple(constraints)
 
 
+def _python_constraints_equivalent(published: str, expected: str) -> bool:
+    """Whether two `Requires-Python` values admit the same current-major versions.
+
+    Sibling metadata is compared by the versions it admits rather than by its
+    spelling, so adding a redundant next-major ceiling (`>=3.11` vs.
+    `>=3.11,<4.0`) does not demand a sibling release. Every minor of the
+    expected constraint's major plus each boundary of either constraint is
+    probed, so any real narrowing or widening still produces a witness.
+    """
+    published_specifier = SpecifierSet(published)
+    expected_specifier = SpecifierSet(expected)
+    minimum = extract_minimum(expected_specifier)
+    if minimum is None:
+        return published_specifier == expected_specifier
+    major = minimum.release[0]
+    probes = {Version(f"{major}.{minor}") for minor in range(PYTHON_MINOR_PROBE_LIMIT)}
+    probes.update(_constraint_probe_versions(published))
+    probes.update(_constraint_probe_versions(expected))
+    return all(
+        published_specifier.contains(version, prereleases=True)
+        == expected_specifier.contains(version, prereleases=True)
+        for version in probes
+        if version.major == major
+    )
+
+
 def _python_constraints_match(
     constraints: Sequence[str],
     *,
@@ -723,16 +752,14 @@ def _python_constraints_match(
 ) -> bool:
     try:
         specifiers = tuple(SpecifierSet(constraint) for constraint in constraints)
-        expected = (
-            SpecifierSet(expected_constraint)
-            if expected_constraint is not None
-            else None
-        )
+        if not specifiers:
+            return False
+        if expected_constraint is not None and not all(
+            _python_constraints_equivalent(constraint, expected_constraint)
+            for constraint in constraints
+        ):
+            return False
     except InvalidSpecifier:
-        return False
-    if not specifiers:
-        return False
-    if expected is not None and any(specifier != expected for specifier in specifiers):
         return False
     return all(
         any(specifier.contains(version, prereleases=True) for specifier in specifiers)
@@ -807,7 +834,7 @@ def compare_wheel_with_pypi(
 
     A third-party dependency whose newest eligible release covers every existing
     CPython minor the wheel claims, but stops below a future minor (for example
-    `requires-python<3.15` against the wheel's `<4.0`), degrades to a warning:
+    `requires-python<3.16` against the wheel's `<4.0`), degrades to a warning:
     resolvers already refuse that extra on the unreleased interpreter, so the
     release is not blocked on another project widening its bound. Gaps at real
     installation targets (the wheel's minimum, any minor the dependency excludes

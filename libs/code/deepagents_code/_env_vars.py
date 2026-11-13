@@ -24,6 +24,10 @@ ever renamed, only the value here changes.
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 # ---------------------------------------------------------------------------
 # Constants — import these instead of bare string literals.
@@ -64,6 +68,22 @@ Resolved once per `dcode` start, so a change takes effect on the next launch.
 
 Like `AUTO_CLASSIFIER_MODEL`, a committed *project* `.env` cannot set it (see
 `config._PROJECT_DOTENV_DENIED_ENV_KEYS`).
+"""
+
+MCP_TOOL_TIMEOUT = "DEEPAGENTS_CODE_MCP_TOOL_TIMEOUT"
+"""Seconds an MCP tool call may run before returning a failed tool message.
+
+Values outside 1-900 seconds are ignored in favor of the next config source.
+Also settable via `[mcp].tool_timeout` in config.toml.
+"""
+
+ASK_ABOUT_SELECTION = "DEEPAGENTS_CODE_ASK_ABOUT_SELECTION"
+"""Show "Ask about this" when conversation text is selected.
+
+Enabled by default; set to a falsy value (`0`, `false`, `no`, `off`) to hide
+it. Parsed by `classify_env_bool` (an unrecognized or empty value falls through
+to the config value rather than forcing the default). Also settable via
+`[ui].ask_about_selection` in config.toml. `/reload` applies a change.
 """
 
 AUTO_UPDATE = "DEEPAGENTS_CODE_AUTO_UPDATE"
@@ -251,19 +271,35 @@ setting it (see `config._PROJECT_DOTENV_DENIED_ENV_KEYS`); only the user's
 shell, launch env, or global `~/.deepagents/.env` can.
 """
 
+FORKED_SUBAGENTS = "DEEPAGENTS_CODE_FORKED_SUBAGENTS"
+"""Whether dcode's built-in `general-purpose` subagent runs in fork mode.
+
+On by default. Set to a falsy value to make the subagent receive only the delegated
+task instead of inheriting the parent agent's conversation and state. Parsed by
+`is_env_truthy`; set this only through the launching shell or global
+`~/.deepagents/.env`, never a project `.env`.
+"""
+
 EXPERIMENTAL = "DEEPAGENTS_CODE_EXPERIMENTAL"
 """Opt into experimental, unstable dcode behavior.
 
 Off by default; parsed by `is_env_truthy` (see there for the accepted truthy
 values). Marks experimental runs in UI/trace metadata. Behavior behind this
 flag may change or be removed without notice.
+
+Set only through the launching shell or global `~/.deepagents/.env`; a project
+`.env` cannot set it.
 """
 
 EXTENSIONS = "DEEPAGENTS_CODE_EXTENSIONS"
 """Enable loading installed-plugin and trusted-project Python extensions."""
 
 EXTENSIONS_TRUST = "DEEPAGENTS_CODE_EXTENSIONS_TRUST"
-"""Default project extension trust policy: `ask`, `always`, or `never`."""
+"""Default project extension trust policy: `ask`, `always`, or `never`.
+
+Set only through the launching shell or global `~/.deepagents/.env`; a project
+`.env` cannot set it.
+"""
 
 EXTERNAL_EVENT_SOCKET = "DEEPAGENTS_CODE_EXTERNAL_EVENT_SOCKET"
 """Enable the local Unix-socket external event listener.
@@ -276,7 +312,21 @@ EXTERNAL_EVENT_SOCKET_PATH = "DEEPAGENTS_CODE_EXTERNAL_EVENT_SOCKET_PATH"
 """Override the default Unix-socket path for the external event listener."""
 
 EXTRA_SKILLS_DIRS = "DEEPAGENTS_CODE_EXTRA_SKILLS_DIRS"
-"""Colon-separated paths added to the skill containment allowlist."""
+"""Paths added to the skill containment allowlist, split with `os.pathsep`.
+
+Set only through the launching shell or global `~/.deepagents/.env`; a project
+`.env` cannot set it.
+"""
+
+GIT_ATTRIBUTION = "DEEPAGENTS_CODE_GIT_ATTRIBUTION"
+"""Toggle git attribution of LangSmith traces (defaults to on).
+
+When enabled and tracing is active, dcode runs bounded, read-only `git`
+inspections around tools that can change a checkout, so traces record the
+repository and branch the agent actually worked on. Set to a falsy value (`0`,
+`false`, `no`, `off`, or empty) to skip these inspections entirely, for example
+in very large repositories. Also configurable as `[tracing].git_attribution`.
+"""
 
 GOAL_AUTO_ACCEPT_CRITERIA = "DEEPAGENTS_CODE_GOAL_AUTO_ACCEPT_CRITERIA"
 """Apply generated goal criteria automatically in Auto mode.
@@ -308,6 +358,9 @@ HIDE_SPLASH_TIPS = "DEEPAGENTS_CODE_HIDE_SPLASH_TIPS"
 HIDE_SPLASH_VERSION = "DEEPAGENTS_CODE_HIDE_SPLASH_VERSION"
 """Hide version and local-install details in the splash screen when enabled."""
 
+IDLE_COMPACTION_TOKENS = "DEEPAGENTS_CODE_IDLE_COMPACTION_TOKENS"
+"""Minimum context tokens for opt-in idle compaction; 0 disables it."""
+
 HISTORY_RETENTION_DAYS = "DEEPAGENTS_CODE_HISTORY_RETENTION_DAYS"
 """Days an offloaded conversation-history archive is kept before the startup
 sweep deletes it.
@@ -336,6 +389,14 @@ KITTY_KEYBOARD = "DEEPAGENTS_CODE_KITTY_KEYBOARD"
 
 LANGSMITH_PROJECT = "DEEPAGENTS_CODE_LANGSMITH_PROJECT"
 """Override LangSmith project name for agent traces."""
+
+LANGSMITH_PROJECT_URL = "DEEPAGENTS_CODE_LANGSMITH_PROJECT_URL"
+"""LangSmith URL of the project named by `DEEPAGENTS_CODE_LANGSMITH_PROJECT`.
+
+When set, thread links and `/trace` use this URL instead of looking the project
+up, so the API key does not need project read access. It is ignored when the
+active project is a different one.
+"""
 
 LANGSMITH_REDACT = "DEEPAGENTS_CODE_LANGSMITH_REDACT"
 """Toggle LangSmith secret redaction for agent traces (defaults to on)."""
@@ -435,6 +496,9 @@ Set to a truthy value to bring the standalone integrations screen back into the
 flow. Parsed by `is_env_truthy`: accepts `1`, `true`, `yes`, `on` as enabled.
 """
 
+PROVIDER_TOOL_SEARCH = "DEEPAGENTS_CODE_PROVIDER_TOOL_SEARCH"
+"""Toggle native MCP tool discovery on verified endpoints (defaults to on)."""
+
 OPENAI_PROMPT_CACHE_KEY = "DEEPAGENTS_CODE_OPENAI_PROMPT_CACHE_KEY"
 """Toggle injecting a per-thread OpenAI `prompt_cache_key` (defaults to on).
 
@@ -462,6 +526,8 @@ PLUGIN_CACHE_DIR = "DEEPAGENTS_CODE_PLUGIN_CACHE_DIR"
 """Override the plugin install/marketplace cache root.
 
 When unset, plugins are stored under `DEFAULT_CONFIG_DIR / "plugins"`.
+Set only through the launching shell or global `~/.deepagents/.env`; a project
+`.env` cannot set it.
 """
 
 PRICES_AUTO_UPDATE = "DEEPAGENTS_CODE_PRICES_AUTO_UPDATE"
@@ -491,6 +557,13 @@ entirely, as defense-in-depth against a cloned repo whose `.env` carries
 hostile values the dotenv denylist does not yet enumerate. The global
 `~/.deepagents/.env` is unaffected. This is user-controlled process env, not a
 repo file, so a project `.env` cannot disable itself.
+"""
+
+RECENT_THREADS = "DEEPAGENTS_CODE_RECENT_THREADS"
+"""Recent threads per batch (default: 100, `_constants.DEFAULT_THREAD_LIMIT`).
+
+The thread switcher loads this many at a time. It is also the default row
+limit for `threads list` (override with `-n`) and `@@` thread completion.
 """
 
 RECURSION_LIMIT = "DEEPAGENTS_CODE_RECURSION_LIMIT"
@@ -534,7 +607,11 @@ SERVER_ENV_PREFIX = "DEEPAGENTS_CODE_SERVER_"
 """Environment variable prefix used to pass CLI config to the server subprocess."""
 
 SHELL_ALLOW_LIST = "DEEPAGENTS_CODE_SHELL_ALLOW_LIST"
-"""Comma-separated shell commands to allow (or 'recommended'/'all')."""
+"""Comma-separated shell commands to allow (or 'recommended'/'all').
+
+Set only through the launching shell or global `~/.deepagents/.env`; a project
+`.env` cannot set it.
+"""
 
 SHOW_HEADER = "DEEPAGENTS_CODE_SHOW_HEADER"
 """Show Textual's native header bar at the top of the TUI when enabled."""
@@ -560,11 +637,11 @@ across restarts.
 SHOW_REASONING = "DEEPAGENTS_CODE_SHOW_REASONING"
 """Show provider-visible reasoning in local TUI and headless output.
 
-Off by default; use `[ui].show_reasoning` in config.toml to persist it. Parsed
-by `classify_env_bool` (an unrecognized value falls through to the config value
+On by default in the TUI and off by default in headless (`-n`) mode. Set this
+or `[ui].show_reasoning` in config.toml to choose for both modes. Parsed by
+`classify_env_bool` (an unrecognized value falls through to the config value
 rather than forcing the default). A recognized value outranks the config value
-but loses to `--show-reasoning`, which is the only way to change the setting for
-a single run.
+but loses to `--show-reasoning`.
 """
 
 SHOW_SCROLLBAR = "DEEPAGENTS_CODE_SHOW_SCROLLBAR"
@@ -641,6 +718,9 @@ sequence regardless.
 THEME = "DEEPAGENTS_CODE_THEME"
 """Force the CLI to launch with this theme name when set."""
 
+UI_CHARSET_MODE = "DEEPAGENTS_CODE_UI_CHARSET_MODE"
+"""Terminal character-set mode (`auto`, `ascii`, or `unicode`)."""
+
 USER_ID = "DEEPAGENTS_CODE_USER_ID"
 """Attach a user identifier to LangSmith trace metadata."""
 
@@ -682,7 +762,12 @@ def classify_env_bool(raw: str) -> bool | None:
     return None
 
 
-def is_env_truthy(name: str, *, default: bool = False) -> bool:
+def is_env_truthy(
+    name: str,
+    *,
+    default: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
     """Return whether env var *name* is set to a recognizably truthy value.
 
     Unlike `bool(os.environ.get(name))`, this does not treat `"0"` or
@@ -694,12 +779,14 @@ def is_env_truthy(name: str, *, default: bool = False) -> bool:
             constant from this module).
         default: Value returned when the variable is unset OR set to a
             value that is neither recognizably truthy nor falsy.
+        environ: Environment to read, defaulting to the process environment.
+            Pass a workspace snapshot to keep the read scoped.
 
     Returns:
         `True` for `1`/`true`/`yes`/`on` (case-insensitive), `False` for
         `0`/`false`/`no`/`off`/empty string, or `default` otherwise.
     """
-    raw = os.environ.get(name)
+    raw = (os.environ if environ is None else environ).get(name)
     if raw is None:
         return default
     classified = classify_env_bool(raw)

@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NotRequired, Protocol, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from weakref import WeakValueDictionary
 
@@ -41,6 +41,7 @@ from deepagents_code._cli_context import (
     CLIContextSchema,
 )
 from deepagents_code.cost_tracking import CostState
+from deepagents_code.goal_state_notice import anchor_summarization_event
 from deepagents_code.hooks.models.domain import (
     CompactTrigger,
     HookEvent,
@@ -59,7 +60,7 @@ from deepagents_code.hooks.server_middleware import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 
     from deepagents.backends.composite import CompositeBackend
     from deepagents.backends.protocol import (
@@ -285,10 +286,12 @@ class _LazySummaryModel:
         summarization: SummarizationMiddleware,
         model_spec: str,
         cli_max_retries: int | None,
+        environ: Mapping[str, str] | None = None,
     ) -> None:
         self._summarization = summarization
         self._model_spec = model_spec
         self._cli_max_retries = cli_max_retries
+        self._environ = environ
         self._lock = Lock()
         self._invocation_lock = Lock()
         self._configured = False
@@ -319,10 +322,13 @@ class _LazySummaryModel:
             from deepagents_code.config import create_model
 
             try:
-                model = create_model(
-                    self._model_spec,
-                    cli_max_retries=self._cli_max_retries,
-                ).model
+                from deepagents_code.config import use_environment
+
+                with use_environment(self._environ):
+                    model = create_model(
+                        self._model_spec,
+                        cli_max_retries=self._cli_max_retries,
+                    ).model
             except Exception as exc:
                 # BlockingError means this ran on the server event loop; that is
                 # a defect in the caller, not a bad model spec, so let it out.
@@ -336,7 +342,7 @@ class _LazySummaryModel:
                     logger.warning(
                         "Could not build the summarization model %r; compaction "
                         "summaries use the main agent model instead. Run "
-                        "`/summarization-model clear` to stop trying it.",
+                        "`/offload model clear` to stop trying it.",
                         self._model_spec,
                         exc_info=True,
                     )
@@ -376,7 +382,7 @@ class _LazySummaryModel:
                 logger.warning(
                     "The summarization model %r failed to generate a summary; "
                     "compaction summaries use the main agent model instead. Run "
-                    "`/summarization-model clear` to stop trying it.",
+                    "`/offload model clear` to stop trying it.",
                     self._model_spec,
                     exc_info=exc,
                 )
@@ -440,6 +446,7 @@ def _install_lazy_summary_model(
     summarization: SummarizationMiddleware,
     model_spec: str,
     cli_max_retries: int | None,
+    environ: Mapping[str, str] | None = None,
 ) -> None:
     """Defer dedicated model construction until a summary is requested.
 
@@ -449,12 +456,13 @@ def _install_lazy_summary_model(
         summarization: Middleware whose summary hooks are wrapped.
         model_spec: Spec to resolve when a summary is first requested.
         cli_max_retries: Explicit `--max-retries` value, or `None`.
+        environ: Workspace environment retained for lazy model construction.
     """
     for slot in ("_create_summary", "_acreate_summary"):
         _require_helper_slot(
             summarization._lc_helper, slot, "defer summary-model construction"
         )
-    lazy = _LazySummaryModel(summarization, model_spec, cli_max_retries)
+    lazy = _LazySummaryModel(summarization, model_spec, cli_max_retries, environ)
     # LangChain annotates these private attributes as unbound method shapes;
     # instance-local bound wrappers are intentional so only this summarizer is lazy.
     summarization._lc_helper._create_summary = (  # ty: ignore[invalid-assignment]
@@ -479,13 +487,18 @@ class _OffloadState(CostState, SummarizationState, total=False):
     """
 
 
-type OffloadStatus = Literal["compacted", "empty", "noop", "denied", "failed"]
+type OffloadStatus = Literal[
+    "compacted", "summarized", "empty", "noop", "denied", "failed"
+]
 """Outcome of one offload attempt. Aliased so the result type and the private
 `_result` factory cannot drift apart."""
 
 
 class OffloadResult(TypedDict):
-    """Typed result emitted by the server-owned offload operation."""
+    """Typed result emitted by the server-owned offload operation.
+
+    Handoff message and token counts describe the unchanged source thread.
+    """
 
     status: OffloadStatus
     messages_offloaded: int
@@ -495,6 +508,8 @@ class OffloadResult(TypedDict):
     archive_path: str | None
     archive_ephemeral: bool
     error: str | None
+    summary: NotRequired[str]
+    """Summary text for a handoff; the source thread stays uncompacted."""
 
 
 class OffloadStateUpdate(TypedDict, total=False):
@@ -510,6 +525,7 @@ class OffloadStateUpdate(TypedDict, total=False):
     _summarization_event: dict[str, Any]
     _summarization_session_id: str
     _session_cost_usd: float
+    _session_cost_breakdown: dict[str, Any]
 
 
 class OffloadExecution(NamedTuple):
@@ -541,6 +557,7 @@ class _PendingArchive(NamedTuple):
     session_id: str
     summary: str
     state_cutoff: int
+    cutoff_message_id: str | None = None
 
     def update(self, file_path: str | None) -> dict[str, Any]:
         """Build the summary update with the archive's settled path.
@@ -554,6 +571,7 @@ class _PendingArchive(NamedTuple):
             file_path,
             self.state_cutoff,
             self.session_id,
+            cutoff_message_id=self.cutoff_message_id,
         )
 
     async def _previous_content(self, path: str) -> tuple[bool, str]:
@@ -814,6 +832,16 @@ class _HasRunContext(Protocol):
         ...
 
 
+def _runtime_cwd(runtime: _HasRunContext) -> Path:
+    """Return the bound workspace directory, or preserve the process fallback."""
+    context = CLIContextSchema.from_payload(runtime.context)
+    if context is not None:
+        cwd = context.workspace.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            return Path(cwd)
+    return Path.cwd()
+
+
 def _runtime_model_config(runtime: _HasRunContext) -> RuntimeModelConfig:
     """Read the active model configuration from a run context carrier.
 
@@ -1004,6 +1032,7 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
         system_prompt: str | None = None,
         cli_max_retries: int | None = None,
         summarization_model_spec: str | None = None,
+        environ: Mapping[str, str] | None = None,
     ) -> None:
         """Initialize the CLI compaction middleware.
 
@@ -1013,13 +1042,15 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
             cli_max_retries: Explicit `--max-retries` value to retain when
                 rebuilding a runtime-selected model for `/offload`.
             summarization_model_spec: Startup model spec to use only for summaries.
+            environ: Workspace environment retained for lazy model construction.
         """
         super().__init__(summarization, system_prompt=system_prompt)
         self._cli_max_retries = cli_max_retries
         self._summarization_model_spec = summarization_model_spec
+        self._environ = environ
         # One-entry memo for `_summarization_for_runtime`. Every model call
         # consults it, but the runtime model configuration only changes on
-        # `/model` or `/summarization-model`, so a single slot hits almost
+        # `/model` or `/offload model`, so a single slot hits almost
         # always and keeps `create_model`'s credential reads and client
         # construction off the per-turn path. It also lets one
         # `_LazySummaryModel` survive across compactions, which is what its
@@ -1058,7 +1089,7 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
         except RuntimeError:
             config = None
         decision = _invoke_hook(
-            _hook_context(runtime.context, config, Path.cwd()),
+            _hook_context(runtime.context, config, _runtime_cwd(runtime)),
             PreCompactEvent(event=HookEvent.PRE_COMPACT, trigger=CompactTrigger.AUTO),
             gate=gate,
             config=config,
@@ -1133,8 +1164,17 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
         Returns:
             The model response.
         """
-        call_model = partial(super().wrap_model_call, handler=handler)
+        original = request
+        call_model = partial(
+            super().wrap_model_call,
+            handler=lambda updated: handler(
+                updated.override(
+                    model=original.model, model_settings=original.model_settings
+                )
+            ),
+        )
         summarization = self._summarization_for_runtime(request.runtime)
+        request = self._summarization_request(request, summarization)
         prepared = self._auto_compaction_request(request, summarization)
         if prepared is not None:
             if not self._pre_auto_compact(prepared):
@@ -1191,10 +1231,19 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
         Returns:
             The model response.
         """
-        call_model = partial(super().awrap_model_call, handler=handler)
+        original = request
+        call_model = partial(
+            super().awrap_model_call,
+            handler=lambda updated: handler(
+                updated.override(
+                    model=original.model, model_settings=original.model_settings
+                )
+            ),
+        )
         summarization = await asyncio.to_thread(
             self._summarization_for_runtime, request.runtime
         )
+        request = self._summarization_request(request, summarization)
         prepared = self._auto_compaction_request(request, summarization)
         if prepared is not None:
             if not self._pre_auto_compact(prepared):
@@ -1299,6 +1348,23 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
             coroutine=async_compact,
         )
 
+    @staticmethod
+    def _summarization_request(
+        request: ModelRequest, summarization: SummarizationMiddleware
+    ) -> ModelRequest:
+        """Prepare selected-model budget checks without changing downstream selection.
+
+        Returns:
+            A request using the cached summarizer's main model and runtime settings.
+        """
+        config = _runtime_model_config(request.runtime)
+        if not config.model_spec:
+            return request
+        return request.override(
+            model=summarization.model,
+            model_settings={**request.model_settings, **config.model_params},
+        )
+
     def _summarization_for_runtime(
         self, runtime: _HasRunContext
     ) -> SummarizationMiddleware:
@@ -1342,12 +1408,15 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
         from deepagents_code.config import create_model
 
         if config.model_spec:
-            model = create_model(
-                config.model_spec,
-                extra_kwargs=config.model_params or None,
-                profile_overrides=config.profile_overrides or None,
-                cli_max_retries=self._cli_max_retries,
-            ).model
+            from deepagents_code.config import use_environment
+
+            with use_environment(self._environ):
+                model = create_model(
+                    config.model_spec,
+                    extra_kwargs=config.model_params or None,
+                    profile_overrides=config.profile_overrides or None,
+                    cli_max_retries=self._cli_max_retries,
+                ).model
         else:
             model = self._summarization.model
         # Only a freshly built model may have its profile mutated. On the
@@ -1369,7 +1438,7 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
                 )
                 try:
                     model.profile = merged  # ty: ignore[invalid-assignment]
-                except (AttributeError, TypeError, ValueError):
+                except AttributeError, TypeError, ValueError:
                     logger.warning(
                         "Could not apply runtime context limit %d to the offload "
                         "model profile; using its resolved profile",
@@ -1399,6 +1468,7 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
                 summarization,
                 summary_model_spec,
                 self._cli_max_retries,
+                self._environ,
             )
         else:
             _install_summary_model_retries(summarization)
@@ -1406,7 +1476,11 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
         return summarization
 
     async def _aplan_forced_compaction_update(
-        self, state: _OffloadState, runtime: _HasRunContext
+        self,
+        state: _OffloadState,
+        runtime: _HasRunContext,
+        *,
+        handoff: bool = False,
     ) -> _ForcedCompactionPlan | None:
         """Summarize forced-compaction history without writing its archive.
 
@@ -1419,6 +1493,8 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
         Args:
             state: Checkpointed conversation and prior summarization event.
             runtime: Run context carrier used to select the summarizer model.
+            handoff: Summarize every message, including the recent tail that
+                compaction normally keeps verbatim.
 
         Returns:
             The checkpoint/archive plan, or `None` when nothing can be compacted.
@@ -1431,12 +1507,16 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
             self._summarization_for_runtime, runtime
         )
         messages = state.get("messages", [])
-        event = state.get("_summarization_event")
+        event = anchor_summarization_event(state.get("_summarization_event"), messages)
         if not messages:
             msg = "Offload compaction requires checkpointed conversation messages."
             raise ValueError(msg)
         effective = summarization._apply_event_to_messages(messages, event)
-        cutoff = summarization._determine_cutoff_index(effective)
+        cutoff = (
+            len(effective)
+            if handoff
+            else summarization._determine_cutoff_index(effective)
+        )
         if cutoff == 0:
             return None
         # Resolved once and threaded into the update below: the SDK call is the
@@ -1455,14 +1535,21 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
             return None
         to_summarize, _ = summarization._partition_messages(effective, cutoff)
         summary = await summarization._acreate_summary(to_summarize)
-        session_id = summarization._get_session_id(state)
+        # Handoffs snapshot every checkpointed message without advancing the
+        # source cutoff. Appending to its compaction archive would repeat history.
+        # The server adds source-thread ownership before committing the snapshot.
+        session_id = uuid4().hex if handoff else summarization._get_session_id(state)
         archive = _PendingArchive(
             summarization,
             self._summarization._backend,
-            to_summarize,
+            # A handoff promises a complete recovery transcript even when an
+            # earlier compaction archive failed or was swept. The effective
+            # messages contain only its summary and the recent tail.
+            messages if handoff else to_summarize,
             session_id,
             summary,
             state_cutoff,
+            messages[state_cutoff].id if state_cutoff < len(messages) else None,
         )
         return _ForcedCompactionPlan(summarization, summary, state_cutoff, archive)
 
@@ -1513,6 +1600,8 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
         file_path: str | None,
         state_cutoff: int,
         session_id: str,
+        *,
+        cutoff_message_id: str | None = None,
     ) -> dict[str, Any]:
         """Build the state-only result used by the server `/offload` operation.
 
@@ -1534,6 +1623,8 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
                 `_summarization_session_id` (mirroring the SDK's compact and
                 auto-summarize paths) so a later offload appends to the same
                 archive instead of minting a fresh file.
+            cutoff_message_id: Id of the message at `state_cutoff`, so readers can
+                find the cutoff after earlier messages are removed.
 
         Returns:
             The summarization state update.
@@ -1563,6 +1654,7 @@ class CLICompactionMiddleware(SummarizationToolMiddleware):
                 # Absolute, not relative: a second `/offload` on the same thread
                 # reads this back as its base.
                 "cutoff_index": state_cutoff,
+                "cutoff_message_id": cutoff_message_id,
                 "summary_message": summary_message,
                 "file_path": file_path,
             },
@@ -1576,6 +1668,7 @@ def _create_cli_compaction_middleware(
     *,
     cli_max_retries: int | None = None,
     summarization_model_spec: str | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> CLICompactionMiddleware:
     """Create the dcode compaction middleware from the SDK configuration.
 
@@ -1584,6 +1677,7 @@ def _create_cli_compaction_middleware(
         backend: Agent backend used for archive persistence.
         cli_max_retries: Explicit `--max-retries` value for runtime rebuilds.
         summarization_model_spec: Startup model spec to use only for summaries.
+        environ: Workspace environment retained for lazy model construction.
 
     Returns:
         CLI compaction middleware with the SDK's model-aware defaults.
@@ -1595,6 +1689,7 @@ def _create_cli_compaction_middleware(
         system_prompt=sdk_middleware.system_prompt,
         cli_max_retries=cli_max_retries,
         summarization_model_spec=summarization_model_spec,
+        environ=environ,
     )
 
 
@@ -1752,8 +1847,16 @@ class OffloadOperation:
         self,
         state: _OffloadState,
         runtime: Runtime[CLIContextSchema],
+        *,
+        handoff: bool = False,
     ) -> OffloadExecution:
         """Run one offload against server-read checkpoint state.
+
+        Args:
+            state: Checkpointed conversation and prior summarization event.
+            runtime: Runtime context for hooks and the summarizer model.
+            handoff: Summarize every message for a new thread. The caller
+                commits only cost and the transcript, not the summary event.
 
         Returns:
             State update for the server to persist and the typed client result.
@@ -1764,7 +1867,7 @@ class OffloadOperation:
         from langchain_core.messages.utils import count_tokens_approximately
 
         messages = list(state.get("messages", []))
-        event = state.get("_summarization_event")
+        event = anchor_summarization_event(state.get("_summarization_event"), messages)
         effective = self._compaction._summarization._apply_event_to_messages(
             messages, event
         )
@@ -1786,7 +1889,7 @@ class OffloadOperation:
 
         try:
             plan = await self._compaction._aplan_forced_compaction_update(
-                state, runtime
+                state, runtime, handoff=handoff
             )
         except HookTransportInterruptError:
             raise
@@ -1808,6 +1911,17 @@ class OffloadOperation:
             )
             return OffloadExecution({}, result)
 
+        from deepagents_code.offload import offload_storage_is_ephemeral
+
+        if handoff:
+            result = self._result(
+                "summarized",
+                messages=max(0, len(messages) - _event_cutoff(event)),
+                tokens=tokens_before,
+            )
+            result["archive_ephemeral"] = offload_storage_is_ephemeral()
+            return OffloadExecution({}, result, plan.archive)
+
         update = plan.update(None)
         new_event = update["_summarization_event"]
         new_cutoff = _event_cutoff(new_event)
@@ -1816,8 +1930,6 @@ class OffloadOperation:
             messages, new_event
         )
         file_path = new_event.get("file_path")
-        from deepagents_code.offload import offload_storage_is_ephemeral
-
         result: OffloadResult = {
             "status": "compacted",
             "messages_offloaded": max(0, new_cutoff - prior_cutoff),

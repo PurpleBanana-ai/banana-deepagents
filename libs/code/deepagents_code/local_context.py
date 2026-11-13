@@ -14,6 +14,8 @@ import html
 import inspect
 import json
 import logging
+import threading
+from collections import OrderedDict
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -39,6 +41,7 @@ from deepagents_code._constants import (
     LOCAL_CONTEXT_MESSAGE_SOURCE,
     SYSTEM_MESSAGE_PREFIX,
 )
+from deepagents_code.goal_state_notice import anchor_summarization_event
 from deepagents_code.unicode_security import sanitize_control_chars
 
 if TYPE_CHECKING:
@@ -62,6 +65,15 @@ _MCP_ERROR_DETAIL_LIMIT = 200
 
 _TRACING_PROJECT_NAME_LIMIT = 200
 """Max characters of a LangSmith project name surfaced in the system prompt."""
+
+_FORKED_CONTEXT_KEY = "_deepagents_forked_context"
+"""State key the SDK sets on a forked subagent's initial state.
+
+Mirrors `deepagents.middleware.subagents._FORKED_CONTEXT_KEY`.
+"""
+
+_SNAPSHOT_CACHE_SIZE = 32
+"""Max threads whose parent snapshot is kept for forked subagents."""
 
 
 def _sanitize_error_detail(error: str | None) -> str:
@@ -410,7 +422,21 @@ def _section_git() -> str:
     """
     return r"""# --- Git ---
 if $IN_GIT; then
-  BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  if STATUS="$(git status --porcelain=v2 --branch --no-ahead-behind 2>/dev/null)"; then
+    SUMMARY=$(awk '
+      /^# branch.head / { branch = substr($0, 15) }
+      /^[12u?] / { changes++ }
+      END { print branch; print changes + 0 }
+    ' <<< "$STATUS")
+    BRANCH="${SUMMARY%%$'\n'*}"
+    DC="${SUMMARY##*$'\n'}"
+    if [ "$BRANCH" = "(detached)" ]; then
+      BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    fi
+  else
+    BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    DC=$(git status --porcelain 2>/dev/null | awk 'END { print NR }')
+  fi
   if [ "$BRANCH" = "HEAD" ]; then
     COMMIT="$(git rev-parse --short HEAD 2>/dev/null)"
     GT="**Git**: Detached HEAD at \`${COMMIT}\`"
@@ -428,7 +454,6 @@ if $IN_GIT; then
   done
   [ -n "$MAINS" ] && GT="${GT}, ${MAINS} available"
 
-  DC=$(git status --porcelain 2>/dev/null | awk 'END { print NR }')
   if [ "$DC" -gt 0 ]; then
     if [ "$DC" -eq 1 ]; then GT="${GT}, 1 uncommitted change"
     else GT="${GT}, ${DC} uncommitted changes"
@@ -494,6 +519,25 @@ if command -v gh >/dev/null 2>&1; then
       *) echo "- \`gh search prs --json\` does not expose \`mergedAt\`;"
          echo "  use \`gh pr view --json mergedAt\` per PR for merge timestamps." ;;
     esac
+    echo ""
+  fi
+fi"""
+
+
+def _section_gh_stack() -> str:
+    """Best-effort local state from the optional `gh-stack` extension.
+
+    Returns:
+        Bash snippet (standalone).
+    """
+    return r"""# --- Local GitHub stack ---
+if command -v git >/dev/null 2>&1; then
+  _STACK_GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)"
+  _STACK_FILE="${_STACK_GIT_DIR}/gh-stack"
+  if [ -n "$_STACK_GIT_DIR" ] && [ -s "$_STACK_FILE" ]; then
+    echo "**GitHub Stack** (local tracking; may be stale):"
+    head -c 8192 "$_STACK_FILE"
+    echo ""
     echo ""
   fi
 fi"""
@@ -645,10 +689,11 @@ def build_detect_script() -> str:
         ("03_runtimes", _section_runtimes()),
         ("04_git", _section_git()),
         ("05_gh_cli", _section_gh_cli()),
-        ("06_testcmd", _section_test_command()),
-        ("07_files", _section_files()),
-        ("08_tree", _section_tree()),
-        ("09_makefile", _section_makefile()),
+        ("06_gh_stack", _section_gh_stack()),
+        ("07_testcmd", _section_test_command()),
+        ("08_files", _section_files()),
+        ("09_tree", _section_tree()),
+        ("10_makefile", _section_makefile()),
     ]
 
     # Build parallel wrapper: each section runs in a subshell writing to a
@@ -688,6 +733,12 @@ class LocalContextState(AgentState):
 
     _latest_local_context_fingerprint: NotRequired[Annotated[str, PrivateStateAttr]]
     """Fingerprint of the latest context used to deduplicate refresh messages."""
+
+
+def _thread_id(runtime: Runtime) -> str | None:
+    """Return the current thread ID, or `None` without a checkpointer."""
+    info = getattr(runtime, "execution_info", None)
+    return getattr(info, "thread_id", None)
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +787,56 @@ class LocalContextMiddleware(AgentMiddleware):
         self._static_context = "\n\n".join(
             context for context in (tracing_context, mcp_context) if context
         )
+        # Forked subagents reuse this middleware instance but cannot see the
+        # parent's private `_local_context`, so keep the parent's snapshot here.
+        self._snapshots: OrderedDict[str, str] = OrderedDict()
+        self._snapshots_lock = threading.Lock()
+
+    def _remember_snapshot(
+        self, state: LocalContextState, runtime: Runtime, context: str | None
+    ) -> None:
+        """Record the parent agent's snapshot for forks on the same thread."""
+        thread_id = _thread_id(runtime)
+        if not context or thread_id is None or state.get(_FORKED_CONTEXT_KEY):
+            return
+        with self._snapshots_lock:
+            self._snapshots[thread_id] = context
+            self._snapshots.move_to_end(thread_id)
+            while len(self._snapshots) > _SNAPSHOT_CACHE_SIZE:
+                self._snapshots.popitem(last=False)
+
+    def _inherited_snapshot(
+        self, state: LocalContextState, runtime: Runtime
+    ) -> str | None:
+        """Return the parent's snapshot when running as a forked subagent.
+
+        Reusing it skips the detection script and keeps the fork's system
+        prompt byte-identical to the parent's, so the fork can reuse the
+        parent's prompt cache.
+        """
+        thread_id = _thread_id(runtime)
+        if thread_id is None or not state.get(_FORKED_CONTEXT_KEY):
+            return None
+        with self._snapshots_lock:
+            return self._snapshots.get(thread_id)
+
+    def _initial_update(
+        self, state: LocalContextState, runtime: Runtime, output: str | None
+    ) -> dict[str, Any] | None:
+        """Build the state update for a first-time capture.
+
+        Returns:
+            Private context and its fingerprint, or `None` without output.
+        """
+        if not output:
+            return None
+        self._remember_snapshot(state, runtime, output)
+        return {
+            "_local_context": output,
+            "_latest_local_context_fingerprint": hashlib.sha256(
+                output.encode()
+            ).hexdigest(),
+        }
 
     @staticmethod
     def _handle_detect_result(result: ExecuteResponse) -> str | None:
@@ -857,9 +958,9 @@ class LocalContextMiddleware(AgentMiddleware):
         raw_event = state.get("_summarization_event")
         if raw_event is None:
             return None
-        event: SummarizationEvent = raw_event
-        cutoff = event.get("cutoff_index")
         messages = state.get("messages", [])
+        event: SummarizationEvent = anchor_summarization_event(raw_event, messages)
+        cutoff = event.get("cutoff_index")
         if (
             not isinstance(cutoff, int)
             or isinstance(cutoff, bool)
@@ -876,9 +977,12 @@ class LocalContextMiddleware(AgentMiddleware):
     def before_agent(  # ty: ignore[invalid-method-override]
         self,
         state: LocalContextState,
-        runtime: Runtime,  # noqa: ARG002  # Required by interface but not used in local context
+        runtime: Runtime,
     ) -> dict[str, Any] | None:
         """Capture initial context or append a changed post-summary snapshot.
+
+        A forked subagent reuses the parent's snapshot instead of running
+        the detection script.
 
         Args:
             state: Current agent state.
@@ -887,20 +991,16 @@ class LocalContextMiddleware(AgentMiddleware):
         Returns:
             Initial private context, a post-summary refresh update, or `None`.
         """
+        self._remember_snapshot(state, runtime, state.get("_local_context"))
         cutoff = self._pending_refresh_cutoff(state)
         if cutoff is not None:
             return self._refresh_update(state, self._run_detect_script(), cutoff)
         if state.get("_local_context"):
             return None
-        output = self._run_detect_script()
-        if output:
-            return {
-                "_local_context": output,
-                "_latest_local_context_fingerprint": hashlib.sha256(
-                    output.encode()
-                ).hexdigest(),
-            }
-        return None
+        output = self._inherited_snapshot(state, runtime)
+        if output is None:
+            output = self._run_detect_script()
+        return self._initial_update(state, runtime, output)
 
     async def _arun_detect_script(self) -> str | None:
         """Run the environment detection script asynchronously.
@@ -945,9 +1045,12 @@ class LocalContextMiddleware(AgentMiddleware):
     async def abefore_agent(  # ty: ignore[invalid-method-override]
         self,
         state: LocalContextState,
-        runtime: Runtime,  # noqa: ARG002  # Required by interface but not used in local context
+        runtime: Runtime,
     ) -> dict[str, Any] | None:
         """Capture initial context or append an async post-summary refresh.
+
+        A forked subagent reuses the parent's snapshot instead of running
+        the detection script.
 
         Args:
             state: Current agent state.
@@ -956,21 +1059,17 @@ class LocalContextMiddleware(AgentMiddleware):
         Returns:
             Initial private context, a post-summary refresh update, or `None`.
         """
+        self._remember_snapshot(state, runtime, state.get("_local_context"))
         cutoff = self._pending_refresh_cutoff(state)
         if cutoff is not None:
             output = await self._arun_detect_script()
             return self._refresh_update(state, output, cutoff)
         if state.get("_local_context"):
             return None
-        output = await self._arun_detect_script()
-        if output:
-            return {
-                "_local_context": output,
-                "_latest_local_context_fingerprint": hashlib.sha256(
-                    output.encode()
-                ).hexdigest(),
-            }
-        return None
+        output = self._inherited_snapshot(state, runtime)
+        if output is None:
+            output = await self._arun_detect_script()
+        return self._initial_update(state, runtime, output)
 
     def _get_modified_request(self, request: ModelRequest) -> ModelRequest | None:
         """Append local context and MCP info to the system prompt if available.

@@ -9,11 +9,13 @@ import contextvars
 import mimetypes
 import threading
 import uuid
+import warnings
 from binascii import Error as BinasciiError
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from copy import copy
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, NotRequired, cast
+from typing import Annotated, Any, Final, Literal, NotRequired, cast
 
 import wcmatch.glob as wcglob
 from langchain.agents.middleware.types import (
@@ -23,20 +25,24 @@ from langchain.agents.middleware.types import (
     ExtendedModelResponse,
     ModelRequest,
     ModelResponse,
+    PrivateStateAttr,
     ResponseT,
     TracePolicy,
     omit_payload,
 )
 from langchain.tools import ToolRuntime
 from langchain.tools.tool_node import ToolCallRequest
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, ToolMessage
+from langchain_core.exceptions import ModelInvalidRequestError
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, ToolMessage, add_notification_metadata
 from langchain_core.messages.content import ContentBlock
 from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.channels.delta import DeltaChannel
+from langgraph.channels.untracked_value import UntrackedValue
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from deepagents._api.deprecation import warn_deprecated
 from deepagents.backends import CompositeBackend, FilesystemBackend, LocalShellBackend, StateBackend
 from deepagents.backends.composite import _route_for_path
 from deepagents.backends.protocol import (
@@ -68,23 +74,37 @@ from deepagents.backends.utils import (
     _VIDEO_EXTRA_EXTENSIONS,
     MAX_VIDEO_INPUT_BYTES,
     FileType,
+    _format_source_block,
     _get_file_type,
     _glob_anchor,
     _paths_overlap,
     check_empty_content,
-    format_content_with_line_numbers,
     format_grep_matches,
     regex_literal_hint,
     sanitize_tool_call_id as sanitize_tool_call_id,
+    to_posix_path,
     truncate_if_too_long,
     validate_path,
 )
+from deepagents.middleware._blob_offload import (
+    _BLOB_PAYLOADS_KEY,
+    _ahydrate_messages,
+    _aoffload_history_messages,
+    _aoffload_tool_result,
+    _hydrate_messages,
+    _offload_history_messages,
+    _offload_tool_result,
+    _tool_blob_store,
+)
 from deepagents.middleware._message_eviction import (
-    TOO_LARGE_TOOL_MSG as TOO_LARGE_TOOL_MSG,
+    _TOO_LARGE_TOOL_MSG,
+    ContentPreview,
     _aoffload_tool_message_content,
     _create_content_preview,
     _extract_text_from_message,
     _offload_tool_message_content,
+    _render_preview_stub,
+    _visible_tool_call_id,
 )
 from deepagents.middleware._utils import append_to_system_message
 from deepagents.middleware._video import (
@@ -93,26 +113,53 @@ from deepagents.middleware._video import (
     video_dependencies_available,
 )
 
-# `ChatOpenAI`, `AzureChatOpenAI`, and `ChatGoogleGenerativeAI` accept non-PDF
-# `file` blocks such as `.docx` and `.pptx`. `ModelProfile` only encodes PDF
-# support today, so these providers get a hard-coded pass until profiles can
-# describe support for other office and document formats.
-try:
-    from langchain_openai import AzureChatOpenAI as _AzureChatOpenAI, ChatOpenAI as _ChatOpenAI
-except ImportError:
-    _OPENAI_FILE_MODEL_TYPES: tuple[type[Any], ...] = ()
-else:
-    _OPENAI_FILE_MODEL_TYPES = (_AzureChatOpenAI, _ChatOpenAI)
+_LEGACY_TOO_LARGE_TOOL_MSG: Final = """Tool result too large, the result of this tool call {tool_call_id} was saved in the filesystem at this path: {file_path}
 
-try:
-    from langchain_google_genai import ChatGoogleGenerativeAI as _ChatGoogleGenerativeAI
-except ImportError:
-    _GOOGLE_FILE_MODEL_TYPES: tuple[type[Any], ...] = ()
-else:
-    _GOOGLE_FILE_MODEL_TYPES = (_ChatGoogleGenerativeAI,)
+You can read the result from the filesystem by using the read_file tool, but make sure to only read part of the result at a time.
 
-if TYPE_CHECKING:
-    from langchain.chat_models import BaseChatModel
+You can do this by specifying an offset and limit in the read_file tool call. For example, to read the first 100 lines, you can use the read_file tool with offset=0 and limit=100.
+
+Here is a preview showing the head and tail of the result (lines of the form `... [N lines truncated] ...` indicate omitted lines in the middle of the content):
+
+{content_sample}
+"""
+"""Legacy `TOO_LARGE_TOOL_MSG` value available until `deepagents==0.9.0`."""
+
+_LEGACY_TOO_LARGE_HUMAN_MSG: Final = """Message content too large and was saved to the filesystem at: {file_path}
+
+You can read the full content using the read_file tool with pagination (offset and limit parameters).
+
+Here is a preview showing the head and tail of the content:
+
+{content_sample}
+"""
+"""Legacy `TOO_LARGE_HUMAN_MSG` value available until `deepagents==0.9.0`."""
+
+_LEGACY_LARGE_RESULT_TEMPLATES: Final = {
+    "TOO_LARGE_TOOL_MSG": _LEGACY_TOO_LARGE_TOOL_MSG,
+    "TOO_LARGE_HUMAN_MSG": _LEGACY_TOO_LARGE_HUMAN_MSG,
+}
+
+
+def __getattr__(name: str) -> str:
+    """Provide deprecated compatibility access to legacy prompt templates."""
+    if (template := _LEGACY_LARGE_RESULT_TEMPLATES.get(name)) is not None:
+        warn_deprecated(
+            since="0.7.7",
+            removal="0.9.0",
+            message=(
+                f"`{name}` was deprecated in `deepagents==0.7.7` and will be removed in "
+                "`deepagents==0.9.0`. Large-result prompt templates are internal "
+                "implementation details and should not be imported. This frozen copy "
+                "keeps the released wording; the live template now derives its preview "
+                "note from what the preview actually elided."
+            ),
+            package="deepagents",
+        )
+        return template
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)
+
 
 _FS_WCMATCH_FLAGS = wcglob.BRACE | wcglob.GLOBSTAR
 """wcmatch flags enabling brace expansion and `**` globstar recursion."""
@@ -134,25 +181,53 @@ _DEFAULT_FS_TOOL_OPS: dict[str, FilesystemOperation] = {
 }
 """Default mapping from filesystem tool name to its operation category."""
 
+_FILE_MUTATION_TOOLS: Final = frozenset({"write_file", "edit_file", "delete"})
+
 _READ_FILE_MEDIA_RESULT: Final = "read_file_media_result"
 """`additional_kwargs` key marking synthetic `HumanMessage` media from `read_file`."""
+
+_READ_FILE_MEDIA_SOURCE: Final = "read_file_media"
+"""`lc_source` of the synthetic `HumanMessage` carrying `read_file` media."""
 
 _VIDEO_SAMPLING_RATE: Final = 0.5
 """Seconds between sampled frames when extracting stills from a video."""
 
 _MULTIMODAL_BLOCK_TYPES: Final = frozenset(_EXTENSION_TO_FILE_TYPE.values())
-"""Content block types `read_file` may emit that require multimodal model support.
-
-Derived from `_EXTENSION_TO_FILE_TYPE`'s values (`"text"` never appears there,
-since it's `_get_file_type`'s default for unmapped extensions).
-"""
-
-_PDF_MIME_TYPE: Final = "application/pdf"
+"""Content block types `read_file` may emit that require multimodal model support."""
 
 
 def _tool_error(name: str, tool_call_id: str | None, content: str) -> ToolMessage:
     """Build a `ToolMessage` carrying a plain text error."""
     return ToolMessage(content=content, name=name, tool_call_id=tool_call_id, status="error")
+
+
+def _parallel_file_mutation_error(request: ToolCallRequest) -> ToolMessage | None:
+    """Reject later same-path file mutations in one model response."""
+    tool_call = request.tool_call
+    if tool_call["name"] not in _FILE_MUTATION_TOOLS:
+        return None
+    path = tool_call["args"].get("file_path")
+    if not isinstance(path, str):
+        return None
+    try:
+        file_path = validate_path(path)
+    except ValueError:
+        return None
+    messages = request.state.get("messages") if isinstance(request.state, Mapping) else None
+    ai_message = next((message for message in reversed(messages or []) if isinstance(message, AIMessage)), None)
+    for call in ai_message.tool_calls if ai_message else []:
+        if call["id"] == tool_call["id"]:
+            return None
+        path = call["args"].get("file_path")
+        if call["name"] not in _FILE_MUTATION_TOOLS or not isinstance(path, str):
+            continue
+        try:
+            duplicate = validate_path(path) == file_path
+        except ValueError:
+            continue
+        if duplicate:
+            return _tool_error(tool_call["name"], tool_call["id"], "Error: parallel file mutations to the same path are not allowed.")
+    return None
 
 
 def _is_read_file_media_result(message: AnyMessage) -> bool:
@@ -191,107 +266,17 @@ def _move_media_results_after_tool_results(messages: list[AnyMessage]) -> list[A
     return reordered
 
 
-_PROFILE_FIELD_BY_BLOCK_TYPE: Final = {"image": "image_inputs", "audio": "audio_inputs", "video": "video_inputs", "file": "pdf_inputs"}
-"""`ModelProfile` field gating each block type. `file` only applies to PDF `mime_type`; other
-file types have no field yet and are handled separately via provider class checks."""
-
-_TOOL_MESSAGE_FIELD_BY_BLOCK_TYPE: Final = {"image": "image_tool_message", "file": "pdf_tool_message"}
-"""Extra `ModelProfile` field that can gate a block type specifically within a `ToolMessage`."""
-
-
-def _model_tolerates_non_pdf_files(model: "BaseChatModel | None") -> bool:
-    """Whether `model` is a provider class known to accept non-PDF `file` blocks."""
-    return isinstance(model, _OPENAI_FILE_MODEL_TYPES + _GOOGLE_FILE_MODEL_TYPES)
-
-
-def _multimodal_block_supported(
-    block: ContentBlock,
-    *,
-    profile: Mapping[str, Any],
-    tolerates_non_pdf_files: bool,
-    in_tool_message: bool,
-) -> bool:
-    """Check whether `profile` (plus the hard-coded provider exception) accepts `block`.
-
-    Missing `ModelProfile` fields default to supported, since profile coverage is
-    incomplete. Only an explicit `False` rejects a block type.
-    """
-    block_type = block["type"]
-    if block_type == "file" and "base64" not in block:
-        # URL-/file-ID-backed file references are provider-managed and often don't
-        # include a `mime_type`, so leave them untouched.
-        return True
-    if block_type == "file" and block.get("mime_type") != _PDF_MIME_TYPE:
-        # Non-PDF base64 `file` blocks (`.docx`, `.pptx`, ...) aren't described
-        # by any `ModelProfile` field yet; only the hard-coded tolerant
-        # providers pass.
-        return tolerates_non_pdf_files
-
-    field = _PROFILE_FIELD_BY_BLOCK_TYPE.get(block_type)
-    if field is None:
-        return True
-    if in_tool_message:
-        tool_field = _TOOL_MESSAGE_FIELD_BY_BLOCK_TYPE.get(block_type)
-        if tool_field and profile.get(tool_field) is False:
-            return False
-    return profile.get(field) is not False
-
-
-def _unsupported_multimodal_placeholder(block: ContentBlock, message: AnyMessage) -> ContentBlock:
-    """Build the text block replacing a multimodal block the model can't accept."""
-    mime_type = block.get("mime_type", "unknown")
-    path = message.additional_kwargs.get("read_file_path", "the requested file")
-    return cast(
-        "ContentBlock",
-        {
-            "type": "text",
-            "text": f"[read_file: {path} was not attached because this model does not support {block['type']} content ({mime_type}).]",
-        },
-    )
-
-
-def _scrub_message_multimodal_content(message: AnyMessage, *, profile: Mapping[str, Any], tolerates_non_pdf_files: bool) -> AnyMessage:
-    """Return `message` unchanged, or a copy with unsupported blocks replaced by placeholders."""
-    if not isinstance(message, (ToolMessage, HumanMessage)):
-        return message
-
-    in_tool_message = isinstance(message, ToolMessage)
-    blocks = message.content_blocks
-    new_blocks = [
-        block
-        if block["type"] not in _MULTIMODAL_BLOCK_TYPES
-        or _multimodal_block_supported(block, profile=profile, tolerates_non_pdf_files=tolerates_non_pdf_files, in_tool_message=in_tool_message)
-        else _unsupported_multimodal_placeholder(block, message)
-        for block in blocks
+def _replace_rejected_file_content(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """Replace only multimodal reads since the latest model response."""
+    last_response = next((index for index in range(len(messages) - 1, -1, -1) if isinstance(messages[index], AIMessage)), -1)
+    return [
+        message.model_copy(update={"content": "Unsupported content. The file may be invalid, too large, or of an unsupported mime-type."})
+        if index > last_response
+        and (_is_read_file_media_result(message) or (isinstance(message, ToolMessage) and message.name == "read_file"))
+        and any(block["type"] in _MULTIMODAL_BLOCK_TYPES for block in message.content_blocks)
+        else message
+        for index, message in enumerate(messages)
     ]
-    if new_blocks == blocks:
-        return message
-    return message.model_copy(update={"content": new_blocks})
-
-
-def _scrub_unsupported_multimodal_content(messages: list[AnyMessage], model: "BaseChatModel | None") -> list[AnyMessage]:
-    """Replace multimodal content blocks `model.profile` marks unsupported.
-
-    Some providers return a non-retryable 400 when sent a content block they
-    don't support (e.g. a `file` block whose `mime_type` isn't
-    `application/pdf`, produced when `read_file` reads a `.docx`), which would
-    otherwise end the thread. Swapping the unsupported block for a text
-    placeholder here before the request reaches the model.
-
-    A `model` with no `profile` (including `None` `model`, e.g. in tests) is
-    treated as an empty profile rather than skipped: `ModelProfile` is often
-    absent for models `langchain_anthropic` doesn't have a static entry for
-    (e.g. `ChatAnthropic(model="claude-3-5-sonnet-latest")`), and the
-    provider-based non-PDF `file` gate doesn't depend on profile data at all —
-    skipping the whole scrub in that case would silently leave the exact
-    `.docx`-on-Anthropic bug this fixes unfixed for those models. An empty
-    profile still defaults every per-field check to "supported."
-    """
-    profile = model.profile if model is not None else None
-    if not isinstance(profile, dict):
-        profile = {}
-    tolerates_non_pdf_files = _model_tolerates_non_pdf_files(model)
-    return [_scrub_message_multimodal_content(message, profile=profile, tolerates_non_pdf_files=tolerates_non_pdf_files) for message in messages]
 
 
 def _handle_video_read(
@@ -349,13 +334,17 @@ def _handle_video_read(
         additional_kwargs={"read_file_path": validated_path, "read_file_frame_count": frame_count},
         status="success",
     )
-    media_message = HumanMessage(
-        content_blocks=blocks,
-        additional_kwargs={
-            _READ_FILE_MEDIA_RESULT: True,
-            "read_file_path": validated_path,
-            "read_file_tool_call_id": tool_call_id,
-        },
+    media_message = add_notification_metadata(
+        HumanMessage(
+            content_blocks=blocks,
+            additional_kwargs={
+                _READ_FILE_MEDIA_RESULT: True,
+                "read_file_path": validated_path,
+                "read_file_tool_call_id": tool_call_id,
+            },
+        ),
+        source=_READ_FILE_MEDIA_SOURCE,
+        data={"path": validated_path, "tool_call_id": tool_call_id},
     )
     return Command(
         update={
@@ -385,7 +374,12 @@ def _get_read_file_type(path: str, *, video_enabled: bool) -> FileType:
 
 @dataclass
 class FilesystemPermission:
-    """A single access rule for filesystem operations."""
+    """A single access rule for filesystem operations.
+
+    With `FilesystemBackend` (directly or behind a `CompositeBackend` route),
+    rules are matched against both the requested path and its symlink-resolved
+    target; a deny on either blocks the call.
+    """
 
     operations: list[FilesystemOperation]
     paths: list[str]
@@ -431,6 +425,129 @@ def _check_fs_permission(
         if any(wcglob.globmatch(path, pattern, flags=_FS_WCMATCH_FLAGS) for pattern in rule.paths):
             return rule.mode
     return "allow"
+
+
+def _resolve_real_path(backend: BackendProtocol, path: str) -> str:
+    """Resolve `path` through symlinks for backends on a real filesystem, and re-validate it.
+
+    Other backends have no path aliasing, so `path` is returned unchanged.
+    """
+    if isinstance(backend, CompositeBackend):
+        routed, routed_path, route_prefix = _route_for_path(default=backend.default, sorted_routes=backend.sorted_routes, path=path)
+        resolved = _resolve_real_path(routed, routed_path)
+        return resolved if route_prefix is None else validate_path(route_prefix.rstrip("/") + resolved)
+    if isinstance(backend, FilesystemBackend):
+        return validate_path(backend._real_path(path))
+    return path
+
+
+def _permission_error(
+    rules: list[FilesystemPermission],
+    operation: FilesystemOperation,
+    backend: BackendProtocol,
+    validated_path: str,
+) -> str | None:
+    """Return an error if `validated_path` or its resolved target is denied, or it can't be resolved."""
+    if _check_fs_permission(rules, operation, validated_path) == "deny":
+        return f"Error: permission denied for {operation} on {validated_path}"
+    return _resolved_permission_error(rules, operation, backend, validated_path)
+
+
+def _resolved_permission_error(
+    rules: list[FilesystemPermission],
+    operation: FilesystemOperation,
+    backend: BackendProtocol,
+    validated_path: str,
+) -> str | None:
+    """Return an error if `validated_path`'s resolved target is denied, or it can't be resolved."""
+    if not rules:
+        return None
+    try:
+        real = _resolve_real_path(backend, validated_path)
+    except (ValueError, OSError, RuntimeError):
+        return f"Error: cannot resolve {validated_path}"
+    if real != validated_path and _check_fs_permission(rules, operation, real) == "deny":
+        return f"Error: permission denied for {operation} on {validated_path} (resolves to {real})"
+    return None
+
+
+def _delete_permission_error(
+    rules: list[FilesystemPermission],
+    backend: BackendProtocol,
+    validated_path: str,
+    *,
+    has_descendants: bool,
+) -> str | None:
+    """Return an error if deleting `validated_path` would remove a denied target.
+
+    The full resolved path is checked too, including a symlink leaf.
+    """
+    if denying_patterns := _find_delete_deny_patterns(rules, validated_path, has_descendants=has_descendants):
+        return f"Error: permission denied for write on {validated_path} (matches deny rule(s): {', '.join(denying_patterns)})"
+    if not rules:
+        return None
+    try:
+        real = _resolve_real_path(backend, validated_path)
+    except (ValueError, OSError, RuntimeError):
+        return f"Error: cannot resolve {validated_path}"
+    if real != validated_path and _find_delete_deny_patterns(rules, real, has_descendants=has_descendants):
+        return f"Error: permission denied for write on {validated_path} (resolves to {real})"
+    return None
+
+
+def _is_denied(
+    rules: list[FilesystemPermission],
+    operation: FilesystemOperation,
+    path: str,
+    backend: BackendProtocol | None,
+    scope: list[str] | None = None,
+) -> bool:
+    """Whether `path` or, when `backend` is given, its resolved target is denied.
+
+    Paths the backend cannot resolve count as denied. With `scope`, so does a
+    path or target that needs approval outside every root in `scope`.
+    """
+    if _check_fs_permission(rules, operation, path) == "deny":
+        return True
+    candidates = [path]
+    if backend is not None:
+        try:
+            real = _resolve_real_path(backend, path)
+        except (ValueError, OSError, RuntimeError):
+            return True
+        candidates += [real.rstrip("/") + "/", real] if path.endswith("/") else [real]
+    if any(_check_fs_permission(rules, operation, p) == "deny" for p in candidates[1:]):
+        return True
+    return scope is not None and any(
+        _check_fs_permission(rules, operation, p) == "interrupt" and not any(PurePosixPath(p).is_relative_to(root) for root in scope)
+        for p in candidates
+    )
+
+
+def _bulk_scope(
+    rules: list[FilesystemPermission],
+    backend: BackendProtocol,
+    path: str,
+    pattern: str | None = None,
+) -> list[str] | None:
+    """Return the roots a bulk call's `interrupt` decision covered, or `None` without `interrupt` rules.
+
+    The roots are `path` and its resolved target. A `glob` pattern can reach
+    outside `path`: an absolute one adds its anchor, one that climbs with `..`
+    adds `/`. Results reached through a symlink can resolve outside them.
+    """
+    if not any(rule.mode == "interrupt" and "read" in rule.operations for rule in rules):
+        return None
+    scope = [path]
+    with contextlib.suppress(ValueError, OSError, RuntimeError):
+        scope.append(_resolve_real_path(backend, path))
+    if pattern is not None:
+        posix_pattern = to_posix_path(pattern)
+        if posix_pattern.startswith("/"):
+            scope.append(_glob_anchor(pattern))
+        elif ".." in PurePosixPath(posix_pattern).parts:
+            scope.append("/")
+    return scope
 
 
 def _wildcard_delete_overlap(pattern: str, anchor: str, target: str) -> bool:
@@ -624,6 +741,8 @@ def _filter_paths_by_permission(
     rules: list[FilesystemPermission],
     operation: FilesystemOperation,
     paths: list[str],
+    *,
+    backend: BackendProtocol | None = None,
 ) -> list[str]:
     """Filter paths, removing only those denied by a rule.
 
@@ -632,10 +751,32 @@ def _filter_paths_by_permission(
     and its scope-aware predicate), so by the time result-filtering runs the
     user has already approved (or no rule matched). Filtering interrupt-mode
     results out here would silently empty the listing the user just approved.
+
+    When `backend` is given, each path's symlink-resolved target is checked too.
     """
     if not rules:
         return paths
-    return [p for p in paths if _check_fs_permission(rules, operation, p) != "deny"]
+    denied = _denied_lookup(rules, operation, backend)
+    return [p for p in paths if not denied(p)]
+
+
+def _denied_lookup(
+    rules: list[FilesystemPermission],
+    operation: FilesystemOperation,
+    backend: BackendProtocol | None,
+    scope: list[str] | None = None,
+) -> Callable[[str], bool]:
+    """Return `_is_denied` memoized per path, for filtering many results."""
+    if not rules:
+        return lambda _path: False
+    cache: dict[str, bool] = {}
+
+    def denied(path: str) -> bool:
+        if path not in cache:
+            cache[path] = _is_denied(rules, operation, path, backend, scope)
+        return cache[path]
+
+    return denied
 
 
 def _all_paths_scoped_to_routes(
@@ -661,13 +802,17 @@ def _filter_file_infos_by_permission(
     infos: list[FileInfo],
     *,
     operation: FilesystemOperation,
+    backend: BackendProtocol | None = None,
+    scope: list[str] | None = None,
 ) -> list[FileInfo]:
     """Filter file-info entries, removing only those denied by a rule.
 
     See `_filter_paths_by_permission` for why interrupt-mode entries
-    pass through.
+    pass through, and for `backend`. With `scope` (see `_bulk_scope`),
+    interrupt-mode entries outside it are removed too.
     """
-    return [fi for fi in infos if _check_fs_permission(rules, operation, fi.get("path", "")) != "deny"]
+    denied = _denied_lookup(rules, operation, backend, scope)
+    return [fi for fi in infos if not denied(fi.get("path", ""))]
 
 
 def _filter_grep_matches_by_permission(
@@ -675,13 +820,17 @@ def _filter_grep_matches_by_permission(
     matches: list[GrepMatch],
     *,
     operation: FilesystemOperation,
+    backend: BackendProtocol | None = None,
+    scope: list[str] | None = None,
 ) -> list[GrepMatch]:
     """Filter grep matches, removing only those denied by a rule.
 
     See `_filter_paths_by_permission` for why interrupt-mode entries
-    pass through.
+    pass through, and for `backend`. With `scope` (see `_bulk_scope`),
+    interrupt-mode entries outside it are removed too.
     """
-    return [m for m in matches if _check_fs_permission(rules, operation, m.get("path", "")) != "deny"]
+    denied = _denied_lookup(rules, operation, backend, scope)
+    return [m for m in matches if not denied(m.get("path", ""))]
 
 
 def _grep_backend(
@@ -714,6 +863,40 @@ async def _agrep_backend(
     return _apply_grep_max_count(result, max_count)
 
 
+GREP_LINE_CHAR_LIMIT = 2000
+"""Characters of a grep line shown to the model.
+
+Longer lines (minified JSON, offloaded tool results) show a window around the
+match instead, so one hit can't return the whole line.
+"""
+
+
+def _clip_grep_line(text: str, pattern: str) -> str:
+    """Clip `text` to a `GREP_LINE_CHAR_LIMIT` window centered on `pattern`.
+
+    Falls back to the head of the line when `pattern` isn't found in it, as for
+    context lines.
+    """
+    if len(text) <= GREP_LINE_CHAR_LIMIT:
+        return text
+    center = max(text.find(pattern), 0) + len(pattern) // 2
+    start = min(max(center - GREP_LINE_CHAR_LIMIT // 2, 0), len(text) - GREP_LINE_CHAR_LIMIT)
+    end = start + GREP_LINE_CHAR_LIMIT
+    before = f"[{start} chars clipped] " if start else ""
+    after = f" [{len(text) - end} chars clipped]" if end < len(text) else ""
+    return f"{before}{text[start:end]}{after}"
+
+
+def _clip_grep_match(match: GrepMatch, pattern: str) -> GrepMatch:
+    """Return `match` with its line and context lines clipped by `_clip_grep_line`."""
+    clipped: GrepMatch = {**match, "text": _clip_grep_line(match["text"], pattern)}
+    if "context_before" in match:
+        clipped["context_before"] = [{**c, "text": _clip_grep_line(c["text"], pattern)} for c in match["context_before"]]
+    if "context_after" in match:
+        clipped["context_after"] = [{**c, "text": _clip_grep_line(c["text"], pattern)} for c in match["context_after"]]
+    return clipped
+
+
 def _format_grep_tool_result(
     result: GrepResult,
     output_mode: Literal["files_with_matches", "content", "count"],
@@ -733,7 +916,7 @@ def _format_grep_tool_result(
     not when matches existed but were all redacted by read permissions (a
     redaction miss has nothing to do with regex syntax).
     """
-    matches = result.matches or []
+    matches = [_clip_grep_match(match, pattern) for match in result.matches or []]
     if result.error and not matches:
         return result.error, "error"
 
@@ -759,18 +942,24 @@ def _format_grep_tool_result(
 def _apply_permissions_to_ls_results(
     rules: list[FilesystemPermission],
     entries: list[FileInfo],
+    *,
+    backend: BackendProtocol | None = None,
+    scope: list[str] | None = None,
 ) -> list[str]:
     """Filter ls entries by permission and return their paths."""
-    filtered_entries = _filter_file_infos_by_permission(rules, entries, operation="read")
+    filtered_entries = _filter_file_infos_by_permission(rules, entries, operation="read", backend=backend, scope=scope)
     return [fi.get("path", "") for fi in filtered_entries]
 
 
 def _apply_permissions_to_glob_results(
     rules: list[FilesystemPermission],
     matches: list[FileInfo],
+    *,
+    backend: BackendProtocol | None = None,
+    scope: list[str] | None = None,
 ) -> list[str]:
     """Filter glob matches by permission and return their paths."""
-    filtered_infos = _filter_file_infos_by_permission(rules, matches, operation="read")
+    filtered_infos = _filter_file_infos_by_permission(rules, matches, operation="read", backend=backend, scope=scope)
     return [fi.get("path", "") for fi in filtered_infos]
 
 
@@ -800,39 +989,95 @@ def _format_glob_tool_result(
     return content
 
 
-def _remaining_lines_notice(read_result: ReadResult) -> str:
-    """Render the read pagination notice when the backend returned a partial window.
+def _window_fields(read_result: ReadResult) -> list[str]:
+    """Describe the window a read returned, as status header fields.
+
+    Carries the facts the pagination notice used to spell out in prose: which
+    source lines came back, how many the file has, and where to resume.
 
     Args:
         read_result: Backend read result carrying the pagination metadata
             (`start_line`, `end_line`, `next_offset`, `total_lines`).
 
     Returns:
-        A model-facing notice describing the window that was read and where to
-            resume, or an empty string when no window metadata is present or the
-            window already reached the end of the file (nothing more to read).
+        The `lines A-B[ of T]` field, followed by `next offset N` when the
+            window stopped short of the end of the file.
     """
     start_line = read_result.start_line
     end_line = read_result.end_line
-    next_offset = read_result.next_offset
-    if start_line is None or end_line is None or next_offset is None:
-        return ""
+    if start_line is None or end_line is None:
+        return []
 
     total_lines = read_result.total_lines
-    read_count = end_line - start_line + 1
-    read_unit = "line" if read_count == 1 else "lines"
-    if total_lines is None:
-        return f"\n\n[Read {read_count} {read_unit} (lines {start_line}-{end_line}). More lines remain from offset {next_offset}.]"
-    if end_line >= total_lines:
-        return ""
+    span = f"lines {start_line}-{end_line}"
+    if total_lines is not None:
+        span += f" of {total_lines}"
+    fields = [span]
+    next_offset = read_result.next_offset
+    if next_offset is not None and (total_lines is None or end_line < total_lines):
+        fields.append(f"next offset {next_offset}")
+    return fields
 
-    remaining = total_lines - end_line
-    remaining_unit = "line" if remaining == 1 else "lines"
-    return (
-        f"\n\n[Read {read_count} {read_unit} "
-        f"(lines {start_line}-{end_line} of {total_lines} total). "
-        f"{remaining} {remaining_unit} remaining from offset {next_offset}.]"
-    )
+
+def _prepare_read_window(read_result: ReadResult, content: str, offset: int) -> tuple[ReadResult, str]:
+    """Normalize a read window into a header range and a verbatim source body.
+
+    `ReadResult` permits `start_line`/`end_line` to be unset, and a custom
+    backend can return numberable text that way. The status header always
+    states a range, so one is derived from the requested offset and the rows on
+    hand rather than emitting a header with no fields.
+
+    Args:
+        read_result: Backend read result, possibly without window metadata.
+        content: Serialized content for the read window.
+        offset: Offset as requested by the caller, before clamping.
+
+    Returns:
+        The read result (carrying a derived range when the backend gave none)
+            and the verbatim source body.
+    """
+    rows: str | list[str] = content
+    if read_result.start_line is not None and read_result.end_line is not None:
+        rows = _pad_blank_rows(content, read_result.start_line, read_result.end_line)
+    body = _format_source_block(rows)
+    if read_result.start_line is not None and read_result.end_line is not None:
+        return read_result, body
+
+    # `max(offset, 0)` keeps the fallback range 1-indexed: a backend that
+    # returns numberable text without `start_line` would otherwise report a
+    # zero or negative first line, which the parsers downstream assume never
+    # happens.
+    start_line = max(offset, 0) + 1
+    return replace(read_result, start_line=start_line, end_line=start_line + body.count("\n")), body
+
+
+def _read_header(fields: Sequence[str]) -> str:
+    """Render the status header that sits above a text `read_file` result.
+
+    Args:
+        fields: Header fields, already formatted, in display order.
+
+    Returns:
+        The header line, without a trailing newline.
+    """
+    return f"@@ {' | '.join(fields)} @@"
+
+
+def _assemble_read(body: str, fields: Sequence[str], notices: Sequence[str]) -> str:
+    """Compose a read result from its notices, status header, and source body.
+
+    Notices sit above the header, so every line below it is verbatim file
+    content and consumers can tell the two apart by position.
+
+    Args:
+        body: Verbatim source lines for the window, newline-joined.
+        fields: Status header fields.
+        notices: Bracketed explanations to place above the header.
+
+    Returns:
+        The assembled tool result.
+    """
+    return "\n".join([*notices, _read_header(fields), body])
 
 
 def _clamped_offset_notice(offset: int) -> str:
@@ -891,6 +1136,11 @@ GLOB_UNREADABLE_NOTE = (
     "Narrowing the search will NOT reveal the missing files -- they are inaccessible. Continue "
     "with what is listed, or report the access problem rather than retrying."
 )
+GLOB_PATHLESS_DENIED_HINT = (
+    ". A glob without 'path' is authorized against the backend's default root, not the "
+    "directories named in 'pattern'. Retry with an explicit 'path' inside an allowed "
+    "directory and a 'pattern' relative to it."
+)
 
 
 def _glob_timeout_message() -> str:
@@ -926,90 +1176,108 @@ READ_FILE_TRUNCATION_MSG = (
 NUM_CHARS_PER_TOKEN = 4
 
 
+def _midline_truncated_read(
+    body: str,
+    read_result: ReadResult,
+    threshold: int,
+    notices: Sequence[str],
+) -> str:
+    """Assemble a read cut inside a single source line too long to fit.
+
+    No offset reaches the remainder of such a line, so the header reports how
+    much of it is shown in place of a resume point.
+
+    Args:
+        body: Verbatim source lines for the window, newline-joined.
+        read_result: Backend read result carrying the window metadata.
+        threshold: Char budget the assembled result must fit under.
+        notices: Bracketed explanations to place above the header.
+
+    Returns:
+        The assembled tool result, cut to the budget.
+    """
+    oversized = len(body.split("\n", 1)[0])
+    clipped = ReadResult(
+        total_lines=read_result.total_lines,
+        start_line=read_result.start_line,
+        end_line=read_result.start_line,
+        next_offset=None,
+    )
+
+    def fields(shown: int) -> list[str]:
+        return [*_window_fields(clipped), "truncated mid-line", f"{shown} of {oversized} chars"]
+
+    # Budget for the widest count it could print; costs 0-2 shown chars, never overshoots.
+    reserved = len(_assemble_read("", fields(oversized), notices))
+    shown = max(0, min(oversized, threshold - reserved))
+    return _assemble_read(body[:shown], fields(shown), notices)
+
+
 def _truncate_paginated_read(
-    content: str,
+    body: str,
     file_path: str,
     read_result: ReadResult,
     token_limit: int | None,
+    *,
+    notices: Sequence[str] = (),
 ) -> str:
     """Truncate a paginated read without skipping undisplayed source lines.
 
-    The backend computes the pagination notice from the full window it
-    returned, but the char budget may drop trailing rows from what the model
-    actually sees. Appending the backend's notice verbatim would then advertise
-    a `next_offset` past those dropped lines, so a re-read would silently skip
-    them. This recomputes the notice from the last *complete* rendered row that
-    still fits, and falls back to the size warning alone (no stale offset) when
-    not even one full source line fits.
+    The backend reports the window it returned, but the char budget may drop
+    trailing lines from what the model actually sees. Reporting the backend's
+    `next_offset` verbatim would then advertise an offset past those dropped
+    lines, so a re-read would silently skip them. This rebuilds the header from
+    the last *complete* source line that still fits, and reports
+    `truncated mid-line` with no resume offset when not even one line fits.
 
     Args:
-        content: Line-numbered content produced by
-            `format_content_with_line_numbers` (a marker followed by two spaces
-            and the source content).
+        body: Verbatim source lines for the window, newline-joined.
         file_path: Path used to format the truncation message.
         read_result: Backend read result carrying the window metadata; the
-            adjusted `next_offset` is derived from its 1-indexed line range.
+            adjusted resume offset is derived from its 1-indexed line range.
         token_limit: Char budget is `NUM_CHARS_PER_TOKEN * token_limit`; when
-            falsy, content is returned with its notice untouched.
+            falsy, the untruncated result is returned.
+        notices: Bracketed explanations to place above the header, such as an
+            offset-clamp disclosure that truncation must not drop.
 
     Returns:
-        The (possibly truncated) content with a notice that never overstates
-            which source lines were shown.
+        The (possibly truncated) result, whose header never overstates which
+            source lines were shown.
 
     Examples:
         If the backend returns source lines 11-20 with `next_offset=20`, but
-        the budget fits only through line 14, the returned notice reports lines
-        11-14 and tells the caller to resume from offset 14 rather than 20.
-
-        A long source line may be rendered as rows `14` and `14.1`. If the
-        budget fits row `14` but not `14.1`, neither row is retained: the notice
-        reports line 13 as the last displayed line and resumes from offset 13.
+        the budget fits only through line 14, the header reports lines 11-14
+        and a resume offset of 14 rather than 20.
     """
-    notice = _remaining_lines_notice(read_result)
-    if not token_limit or len(content) + len(notice) < NUM_CHARS_PER_TOKEN * token_limit:
-        return content + notice
+    result = _assemble_read(body, _window_fields(read_result), notices)
+    if not token_limit or len(result) < NUM_CHARS_PER_TOKEN * token_limit:
+        return result
 
-    truncation_msg = READ_FILE_TRUNCATION_MSG.format(file_path=file_path)
+    truncation_msg = READ_FILE_TRUNCATION_MSG.format(file_path=file_path).strip()
     threshold = NUM_CHARS_PER_TOKEN * token_limit
     if read_result.start_line is not None and read_result.end_line is not None:
-        # Build the safe places where the content can be truncated. A long source
-        # line may span rendered rows numbered `12`, `12.1`, and so on, so cutting
-        # at every newline could keep only part of that source line. `position`
-        # tracks each rendered row's end in `content`; comparing the integer part
-        # of adjacent row markers records a boundary only after the final row for
-        # a source line. The loop below uses these boundaries to find the latest
-        # complete source line that fits alongside the truncation message and the
-        # pagination notice.
-        rows = content.split("\n")
+        # Build the safe places where the body can be truncated: one per source
+        # line, so a cut never lands inside a line the header then claims to
+        # have shown. `position` tracks each line's end in `body`.
+        rows = body.split("\n")
         position = 0
         boundaries: list[tuple[int, int]] = []
-        for index, row in enumerate(rows):
-            position += len(row)
-            marker = row.lstrip().partition("  ")[0].partition(".")[0]
-            source_line = int(marker)
-            # Rows numbered past the window's last source line are not file
-            # content: a byte-capped backend page appends its own truncation
-            # banner (preceded by a blank line), which `format_content_with_line_numbers`
-            # then numbers as `end_line + 1`, `end_line + 2`, .... Stop before
-            # them so a banner row is never chosen as a boundary — resuming from
-            # its inflated number would overshoot `total_lines` and skip real
-            # lines. Rows are numbered monotonically, so the first out-of-range
-            # row means the rest are banner too.
+        for source_line, row in enumerate(rows, start=read_result.start_line):
+            # Rows past the window's last source line are not file content: a
+            # byte-capped backend page appends its own truncation banner
+            # (preceded by a blank line). Stop before them so a banner row is
+            # never chosen as a boundary — resuming from its inflated number
+            # would overshoot `total_lines` and skip real lines.
             if source_line > read_result.end_line:
                 break
-            next_source_line = None
-            if index + 1 < len(rows):
-                next_marker = rows[index + 1].lstrip().partition("  ")[0].partition(".")[0]
-                next_source_line = int(next_marker)
-            if next_source_line != source_line:
-                boundaries.append((position, source_line))
+            position += len(row)
+            boundaries.append((position, source_line))
             position += 1
 
-        # Only advertise source lines whose complete rendered rows fit. If the
-        # byte cut landed partway through a row, resuming after that row would
-        # silently skip its undisplayed tail. `next_offset` is the 0-indexed line
-        # after the last one shown, which for a 1-indexed `end_line` is exactly
-        # `end_line` (no reliance on how the request `offset` maps to `start_line`).
+        # Only advertise source lines that fit whole. `next_offset` is the
+        # 0-indexed line after the last one shown, which for a 1-indexed
+        # `end_line` is exactly `end_line` (no reliance on how the request
+        # `offset` maps to `start_line`).
         for boundary, end_line in reversed(boundaries):
             adjusted_result = ReadResult(
                 total_lines=read_result.total_lines,
@@ -1017,14 +1285,40 @@ def _truncate_paginated_read(
                 end_line=end_line,
                 next_offset=end_line,
             )
-            adjusted_notice = _remaining_lines_notice(adjusted_result)
-            if boundary + len(truncation_msg) + len(adjusted_notice) <= threshold:
-                return content[:boundary] + truncation_msg + adjusted_notice
+            candidate = _assemble_read(
+                body[:boundary],
+                [*_window_fields(adjusted_result), "truncated due to size"],
+                [*notices, truncation_msg],
+            )
+            if len(candidate) <= threshold:
+                return candidate
 
-    # No complete source line fits. Keep the size warning but omit the
-    # backend's stale pagination offset.
-    max_content_length = max(0, threshold - len(truncation_msg))
-    return content[:max_content_length] + truncation_msg
+    # No complete source line fits, so no offset reaches the remainder.
+    return _midline_truncated_read(body, read_result, threshold, [*notices, truncation_msg])
+
+
+def _pad_blank_rows(content: str, start_line: int, end_line: int) -> str | list[str]:
+    r"""Restore blank source rows a page loses to `split("\n")`.
+
+    Backends that join a page's lines with `"\n"` as a separator leave a blank
+    final row indistinguishable from a trailing terminator, which
+    `_format_source_block` drops. Pads to the window the backend
+    reported and never truncates, since a backend may append a truncation
+    banner numbered past `end_line`.
+
+    Args:
+        content: Serialized content for the read window.
+        start_line: First source line in the window.
+        end_line: Last source line in the window.
+
+    Returns:
+        A list of rows when padding was needed, `content` unchanged otherwise.
+    """
+    rows = content.split("\n")
+    if rows and rows[-1] == "":
+        rows.pop()
+    missing = end_line - start_line + 1 - len(rows)
+    return [*rows, *[""] * missing] if missing > 0 else content
 
 
 def _file_data_reducer(left: dict[str, FileData] | None, right: dict[str, FileData | None]) -> dict[str, FileData]:
@@ -1091,6 +1385,17 @@ class FilesystemState(AgentState):
     """Files in the filesystem. Uses DeltaChannel with snapshots every ~50 pregel steps to bound read depth."""
 
 
+class _BlobPayloadState(AgentState):
+    """State for `offload_binary_content`."""
+
+    _blob_payloads: NotRequired[Annotated[dict[str, str], UntrackedValue(dict, guard=False), PrivateStateAttr]]
+    """Payloads of offloaded blobs loaded in this run; never checkpointed."""
+
+
+class _FilesystemBlobPayloadState(FilesystemState, _BlobPayloadState):
+    """`FilesystemState` with `_BlobPayloadState`."""
+
+
 def _uses_state_backend(backend: BackendProtocol) -> bool:
     """Return whether a backend stores any files in agent state."""
     if isinstance(backend, StateBackend):
@@ -1098,6 +1403,27 @@ def _uses_state_backend(backend: BackendProtocol) -> bool:
     if not isinstance(backend, CompositeBackend):
         return False
     return _uses_state_backend(backend.default) or any(_uses_state_backend(route) for route in backend.routes.values())
+
+
+def _routes_to_state_backend(backend: BackendProtocol, path: str) -> bool:
+    """Return whether `path` resolves to a `StateBackend` through composite routing."""
+    if isinstance(backend, CompositeBackend):
+        routed, routed_path, _ = _route_for_path(default=backend.default, sorted_routes=backend.sorted_routes, path=path)
+        return _routes_to_state_backend(routed, routed_path)
+    return isinstance(backend, StateBackend)
+
+
+def _command_messages(command: Command | None) -> list[Any]:
+    update = command.update if command is not None else None
+    return list(update.get("messages", [])) if isinstance(update, dict) else []
+
+
+def _with_update(command: Command | None, updates: dict[str, Any]) -> Command | None:
+    """Return `command` with `updates` merged into its state update."""
+    if not updates:
+        return command
+    update = {**cast("dict[str, Any]", command.update), **updates} if command is not None else updates
+    return replace(command, update=update) if command is not None else Command(update=update)
 
 
 GREP_GLOB_DESCRIPTION = (
@@ -1249,8 +1575,7 @@ _READ_FILE_TOOL_DESCRIPTION_TEMPLATE = """Reads a file from the filesystem. Assu
 
 Usage:
 - {first_line}. Use `offset`/`limit` to page through large files instead of reading them whole.
-- Results are returned with line numbers starting at `offset` + 1 (1 by default), then two spaces, then the source line. Never include these line-number prefixes when editing.
-- Lines over 5,000 characters are split with continuation markers (e.g. 5.1, 5.2); `limit` counts source lines, so continuation rows do not consume the budget.
+- A status header, `@@ field | field | ... @@`, sits above the file content, and every line after it is verbatim file content. When content is truncated, there may be an explanation before the header. Never include the header when editing.
 - Speculatively batch multiple `read_file` calls in one response when several files may be useful.
 - An empty file returns a system-reminder warning in place of contents.
 - Large tool results may be offloaded to a file; the tool message gives the path. Read that path here, paging with `offset`/`limit`.
@@ -1284,7 +1609,7 @@ EDIT_FILE_TOOL_DESCRIPTION = """Performs exact string replacements in files.
 
 Usage:
 - You must read the file before editing; this tool errors otherwise.
-- Preserve the exact indentation from the read output, and never include line-number prefixes in old_string or new_string.
+- Preserve the exact source indentation from the read output, and never include the read status header in old_string or new_string.
 - Prefer editing an existing file over creating a new one.
 - Only use emojis if the user explicitly requests it."""
 
@@ -1515,11 +1840,11 @@ TOOLS_EXCLUDED_FROM_EVICTION = (
 )
 
 
-TOO_LARGE_HUMAN_MSG = """Message content too large and was saved to the filesystem at: {file_path}
+_TOO_LARGE_HUMAN_MSG = """Message content too large and was saved to the filesystem at: {file_path}
 
 You can read the full content using the read_file tool with pagination (offset and limit parameters).
 
-Here is a preview showing the head and tail of the content:
+{preview_note}
 
 {content_sample}
 """
@@ -1565,10 +1890,11 @@ def _build_truncated_human_message(message: HumanMessage, file_path: str) -> Hum
         A new HumanMessage with truncated content and the same `id`.
     """
     content_str = _extract_text_from_message(message)
-    content_sample = _create_content_preview(content_str)
-    replacement_text = TOO_LARGE_HUMAN_MSG.format(
+    replacement_text = _render_preview_stub(
+        _TOO_LARGE_HUMAN_MSG,
+        _create_content_preview(content_str),
+        subject="content",
         file_path=file_path,
-        content_sample=content_sample,
     )
     evicted = _build_evicted_human_content(message, replacement_text)
     return message.model_copy(update={"content": evicted})
@@ -1591,6 +1917,11 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
 
     This middleware also automatically evicts large tool results to the file system when
     they exceed a token threshold, preventing context window saturation.
+
+    When using `create_agent` directly, add
+    [`UnsupportedContentMiddleware`][deepagents.middleware.unsupported_content.UnsupportedContentMiddleware]
+    last in the `middleware` list, so `read_file` results the model can't accept are
+    replaced with a text notice. `create_deep_agent` adds it automatically.
 
     Args:
         backend: Backend for file storage and optional execution.
@@ -1652,6 +1983,8 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         max_execute_timeout: int = 3600,
         grep_max_count: int | None = 1000,
         tools: list[FsToolName] | Literal["all"] | None = None,
+        offload_binary_content: bool = False,
+        permissions: list[FilesystemPermission] | None = None,
         _permissions: list[FilesystemPermission] | None = None,
     ) -> None:
         """Initialize the filesystem middleware.
@@ -1685,13 +2018,37 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                 in any list. Backend capability checks for `execute` and
                 `delete` still apply; listing them when the backend does not
                 support them is a no-op.
-            _permissions: Optional filesystem permission rules enforced directly
-                by this middleware's tool implementations.
+            offload_binary_content: Keep binary `read_file` content and inline
+                `HumanMessage` media out of message history.
 
-                Marked private for now because this is an internal
-                implementation detail and may move to the backend layer in a
-                future change.
+                Payloads are written to `blobs/` under the artifacts root and
+                state keeps a content-addressed reference; model requests are
+                rehydrated from the backend. Inline `HumanMessage` media and
+                `read_file` results anywhere in the history, including imported
+                conversations, are replaced at the next model call. The original
+                input write stays in checkpoint history.
+                Useful with sandbox backends. Has no effect when `blobs/`
+                routes to a `StateBackend`.
+            permissions: Filesystem rules enforced by this middleware's tools.
+                `create_deep_agent` supplies its rules when this list is empty;
+                conflicting non-empty rule lists raise `ValueError`.
+                Interrupt rules require `create_deep_agent(permissions=...)`
+                to configure human-in-the-loop approval.
+            _permissions: Deprecated since `0.7.31`; scheduled for removal in
+                `0.9.0`. Use `permissions` instead; do not pass both.
         """
+        if permissions is not None and _permissions is not None:
+            msg = "Pass only permissions, not both permissions and _permissions."
+            raise ValueError(msg)
+        if _permissions is not None:
+            warn_deprecated(
+                since="0.7.31",
+                removal="0.9.0",
+                name="FilesystemMiddleware(_permissions=...)",
+                alternative="FilesystemMiddleware(permissions=...)",
+                package="deepagents",
+            )
+            permissions = _permissions
         if isinstance(tools, list) and "read_file" not in tools:
             msg = "read_file must be included in tools; it is required by FilesystemMiddleware"
             raise ValueError(msg)
@@ -1712,21 +2069,20 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             raise TypeError(msg)
         self.state_schema = cast(
             "type[FilesystemState]",
-            FilesystemState if _uses_state_backend(self.backend) else AgentState,
+            _FilesystemBlobPayloadState if _uses_state_backend(self.backend) else _BlobPayloadState,
         )
-        if _permissions and supports_execution(self.backend) and not _all_paths_scoped_to_routes(_permissions, self.backend):
-            msg = (
-                "FilesystemMiddleware does not yet support permissions with backends that "
-                "provide command execution (SandboxBackendProtocol). Tool-level permissions "
-                "for the execute tool are not implemented. Either remove permissions or use "
-                "a backend without execution support."
-            )
-            raise NotImplementedError(msg)
+        self._set_permissions(permissions)
 
         artifacts_root = self.backend.artifacts_root if isinstance(self.backend, CompositeBackend) else "/"
         _root = artifacts_root.rstrip("/")
         self._large_tool_results_prefix = f"{_root}/large_tool_results"
         self._conversation_history_prefix = f"{_root}/conversation_history"
+        self._blobs_prefix = f"{_root}/blobs"
+        if offload_binary_content and _routes_to_state_backend(self.backend, f"{self._blobs_prefix}/"):
+            msg = f"`offload_binary_content` has no effect: `{self._blobs_prefix}/` routes to a `StateBackend`, which keeps files in checkpointed state."
+            warnings.warn(msg, stacklevel=2)
+            offload_binary_content = False
+        self._offload_binary_content = offload_binary_content
 
         # Store configuration (private - internal implementation details)
         self._custom_system_prompt = system_prompt
@@ -1741,7 +2097,6 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             self._enabled_tools = frozenset(_ALL_FS_TOOL_NAMES)
         else:  # None -- user did not specify, defaults to all tools opted-in
             self._enabled_tools = None
-        self._permissions = list(_permissions or [])
 
         # Shared executor for enforcing GLOB_TIMEOUT on the sync glob tool.
         # Timed-out worker threads keep running until the backend call returns,
@@ -1752,6 +2107,10 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         )
         self._glob_slots = threading.BoundedSemaphore(_SYNC_GLOB_WORKERS)
 
+        self.tools = self._create_tools()
+
+    def _create_tools(self) -> list[BaseTool]:
+        """Bind enabled filesystem tools to this middleware instance."""
         tool_factories: tuple[tuple[str, Callable[[], BaseTool]], ...] = (
             ("ls", self._create_ls_tool),
             ("read_file", self._create_read_file_tool),
@@ -1765,7 +2124,26 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         # Excluded tools are omitted here entirely, not just hidden from the
         # model's schema, so a tool name outside `tools=` never reaches the
         # dispatchable tool node
-        self.tools = [factory() for name, factory in tool_factories if self._enabled_tools is None or name in self._enabled_tools]
+        return [factory() for name, factory in tool_factories if self._enabled_tools is None or name in self._enabled_tools]
+
+    def _with_permissions(self, permissions: list[FilesystemPermission]) -> "FilesystemMiddleware[ContextT, ResponseT]":
+        """Copy the middleware with agent-local rules and bound tools."""
+        configured = copy(self)
+        configured._set_permissions(permissions)
+        configured.tools = configured._create_tools()
+        return configured
+
+    def _set_permissions(self, permissions: list[FilesystemPermission] | None) -> None:
+        """Validate and copy rules against this middleware's backend."""
+        if permissions and supports_execution(self.backend) and not _all_paths_scoped_to_routes(permissions, self.backend):
+            msg = (
+                "FilesystemMiddleware does not yet support permissions with backends that "
+                "provide command execution (SandboxBackendProtocol). Tool-level permissions "
+                "for the execute tool are not implemented. Either remove permissions or use "
+                "a backend without execution support."
+            )
+            raise NotImplementedError(msg)
+        self._permissions = list(permissions or [])
 
     def _create_ls_tool(self) -> BaseTool:
         """Create the ls (list files) tool."""
@@ -1786,9 +2164,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     tool_call_id=runtime.tool_call_id,
                     status="error",
                 )
-            if _check_fs_permission(self._permissions, "read", validated_path) == "deny":
+            if (error := _permission_error(self._permissions, "read", self.backend, validated_path)) is not None:
                 return ToolMessage(
-                    content=f"Error: permission denied for read on {validated_path}",
+                    content=error,
                     name="ls",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -1802,7 +2180,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     status="error",
                 )
             infos = ls_result.entries or []
-            paths = _apply_permissions_to_ls_results(self._permissions, infos)
+            paths = _apply_permissions_to_ls_results(
+                self._permissions, infos, backend=self.backend, scope=_bulk_scope(self._permissions, self.backend, validated_path)
+            )
             return ToolMessage(
                 content=_format_file_paths(paths),
                 tool_call_id=runtime.tool_call_id,
@@ -1825,9 +2205,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     tool_call_id=runtime.tool_call_id,
                     status="error",
                 )
-            if _check_fs_permission(self._permissions, "read", validated_path) == "deny":
+            if (error := _permission_error(self._permissions, "read", self.backend, validated_path)) is not None:
                 return ToolMessage(
-                    content=f"Error: permission denied for read on {validated_path}",
+                    content=error,
                     name="ls",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -1841,7 +2221,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     status="error",
                 )
             infos = ls_result.entries or []
-            paths = _apply_permissions_to_ls_results(self._permissions, infos)
+            paths = _apply_permissions_to_ls_results(
+                self._permissions, infos, backend=self.backend, scope=_bulk_scope(self._permissions, self.backend, validated_path)
+            )
             return ToolMessage(
                 content=_format_file_paths(paths),
                 tool_call_id=runtime.tool_call_id,
@@ -1906,22 +2288,17 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             encoding = read_result.file_data.get("encoding", "utf-8")
             content = read_result.file_data["content"]
 
-            # Empty files get a uniform warning regardless of encoding/type, so
-            # check before routing to avoid a degenerate empty content block for
-            # binary reads.
+            # Empty content earns the warning ahead of type routing so a binary
+            # read never renders a degenerate empty content block. Only content
+            # that is the whole file qualifies: an unpaginated result, or a
+            # window spanning every line. A blank window of a file with content
+            # elsewhere renders its rows below instead. Unknown `total_lines`
+            # fails closed, so an unprovable whole-file claim renders rows too.
             empty_msg = check_empty_content(content)
-            if empty_msg:
-                # Empty content has two causes that must not be conflated: a
-                # zero-line window, where the file was never inspected, and a
-                # genuinely empty file. Reporting the former as the latter
-                # states something false about a file that may have contents.
-                # The backend declares which one happened: both arrive as
-                # empty content with no pagination metadata, but only the
-                # never-inspected window sets `no_lines_requested` — a file
-                # that was inspected and is empty (whitespace-only text from
-                # `slice_read_response`'s blank branch, or empty base64 from
-                # a binary read that ignored `limit`) keeps the empty-file
-                # reminder.
+            is_whole_file = read_result.start_line is None or (read_result.start_line == 1 and read_result.total_lines == read_result.end_line)
+            if empty_msg and is_whole_file:
+                # A zero-line window never inspected the file, so it must not be
+                # reported as empty.
                 if not content and read_result.no_lines_requested:
                     empty_msg = NO_LINES_REQUESTED_WARNING.format(limit=limit)
                 return ToolMessage(
@@ -1959,17 +2336,20 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     status="success",
                 )
 
-            # `max(offset, 0)` so the fallback gutter stays 1-indexed: a backend
-            # that returns numberable text without `start_line` would otherwise
-            # render a zero or negative line marker, which the row-marker
-            # parsers downstream assume never happens.
-            content = format_content_with_line_numbers(content, start_line=read_result.start_line or max(offset, 0) + 1)
+            read_result, body = _prepare_read_window(read_result, content, offset)
             # `limit` already bounded raw source lines at the backend; do not
-            # re-truncate by row count here, or wrapped continuation rows would
-            # push real source lines off the end of the page (#2453).
-            # The clamp notice is appended after truncation so it cannot be cut.
+            # re-truncate by row count here, or real source lines would be
+            # pushed off the end of the page (#2453).
+            # The clamp notice sits above the header so truncation cannot cut it.
+            clamp_notice = _clamped_offset_notice(offset).strip()
             return ToolMessage(
-                content=_truncate_paginated_read(content, validated_path, read_result, token_limit) + _clamped_offset_notice(offset),
+                content=_truncate_paginated_read(
+                    body,
+                    validated_path,
+                    read_result,
+                    token_limit,
+                    notices=[clamp_notice] if clamp_notice else [],
+                ),
                 name="read_file",
                 tool_call_id=tool_call_id,
                 status="success",
@@ -1992,9 +2372,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     tool_call_id=runtime.tool_call_id,
                     status="error",
                 )
-            if _check_fs_permission(self._permissions, "read", validated_path) == "deny":
+            if (error := _permission_error(self._permissions, "read", self.backend, validated_path)) is not None:
                 return ToolMessage(
-                    content=f"Error: permission denied for read on {validated_path}",
+                    content=error,
                     name="read_file",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -2019,9 +2399,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     tool_call_id=runtime.tool_call_id,
                     status="error",
                 )
-            if _check_fs_permission(self._permissions, "read", validated_path) == "deny":
+            if (error := _permission_error(self._permissions, "read", self.backend, validated_path)) is not None:
                 return ToolMessage(
-                    content=f"Error: permission denied for read on {validated_path}",
+                    content=error,
                     name="read_file",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -2059,9 +2439,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     status="error",
                 )
 
-            if _check_fs_permission(self._permissions, "write", validated_path) == "deny":
+            if (error := _permission_error(self._permissions, "write", self.backend, validated_path)) is not None:
                 return ToolMessage(
-                    content=f"Error: permission denied for write on {validated_path}",
+                    content=error,
                     name="write_file",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -2098,9 +2478,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     status="error",
                 )
 
-            if _check_fs_permission(self._permissions, "write", validated_path) == "deny":
+            if (error := _permission_error(self._permissions, "write", self.backend, validated_path)) is not None:
                 return ToolMessage(
-                    content=f"Error: permission denied for write on {validated_path}",
+                    content=error,
                     name="write_file",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -2153,9 +2533,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     status="error",
                 )
 
-            if _check_fs_permission(self._permissions, "write", validated_path) == "deny":
+            if (error := _permission_error(self._permissions, "write", self.backend, validated_path)) is not None:
                 return ToolMessage(
-                    content=f"Error: permission denied for write on {validated_path}",
+                    content=error,
                     name="edit_file",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -2195,9 +2575,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     status="error",
                 )
 
-            if _check_fs_permission(self._permissions, "write", validated_path) == "deny":
+            if (error := _permission_error(self._permissions, "write", self.backend, validated_path)) is not None:
                 return ToolMessage(
-                    content=f"Error: permission denied for write on {validated_path}",
+                    content=error,
                     name="edit_file",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -2247,10 +2627,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                 )
 
             has_descendants = _delete_target_may_have_descendants(resolved_backend, validated_path, permissions_configured=bool(self._permissions))
-            denying_patterns = _find_delete_deny_patterns(self._permissions, validated_path, has_descendants=has_descendants)
-            if denying_patterns:
+            if (error := _delete_permission_error(self._permissions, resolved_backend, validated_path, has_descendants=has_descendants)) is not None:
                 return ToolMessage(
-                    content=f"Error: permission denied for write on {validated_path} (matches deny rule(s): {', '.join(denying_patterns)})",
+                    content=error,
                     name="delete",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -2289,10 +2668,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             has_descendants = await _adelete_target_may_have_descendants(
                 resolved_backend, validated_path, permissions_configured=bool(self._permissions)
             )
-            denying_patterns = _find_delete_deny_patterns(self._permissions, validated_path, has_descendants=has_descendants)
-            if denying_patterns:
+            if (error := _delete_permission_error(self._permissions, resolved_backend, validated_path, has_descendants=has_descendants)) is not None:
                 return ToolMessage(
-                    content=f"Error: permission denied for write on {validated_path} (matches deny rule(s): {', '.join(denying_patterns)})",
+                    content=error,
                     name="delete",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -2325,7 +2703,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         """Create the glob tool."""
         tool_description = self._custom_tool_descriptions.get("glob") or GLOB_TOOL_DESCRIPTION
 
-        def sync_glob(  # noqa: PLR0911 - early returns for distinct error conditions
+        def sync_glob(  # noqa: C901, PLR0911 - early returns for distinct error conditions
             pattern: str,
             runtime: ToolRuntime[None, FilesystemState],
             path: str | None = None,
@@ -2343,7 +2721,14 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                 )
             if _check_fs_permission(self._permissions, "read", permission_path) == "deny":
                 return ToolMessage(
-                    content=f"Error: permission denied for read on {permission_path}",
+                    content=f"Error: permission denied for read on {permission_path}{GLOB_PATHLESS_DENIED_HINT if path is None else ''}",
+                    name="glob",
+                    tool_call_id=runtime.tool_call_id,
+                    status="error",
+                )
+            if (error := _resolved_permission_error(self._permissions, "read", self.backend, permission_path)) is not None:
+                return ToolMessage(
+                    content=error,
                     name="glob",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -2413,7 +2798,8 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     status="error",
                 )
             infos = glob_result.matches or []
-            paths = _apply_permissions_to_glob_results(self._permissions, infos)
+            scope = _bulk_scope(self._permissions, self.backend, permission_path, pattern)
+            paths = _apply_permissions_to_glob_results(self._permissions, infos, backend=self.backend, scope=scope)
             return ToolMessage(
                 content=_format_glob_tool_result(
                     paths,
@@ -2425,7 +2811,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                 status="success",
             )
 
-        async def async_glob(
+        async def async_glob(  # noqa: PLR0911 - early returns for distinct error conditions
             pattern: str,
             runtime: ToolRuntime[None, FilesystemState],
             path: str | None = None,
@@ -2443,7 +2829,14 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                 )
             if _check_fs_permission(self._permissions, "read", permission_path) == "deny":
                 return ToolMessage(
-                    content=f"Error: permission denied for read on {permission_path}",
+                    content=f"Error: permission denied for read on {permission_path}{GLOB_PATHLESS_DENIED_HINT if path is None else ''}",
+                    name="glob",
+                    tool_call_id=runtime.tool_call_id,
+                    status="error",
+                )
+            if (error := _resolved_permission_error(self._permissions, "read", self.backend, permission_path)) is not None:
+                return ToolMessage(
+                    content=error,
                     name="glob",
                     tool_call_id=runtime.tool_call_id,
                     status="error",
@@ -2481,7 +2874,8 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     status="error",
                 )
             infos = glob_result.matches or []
-            paths = _apply_permissions_to_glob_results(self._permissions, infos)
+            scope = _bulk_scope(self._permissions, self.backend, permission_path, pattern)
+            paths = _apply_permissions_to_glob_results(self._permissions, infos, backend=self.backend, scope=scope)
             return ToolMessage(
                 content=_format_glob_tool_result(
                     paths,
@@ -2530,9 +2924,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                         tool_call_id=runtime.tool_call_id,
                         status="error",
                     )
-                if _check_fs_permission(self._permissions, "read", path) == "deny":
+                if (error := _permission_error(self._permissions, "read", self.backend, path)) is not None:
                     return ToolMessage(
-                        content=f"Error: permission denied for read on {path}",
+                        content=error,
                         name="grep",
                         tool_call_id=runtime.tool_call_id,
                         status="error",
@@ -2541,7 +2935,8 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             effective_max_count = max_count if max_count is not None else self._grep_max_count
             grep_result = _grep_backend(resolved_backend, pattern, path, glob, effective_max_count)
             matches = grep_result.matches or []
-            filtered_matches = _filter_grep_matches_by_permission(self._permissions, matches, operation="read")
+            scope = _bulk_scope(self._permissions, self.backend, path or "/")
+            filtered_matches = _filter_grep_matches_by_permission(self._permissions, matches, operation="read", backend=self.backend, scope=scope)
             formatted, status = _format_grep_tool_result(
                 GrepResult(error=grep_result.error, matches=filtered_matches, truncated=grep_result.truncated),
                 output_mode,
@@ -2576,9 +2971,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                         tool_call_id=runtime.tool_call_id,
                         status="error",
                     )
-                if _check_fs_permission(self._permissions, "read", path) == "deny":
+                if (error := _permission_error(self._permissions, "read", self.backend, path)) is not None:
                     return ToolMessage(
-                        content=f"Error: permission denied for read on {path}",
+                        content=error,
                         name="grep",
                         tool_call_id=runtime.tool_call_id,
                         status="error",
@@ -2587,7 +2982,8 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             effective_max_count = max_count if max_count is not None else self._grep_max_count
             grep_result = await _agrep_backend(resolved_backend, pattern, path, glob, effective_max_count)
             matches = grep_result.matches or []
-            filtered_matches = _filter_grep_matches_by_permission(self._permissions, matches, operation="read")
+            scope = _bulk_scope(self._permissions, self.backend, path or "/")
+            filtered_matches = _filter_grep_matches_by_permission(self._permissions, matches, operation="read", backend=self.backend, scope=scope)
             formatted, status = _format_grep_tool_result(
                 GrepResult(error=grep_result.error, matches=filtered_matches, truncated=grep_result.truncated),
                 output_mode,
@@ -2828,15 +3224,14 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         return "".join(parts)
 
     @staticmethod
-    def _execute_artifact(response: ExecuteResponse) -> ExecuteArtifact:
-        """Build the `ExecuteArtifact` for an execute result.
-
-        See `ExecuteArtifact` for why an unknown exit code is omitted rather
-        than published as `None`.
-        """
-        if response.exit_code is None:
-            return {}
-        return {"exit_code": response.exit_code}
+    def _execute_artifact(response: ExecuteResponse, *, output_file: str | None = None) -> ExecuteArtifact:
+        """Build bounded execution metadata without duplicating command output."""
+        artifact: ExecuteArtifact = {"truncated": response.truncated}
+        if response.exit_code is not None:
+            artifact["exit_code"] = response.exit_code
+        if output_file is not None:
+            artifact["output_file"] = output_file
+        return artifact
 
     def _interpret_capture_output(self, offload: ExecuteOffloadResult, capture_path: str, tool_call_id: str) -> str:
         """Build `ToolMessage` content from an `execute_with_offload` result."""
@@ -2847,11 +3242,19 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         status_line = f"[Command {cmd_status} with exit code {response.exit_code}]"
         if response.truncated:
             status_line += "\n[Output exceeded the capture size limit and was truncated; the saved file is incomplete]"
-        content_sample = f"{status_line}\n{response.output}"
-        return TOO_LARGE_TOOL_MSG.format(
-            tool_call_id=tool_call_id,
+        return _render_preview_stub(
+            _TOO_LARGE_TOOL_MSG,
+            ContentPreview(
+                f"{status_line}\n{response.output}",
+                lines_omitted=offload.preview_has_truncation_marker,
+                # A `PREVIEW_LINE_CHAR_LIMIT` caveat, and the wrapper has no
+                # per-line character budget, so it never applies here. The
+                # wrapper's byte caps can still cut a shown line mid-line; it
+                # discloses that in-band rather than through this note.
+                lines_clipped=False,
+            ),
+            tool_call_id=_visible_tool_call_id(tool_call_id),
             file_path=capture_path,
-            content_sample=content_sample,
         )
 
     def _create_execute_tool(self) -> BaseTool:  # noqa: C901
@@ -2946,7 +3349,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                 content=content,
                 name="execute",
                 tool_call_id=runtime.tool_call_id,
-                artifact=self._execute_artifact(response),
+                artifact=self._execute_artifact(response, output_file=capture[1] if capture is not None and offload.offloaded else None),
                 status="success",
             )
 
@@ -3034,7 +3437,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                 content=content,
                 name="execute",
                 tool_call_id=runtime.tool_call_id,
-                artifact=self._execute_artifact(response),
+                artifact=self._execute_artifact(response, output_file=capture[1] if capture is not None and offload.offloaded else None),
                 status="success",
             )
 
@@ -3112,9 +3515,6 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             eviction threshold, its content is written to the backend and the
             message is tagged in state via `ExtendedModelResponse`.
 
-        It also scrubs unsupported multimodal blocks, replacing them with text
-        placeholders to avoid non-retryable provider errors.
-
         Args:
             request: The model request being processed.
             handler: The handler function to call with the modified request.
@@ -3126,20 +3526,39 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         request = self._filter_unsupported_tools_and_apply_prompt(request)
 
         request_messages = _move_media_results_after_tool_results(list(request.messages))
-        request_messages = _scrub_unsupported_multimodal_content(request_messages, request.model)
         if request_messages != list(request.messages):
             request = request.override(messages=request_messages)
 
+        state_command = None
         eviction_result = self._evict_and_truncate_messages(request)
         if eviction_result is not None:
             messages, state_command = eviction_result
             request = request.override(messages=messages)
+        if self._offload_binary_content:
+            cached = request.state.get(_BLOB_PAYLOADS_KEY) or {}
+            payloads = dict(cached)
+            offloaded = _offload_history_messages(
+                request.state.get("messages", []), _command_messages(state_command), self.backend, self._blobs_prefix, payloads
+            )
+            request = request.override(messages=_hydrate_messages(request.messages, self.backend, self._blobs_prefix, payloads))
+            updates: dict[str, Any] = {"messages": offloaded} if offloaded else {}
+            if payloads.keys() != cached.keys():
+                updates[_BLOB_PAYLOADS_KEY] = payloads
+            state_command = _with_update(state_command, updates)
+        try:
             response = handler(request)
-            if state_command is not None:
-                return ExtendedModelResponse(model_response=response, command=state_command)
-            return response
-
-        return handler(request)
+        except ModelInvalidRequestError:
+            messages = _replace_rejected_file_content(request.messages)
+            if messages == request.messages:
+                raise
+            response = handler(request.override(messages=messages))
+            replacements = [message for original, message in zip(request.messages, messages, strict=True) if message is not original]
+            update = dict(cast("dict[str, Any]", state_command.update)) if state_command is not None else {}
+            update["messages"] = [*update.get("messages", []), *replacements]
+            state_command = replace(state_command, update=update) if state_command is not None else Command(update=update)
+        if state_command is not None:
+            return ExtendedModelResponse(model_response=response, command=state_command)
+        return response
 
     async def awrap_model_call(
         self,
@@ -3162,20 +3581,39 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         request = self._filter_unsupported_tools_and_apply_prompt(request)
 
         request_messages = _move_media_results_after_tool_results(list(request.messages))
-        request_messages = _scrub_unsupported_multimodal_content(request_messages, request.model)
         if request_messages != list(request.messages):
             request = request.override(messages=request_messages)
 
+        state_command = None
         eviction_result = await self._aevict_and_truncate_messages(request)
         if eviction_result is not None:
             messages, state_command = eviction_result
             request = request.override(messages=messages)
+        if self._offload_binary_content:
+            cached = request.state.get(_BLOB_PAYLOADS_KEY) or {}
+            payloads = dict(cached)
+            offloaded = await _aoffload_history_messages(
+                request.state.get("messages", []), _command_messages(state_command), self.backend, self._blobs_prefix, payloads
+            )
+            request = request.override(messages=await _ahydrate_messages(request.messages, self.backend, self._blobs_prefix, payloads))
+            updates: dict[str, Any] = {"messages": offloaded} if offloaded else {}
+            if payloads.keys() != cached.keys():
+                updates[_BLOB_PAYLOADS_KEY] = payloads
+            state_command = _with_update(state_command, updates)
+        try:
             response = await handler(request)
-            if state_command is not None:
-                return ExtendedModelResponse(model_response=response, command=state_command)
-            return response
-
-        return await handler(request)
+        except ModelInvalidRequestError:
+            messages = _replace_rejected_file_content(request.messages)
+            if messages == request.messages:
+                raise
+            response = await handler(request.override(messages=messages))
+            replacements = [message for original, message in zip(request.messages, messages, strict=True) if message is not original]
+            update = dict(cast("dict[str, Any]", state_command.update)) if state_command is not None else {}
+            update["messages"] = [*update.get("messages", []), *replacements]
+            state_command = replace(state_command, update=update) if state_command is not None else Command(update=update)
+        if state_command is not None:
+            return ExtendedModelResponse(model_response=response, command=state_command)
+        return response
 
     def _process_large_message(
         self,
@@ -3505,7 +3943,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command],
     ) -> ToolMessage | Command:
-        """Check the size of the tool call result and evict to filesystem if too large.
+        """Provide on-demand media access and evict oversized tool results.
 
         Args:
             request: The tool call request being processed.
@@ -3519,7 +3957,12 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             Tool-execution exceptions (including `ToolException`) propagate
             through this wrapper unhandled by design.
         """
-        tool_result = handler(request)
+        if error := _parallel_file_mutation_error(request):
+            return error
+        with _tool_blob_store(self.backend if self._offload_binary_content else None, self._blobs_prefix):
+            tool_result = handler(request)
+        if self._offload_binary_content and request.tool_call["name"] == "read_file":
+            tool_result = _offload_tool_result(tool_result, self.backend, self._blobs_prefix, {})
 
         if self._tool_token_limit_before_evict is None or request.tool_call["name"] in TOOLS_EXCLUDED_FROM_EVICTION:
             return tool_result
@@ -3531,7 +3974,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
     ) -> ToolMessage | Command:
-        """(async) Check the size of the tool call result and evict to filesystem if too large.
+        """(async) Provide on-demand media access and evict oversized tool results.
 
         Args:
             request: The tool call request being processed.
@@ -3544,7 +3987,12 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             Tool-execution exceptions (including `ToolException`) propagate
                 through this wrapper unhandled by design.
         """
-        tool_result = await handler(request)
+        if error := _parallel_file_mutation_error(request):
+            return error
+        with _tool_blob_store(self.backend if self._offload_binary_content else None, self._blobs_prefix):
+            tool_result = await handler(request)
+        if self._offload_binary_content and request.tool_call["name"] == "read_file":
+            tool_result = await _aoffload_tool_result(tool_result, self.backend, self._blobs_prefix, {})
 
         if self._tool_token_limit_before_evict is None or request.tool_call["name"] in TOOLS_EXCLUDED_FROM_EVICTION:
             return tool_result

@@ -1,241 +1,142 @@
 ---
-type: concept
-title: State & Persistence
-description: How Deep Agents models run state with DeepAgentState and the DeltaChannel messages reducer, and how the two persistence axes — LangGraph checkpoints versus backend filesystem/memory — differ and interact.
-tags: [state, persistence, checkpoints, deltachannel, reducer, subagents, langgraph, middleware]
-verified:
-  - by: openwiki/0.4.0
-    at: 2026-08-26T21:35:57.774Z
+type: persistence architecture
+title: State and Persistence
+description: Explains dcode and Talon checkpoint ownership, recoverable offload archives, goal-state reconciliation, and the boundaries that make resumed sessions safe.
+tags: [dcode, persistence, checkpoints, sqlite, threads, offload]
 sources:
-  - id: openwiki-source-68ae2141dbec1e0915410ac3
-    resource: repo://libs/ARCHITECTURE.md
-  - id: openwiki-source-822ae989625ba99d4c7cc08b
-    resource: repo://libs/deepagents/deepagents/_messages_reducer.py
-  - id: openwiki-source-07f9eac13e71bcbdb4e6994b
-    resource: repo://libs/deepagents/deepagents/backends/state.py
-  - id: openwiki-source-0fc0e47059e4d07e23e50be2
-    resource: repo://libs/deepagents/deepagents/graph.py
-  - id: openwiki-source-421bc4b065189ae1165ca326
-    resource: repo://libs/deepagents/deepagents/middleware/_state.py
-  - id: openwiki-source-fed4b84a38685f37e58018c5
-    resource: repo://libs/deepagents/deepagents/middleware/filesystem.py
-  - id: openwiki-source-114a1c7a58992fa867a94ef0
-    resource: repo://libs/deepagents/deepagents/middleware/subagents.py
-  - id: openwiki-source-dc64f28a66d10932b86fcd61
-    resource: repo://libs/deepagents/tests/unit_tests/test_messages_reducer.py
-generated: {by: "openwiki/0.4.0", at: "2026-08-26T21:35:57.774Z"}
+  - id: openwiki-source-15628256fe9cd22197db74ed
+    resource: repo://libs/code/AGENTS.md
+  - id: openwiki-source-e6ad64b6a7d1df658edc7234
+    resource: repo://libs/code/deepagents_code/_checkpointer_adapter.py
+  - id: openwiki-source-fdf5afeb1dd1d11652374e88
+    resource: repo://libs/code/deepagents_code/app.py
+  - id: openwiki-source-b9ef532d79a0667acf40e58b
+    resource: repo://libs/code/deepagents_code/client/launch/server_manager.py
+  - id: openwiki-source-dd104912040624b0d673c588
+    resource: repo://libs/code/deepagents_code/goal_state_notice.py
+  - id: openwiki-source-ea1089f0d7536fbc96c64866
+    resource: repo://libs/code/deepagents_code/offload_api.py
+  - id: openwiki-source-c100a7d2ff8c43af8ad1b816
+    resource: repo://libs/code/deepagents_code/offload_middleware.py
+  - id: openwiki-source-9b6cab59e92c8914079f0f53
+    resource: repo://libs/code/deepagents_code/offload.py
+  - id: openwiki-source-0f8622164498a685abc913d5
+    resource: repo://libs/code/deepagents_code/sessions.py
+  - id: openwiki-source-91c9283d1547adfffd627c43
+    resource: repo://libs/code/deepagents_code/thread_ownership.py
+  - id: openwiki-source-ca29473cdf65d6660e2b952b
+    resource: repo://libs/code/tests/unit_tests/test_goal_state_persistence.py
+  - id: openwiki-source-6a586415ef68cbe7c7967a41
+    resource: repo://libs/code/tests/unit_tests/test_offload_api.py
+  - id: openwiki-source-b3af62e14b5dc835d32e7ee0
+    resource: repo://libs/code/tests/unit_tests/test_offload.py
+  - id: openwiki-source-a5e918d96b1dae3f7adec3f5
+    resource: repo://libs/code/tests/unit_tests/test_thread_ownership.py
+  - id: openwiki-source-665a21e2fbd09a89d3f13ac0
+    resource: repo://libs/talon/deepagents_talon/runtime.py
+verified:
+  - by: openwiki/0.4.2
+    at: 2026-11-10T08:04:01.717Z
+generated: { by: "openwiki/0.4.2", at: "2026-11-10T08:04:01.717Z" }
 ---
 
-# State & Persistence
+# State and Persistence
 
-Deep Agents keeps almost none of its own runtime state. The authoritative state
-container is LangGraph's graph state, which Deep Agents extends with a small
-`TypedDict` (`DeepAgentState`) and a specialized reducer for the `messages`
-channel. Persistence then splits into two independent axes: **LangGraph
-checkpoints**, which preserve conversation/message history, interrupts, and
-resumability, and **backend filesystem/memory**, which decides whether files
-survive a thread and where they physically live.
+A dcode thread is LangGraph state plus dcode-managed metadata. Checkpoints and pending writes are the authority for graph recovery; SQLite names, counters, costs, and prompts are side records; offloaded Markdown history is a separate recoverability artifact. Treating those layers as one transaction or one backup target is unsafe. Talon has its own runtime boundary: its default checkpointer is in memory unless a host supplies a durable saver.
 
-This page explains the state schema, the `DeltaChannel` reducer that keeps
-checkpoint growth linear, how middleware contributes state without leaking
-private fields into subagents, and how the two persistence axes relate. For how
-long message histories are compacted or offloaded (a consumer of this state
-model), see [Context management](/openwiki/concepts/context-management.md). For
-the backend routes that back the filesystem axis, see
-[Backends](/openwiki/concepts/backends.md).
+## Persistence boundaries
 
-## The state schema: DeepAgentState
+| Data | Owner and scope | Recovery implication |
+| --- | --- | --- |
+| Graph channels and pending writes | LangGraph `checkpoints` and `writes` rows for a thread | Resume reads the selected checkpoint, including graph-private channels. |
+| dcode discovery and display metadata | Local `DEFAULT_STATE_DIR / "sessions.db"` and dcode side tables | Session listing and labels survive independently of a transcript projection. |
+| Goal, rubric, and model resume state | Versioned checkpoint channels and append-only internal notices | A resumed client restores state without replaying or retokenizing history. |
+| Compaction archive and handoff snapshot | Per-thread Markdown history on the configured backend | It is a recovery aid with its own retention and deletion lifecycle. |
+| Talon conversation state | Supplied checkpointer, or default `InMemorySaver` | Default state lasts only for the running process. |
 
-`DeepAgentState` subclasses LangChain's `AgentState`. Its only override is the
-`messages` field, which is annotated with a `DeltaChannel` reducer instead of
-the default `add_messages` reducer:
+## Local SQLite sessions
 
-```python
-class DeepAgentState(AgentState):
-    messages: Required[Annotated[list[AnyMessage], DeltaChannel(_messages_delta_reducer, snapshot_frequency=50)]]
-```
+`get_db_path()` hardens `DEFAULT_STATE_DIR` and resolves `sessions.db`. `get_checkpointer()` owns an `aiosqlite` connection and returns an ownership-fenced `AsyncSqliteSaver`. Its connection wrapper retains and explicitly closes the worker-created SQLite handle if opening is cancelled, then drains the worker after close so teardown does not schedule callbacks onto a closed event loop.
 
-The class docstring states the reason directly: the `DeltaChannel` on `messages`
-reduces checkpoint growth from O(N²) to O(N). Every other field a running agent
-relies on — `todos`, `files`, `structured_response`, and middleware-specific
-fields — is contributed by middleware state schemas rather than declared here.
+Thread discovery derives metadata from checkpoint rows. A covering index supports grouped listing without reading large serialized checkpoint blobs; failure to create it is logged and leaves listing correct but slower. Filters can match agent, Git branch, or the exact stored `cwd`; `cwd` is not normalized or prefix-matched. A DeltaChannel snapshot may omit inline `messages`, so visible message counts are rebuilt from root-namespace message writes in checkpoint/task/index order, including pending writes visible from a head-state read.
 
-`DeepAgentState` is the default `state_schema` that `create_deep_agent` forwards
-to `langchain.agents.create_agent`. Because it is a `TypedDict`, the requirement
-that a custom `state_schema` subclass `DeepAgentState` is enforced only by the
-type checker; there is no runtime `issubclass` check.
+Names are deliberately side metadata. dcode prefers `dcode_thread_names`, falls back to the latest root checkpoint's `thread_name` for old stores, and uses an immediate transaction for rename. Conditional automatic naming cannot overwrite a concurrently established name.
 
-## Why DeltaChannel: linear checkpoint growth
+## Writer ownership and deletion
 
-With the default append reducer, every checkpoint stores the full message list,
-so a thread of N steps writes roughly N + (N-1) + ... = O(N²) message copies
-across all checkpoints. `DeltaChannel` instead persists deltas and writes a full
-snapshot only every `snapshot_frequency` steps (50). Replay reconstructs the
-current value from the most recent snapshot plus the deltas after it, so total
-persisted volume grows linearly with thread length while bounding replay depth.
-
-The same `DeltaChannel(..., snapshot_frequency=50)` pattern is applied to the
-`files` state key on `FilesystemState`, for the same reason: state-backed files
-can be large and change often, so snapshots every ~50 pregel steps bound read
-depth.
-
-## The messages delta reducer
-
-`_messages_delta_reducer` is a batch reducer designed specifically for use with
-`DeltaChannel` on the `messages` key. Its responsibilities are narrow and its
-invariants matter:
-
-- **Flatten and coerce writes.** Each write is either a list of message-likes or
-  a single message-like; only lists are flattened. Raw `dict` / `str` / `tuple`
-  inputs are coerced to typed `BaseMessage` via `convert_to_messages`, so
-  HTTP-driven graphs work without a separate coercion step. A fast path skips
-  coercion when the input is already typed `BaseMessage`.
-- **Dedup and update by ID.** Messages are indexed by `id`. A write whose `id`
-  already exists replaces the existing entry in place; a new `id` is appended.
-- **Tombstone via RemoveMessage.** A `RemoveMessage` whose id matches an existing
-  message removes it. A `RemoveMessage` carrying the `REMOVE_ALL_MESSAGES`
-  sentinel resets the whole list, discarding prior state and any writes before
-  the sentinel.
-- **`id=None` messages are appended as-is** rather than deduped.
-- **Tolerate `state is None` on replay.** `DeltaChannel.replay_writes` can pass
-  `state=None` for threads whose earliest checkpoint did not seed `messages: []`;
-  the reducer treats that as the empty list.
-
-The reducer intentionally does **not** assign message IDs. LangGraph's
-`ensure_message_ids` hook stamps stable UUIDs on all `BaseMessage` writes before
-they are serialized to the checkpoint, so by the time the reducer runs a message
-already has a stable ID. Assigning IDs inside the reducer would be redundant and
-fragile, because the reducer also runs on replay, where a freshly random ID would
-diverge from the one stored in the checkpoint. Tests assert the end-to-end
-property this enables: `get_state()` always returns messages with stable,
-non-None IDs — both within a single invocation and across resumed threads, and
-for both `BaseMessage` and dict-style (over-the-wire) input.
-
-This reducer is a Deep Agents-local adaptation of langgraph's upstream
-`_messages_delta_reducer`. Unlike upstream, it deliberately skips coercing
-`BaseMessageChunk` writes to full messages, because Deep Agents never writes
-chunks to the `messages` channel (`create_agent` appends full `AIMessage`
-objects, and streaming operates on the output side via `astream_events`).
+Writers reserve a local thread with operating-system locks, hashed private lock paths, and a random fencing token. `writer_guard` serializes in-process and cross-process mutation, validates the live reservation and token, and the owned saver applies it to checkpoint and pending-write mutations. A stale token or released lease is rejected; deletion likewise refuses a thread owned by another client.
 
 ```mermaid
 flowchart TD
-    W["writes: message-likes"] --> F["flatten lists, coerce dict / str / tuple to BaseMessage"]
-    F --> R{"RemoveMessage with REMOVE_ALL_MESSAGES?"}
-    R -->|yes| Reset["clear state and drop writes before sentinel"]
-    R -->|no| Idx["index existing state by id"]
-    Reset --> Idx
-    Idx --> P{"per write message"}
-    P -->|"id is None"| App["append as-is"]
-    P -->|"RemoveMessage, id known"| Tomb["tombstone existing entry"]
-    P -->|"id already present"| Upd["replace in place"]
-    P -->|"new id"| App2["append and index"]
-    App --> Out["drop tombstones, return list"]
-    Tomb --> Out
-    Upd --> Out
-    App2 --> Out
+    Client["dcode client"] --> Lease["acquire thread lease"]
+    Lease --> Token["fencing token"]
+    Token --> Gate["writer guard"]
+    Gate --> Saver["owned SQLite saver"]
+    Saver --> Checkpoints["checkpoint rows"]
+    Saver --> Writes["pending writes"]
+    Delete["delete thread"] --> DeleteLease["temporary lease"]
+    DeleteLease --> DeleteGate["writer guard"]
+    DeleteGate --> Rows["delete graph and side rows"]
+    Rows --> Cleanup["best effort archive cleanup"]
 ```
+*Local writes and deletion must pass the same ownership fence before changing SQLite state.*
 
-Control flow of `_messages_delta_reducer` for one batch of writes.
+Deletion removes checkpoint and write rows together with names, message-count records, prompts, and side-question costs while holding that fence. It then best-effort removes the normal compaction archive and hash-prefixed handoff snapshots. Filesystem cleanup failures are logged but do not change whether checkpoint deletion succeeded.
 
-## Middleware-owned state vs custom state_schema
+## Keep state small and model-visible state coherent
 
-There are two ways state fields enter the graph, and choosing between them is an
-architectural decision:
+Every graph-state channel is stored inline on every checkpoint step; blobs are not deduplicated, except that `messages` is delta encoded. Keep rendered prompts, file contents, caches, and other large or derivable values out of channels—including private channels—and use a per-thread side table when a value must persist separately. Private channels also do not transfer persistent parent state across a subagent `task` boundary.
 
-- **Middleware-owned state.** Middleware declare their own `state_schema`
-  (`FilesystemState.files`, the planning `todos` field, etc.). `create_deep_agent`
-  collects `mw.state_schema` from every assembled middleware and merges them into
-  the graph schema. Prefer this when a field is only meaningful to the middleware
-  that owns it, so it stays scoped to that middleware's hooks and tools.
-- **Custom `state_schema`.** A caller passes a `TypedDict` subclass of
-  `DeepAgentState` as `state_schema`. It becomes the base graph schema, is merged
-  with middleware schemas, and is forwarded when compiling declarative `SubAgent`
-  specs for the `task` tool so subagents see the same custom fields as the parent.
-  Prefer this when tools or multiple middleware need a shared graph-level field.
+Goal/rubric channels are checkpointed state, but their model-facing representation is a framework-owned `HumanMessage`, not user conversation. A canonical notice has `lc_source="goal_state"`, schema/version and fingerprint metadata, and is excluded from transcript, title, and derived-conversation projections. It embeds user- or agent-controlled objective, criteria, and status text as escaped, labeled context data. On a size-limit violation it suppresses those fields and tells the model not to act on the saved goal rather than putting an oversized payload into a request.
 
-`CompiledSubAgent` runnables do not inherit a custom `state_schema` (they are
-already compiled), and remote `AsyncSubAgent` specs use the schema configured on
-the remote graph.
+The client writes accepted goal/rubric state and an optional notice in one `aupdate_state` update. Before a model call it reads the checkpoint and appends a new notice only if the latest valid, visible notice does not match the desired state fingerprint. It defers while tool-call repair is required. Thus a resumed thread repairs missing, stale, invalid, or compacted-away guidance without exposing control messages as conversation.
 
-## Private fields must not leak into subagents
+Summarization is non-destructive: the raw `messages` channel remains checkpointed and `_summarization_event` controls the request-time cutoff. The cutoff is anchored by message ID if earlier entries moved. A malformed, negative, non-integer, or out-of-range cutoff is discarded rather than clamped; the next request sends untrimmed history and logs the condition, avoiding a stale offset that would hide live turns.
 
-Middleware state fields can be marked private with `PrivateStateAttr`.
-`private_state_field_names` scans every state schema (the custom schema plus each
-middleware's schema) and returns the frozenset of field names carrying that
-marker. `create_deep_agent` computes this set and assigns it to the subagent
-middleware's `private_state_keys`.
+## Archives, offload, and handoff consistency
 
-The `task` tool then enforces the boundary in both directions:
+Local offloaded history uses a hardened `conversation_history` directory below the profile where possible. If that location cannot be used, dcode selects a private temporary fallback and marks storage ephemeral. `history.retention_days` controls a non-raising sweep; zero disables it. Expiry considers only direct regular Markdown archives and is serialized against archive refresh. Thread deletion remains independent of retention.
 
-- **On the way in**, parent state is filtered to drop `_EXCLUDED_STATE_KEYS`
-  (`messages`, `todos`, `structured_response`) and every private key before the
-  subagent is invoked with a fresh `HumanMessage`.
-- **On the way back**, the subagent's result is filtered by the same exclusions
-  and private keys before it is merged into parent state; only the final message
-  is forwarded as a `ToolMessage`.
-
-`private_state_field_names` resolves annotations at runtime with
-`get_type_hints`. A schema whose `PrivateStateAttr` annotation references a
-`TYPE_CHECKING`-only name cannot be resolved; that schema is skipped with a
-warning rather than failing the whole agent. This is a real hazard, not cosmetic:
-a skipped schema keeps **none** of its private fields, so they will be forwarded
-to and merged back from subagents. Keep names used in `PrivateStateAttr`
-annotations importable at runtime.
-
-## Two persistence axes
-
-Persistence in Deep Agents is two related but separate mechanisms. Conflating
-them is a common source of confusion when debugging why data did or did not
-survive.
-
-| Axis | Owner | Preserves | Scope |
-| --- | --- | --- | --- |
-| Graph state / checkpoints | LangGraph checkpointer | conversation state, message history, interrupts, resumability | per thread |
-| Filesystem / memory | Deep Agents backends | files and long-term memory | depends on backend route |
-
-**LangGraph checkpoints** are configured by passing a `checkpointer` to
-`create_deep_agent`, which forwards it to `create_agent`. Checkpoints save the
-graph state (including `messages`, `todos`, and state-backed `files`) after each
-step, enabling interrupts and thread resumption. The `DeltaChannel` reducer above
-is what makes this checkpointing cheap over long threads.
-
-**Backend persistence** is a separate axis. The default `StateBackend` stores
-files inside agent state, so they are checkpointed with the thread but persist
-only *within* that conversation thread, not across threads. It reads and writes
-through LangGraph's `CONFIG_KEY_READ` / `CONFIG_KEY_SEND` config keys, so it only
-works inside a graph execution. Store-backed or filesystem-backed routes make
-files durable across threads or map them to disk / sandbox storage; a `store`
-passed to `create_deep_agent` is required when a backend uses a store route. See
-[Backends](/openwiki/concepts/backends.md) for the route model and
-[Cost and sessions](/openwiki/operations/cost-and-sessions.md) for how thread
-scoping affects sessions.
+A forced compaction first plans the summary and an archive append. The server reserves the summary state, then writes the archive under a per-session archive lock, then updates the checkpoint event with the archive path. The append retains the exact prior file content: if the follow-up link is confirmed absent, it rolls back; if the server cannot determine whether the link landed, it reports an indeterminate outcome rather than claiming recoverability. An archive write failure can leave a useful in-context summary but no recovery file, and is reported as such.
 
 ```mermaid
-flowchart LR
-    subgraph Run["Agent run"]
-        S["DeepAgentState: messages, todos, files, middleware fields"]
-    end
-    S -->|"DeltaChannel deltas plus snapshots"| CP["LangGraph checkpointer, per thread"]
-    S -->|"StateBackend files in state"| CP
-    S -->|"store or filesystem route"| DUR["Durable store or disk, across threads"]
-    CP -->|"resume, interrupts, replay"| Run
+sequenceDiagram
+    participant Caller as Offload caller
+    participant Service as Server offload
+    participant Store as Checkpoint store
+    participant Archive as Archive backend
+    Caller->>Service: request for idle thread
+    Service->>Store: read checkpoint and remember id
+    Service->>Service: plan summary
+    Service->>Store: recheck id and reserve state
+    Service->>Archive: append reversible transcript
+    Service->>Store: link archive path in event
+    Store-->>Service: link confirmed or absent
+    Service-->>Caller: complete or indeterminate result
 ```
+*The archive becomes advertised recovery state only after the checkpoint link is confirmed; a confirmed failed link restores the prior archive.*
 
-The two persistence axes: checkpoints capture thread state, while store or disk
-routes make backend files durable beyond a single thread.
+The server-owned `/offload` boundary serializes each thread, allows only idle or error-status registered threads with no pending graph work, and rechecks the checkpoint after summarization. Client transport settings are untrusted: credential-routing parameters are stripped and model selection/parameters are restored from checkpoint state. The permitted write set is derived from `OffloadStateUpdate`, excluding `messages`; this is essential because the operation commits against current state after its read. Cost settlement rolls back only after a confirmed unchanged write; ambiguous or advanced state keeps records claimed to prevent double charging. Commit work completes before request cancellation is re-raised.
 
-## Practical implications
+A cache handoff has different semantics. It summarizes all source messages, preserves the source context without writing a summary event, stores only settled summarizer cost on the source, and writes an immutable recovery transcript whose session ID is prefixed with a hash of the source thread. The child is seeded with the returned summary and recovery reference. When server and local checkpoint storage differ, the client mirrors a local discovery seed; with shared storage it updates shared metadata instead. The source-derived archive prefix lets source deletion clean snapshots even if child creation did not finish.
 
-- Long threads stay affordable to checkpoint because `messages` (and state-backed
-  `files`) persist as deltas with periodic snapshots, not full copies per step.
-- Message IDs are stable across resumes; do not rely on the reducer to mint IDs.
-- If you add application state, prefer middleware-owned state for
-  middleware-local fields and a custom `state_schema` (subclassing
-  `DeepAgentState`) for shared graph-level fields — and remember `messages` must
-  keep the `DeltaChannel` reducer.
-- If subagents unexpectedly see or overwrite internal fields, check that the
-  fields are annotated `PrivateStateAttr` and that
-  `private_state_field_names` could resolve the schema (no `TYPE_CHECKING`-only
-  names in the annotation).
-- Files in the default `StateBackend` disappear when you start a new thread; use a
-  store- or filesystem-backed route for cross-thread durability.
+## Server construction and compatibility
+
+The development-server scaffold passes the local sessions database path in `DEEPAGENTS_CODE_SERVER_DB_PATH` and generates a factory using the ownership-fenced SQLite saver. It installs delta-history forwarding because langgraph-api's private custom-checkpointer adapter otherwise inherits base delta-history methods and can bypass an inner saver override. The patch is idempotent and best effort: it delegates only when the inner saver overrides the method, otherwise retains the base ancestor walk, and a missing adapter warns rather than blocking startup.
+
+## Talon recovery boundary
+
+`DeepAgentRuntime` uses a supplied LangGraph checkpointer when given; otherwise `_transcript_saver()` returns `InMemorySaver`. A `ConversationSaver` additionally receives the transcript home used to coordinate local hook erasure with archive deletion. Durable Talon recovery is therefore a host/checkpointer deployment concern, not a promise made by the runtime default.
+
+After an interrupted Talon conversation, `recover_interrupted()` reads the latest committed snapshot, asks `PatchToolCallsMiddleware` to repair any dangling tool-call batch, and writes the repaired messages plus a framework interruption marker at that snapshot's configuration. The operation requires a started graph with async state APIs and adds recovery trace metadata. It deliberately appends after committed state rather than attempting to recreate uncheckpointed work.
+
+## Safe changes and focused tests
+
+- Construct writable local savers through `get_checkpointer()` and propagate the ownership token; do not open an unfenced saver against `sessions.db`.
+- Preserve database-first, fenced deletion and best-effort file cleanup ordering.
+- Preserve the notice fingerprint/schema, internal-message filters, and request-time cutoff validation when changing goal state or transcript projections.
+- Preserve the reserve → append → link/verify archive protocol and conservative ambiguous-write cost settlement.
+- Do not broaden server offload channels without reconsidering the checkpoint race and credentialed model trust boundary.
+- Test persisted goal notices across stale state, compaction cutoffs, malformed events, and incomplete tool batches in `test_goal_state_persistence.py`; test archive/offload failure and concurrency behavior in `test_offload.py` and `test_offload_api.py`; test leases and stale writers in `test_thread_ownership.py`.
+
+See also [SDK construction and execution](/openwiki/architecture/sdk-construction-execution.md), [Context management](/openwiki/concepts/context-management.md), [Talon history storage](/openwiki/concepts/talon-history-storage.md), and [Security](/openwiki/operations/security.md).

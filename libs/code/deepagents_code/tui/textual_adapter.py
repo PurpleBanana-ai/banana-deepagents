@@ -38,11 +38,22 @@ if TYPE_CHECKING:
     from pydantic import TypeAdapter
 
     from deepagents_code._ask_user_types import AskUserWidgetResult, Question
+    from deepagents_code.cold_cache import CacheActivity
     from deepagents_code.hooks.models.domain import ToolCallData
     from deepagents_code.resume_state import RubricResult
 
     # Type alias matching HITLResponse["decisions"] element type
     HITLDecision = ApproveDecision | EditDecision | RejectDecision
+
+    class _StateUpdater(Protocol):
+        """Agent state-update surface used by interruption recovery."""
+
+        async def aupdate_state(
+            self,
+            config: RunnableConfig,
+            values: dict[str, Any],
+            **kwargs: object,
+        ) -> None: ...
 
     class _TokensUpdateCallback(Protocol):
         """Callback signature for `_on_tokens_update`."""
@@ -71,15 +82,26 @@ if TYPE_CHECKING:
             *,
             thread_id: str = "",
             pricing_ok: bool | None = None,
+            breakdown: Mapping[str, Any] | None = None,
         ) -> None: ...
 
     class _ProvisionalCostCallback(Protocol):
         """Callback signature for `_on_provisional_cost`.
 
-        Positional-only for the same reason as `_SessionCostCallback`.
+        `cost_usd` is positional-only for the same reason as
+        `_SessionCostCallback`. The rest are keyword-only: an implementation
+        must handle them, so a silent regression to unreconciled deltas is a
+        type error rather than a display bug.
         """
 
-        def __call__(self, cost_usd: float, /) -> None: ...
+        def __call__(
+            self,
+            cost_usd: float,
+            /,
+            *,
+            request_id: str | None,
+            is_correction: bool,
+        ) -> None: ...
 
 
 from deepagents_code import _session_stats
@@ -93,7 +115,10 @@ from deepagents_code._ask_user_types import (
     AskUserRowSummary,
 )
 from deepagents_code._cli_context import CLIContext
-from deepagents_code._constants import SYSTEM_MESSAGE_PREFIX
+from deepagents_code._constants import (
+    SYSTEM_MESSAGE_PREFIX,
+    TASK_INTERRUPTED_MESSAGE_SOURCE,
+)
 from deepagents_code._content_blocks import reasoning_text
 from deepagents_code._tool_stream import (
     UNRENDERABLE_TOOL_OUTPUT,
@@ -128,6 +153,17 @@ from deepagents_code.model_retry import (
     model_retry_from_event,
     retry_marker_from_event,
     retry_status_from_event,
+)
+from deepagents_code.output_truncation import describe_truncation, output_truncation
+from deepagents_code.skills.invocation import pinned_skill_parts
+from deepagents_code.skills.load_errors import (
+    format_skills_load_errors,
+    skills_load_errors_from_event,
+)
+from deepagents_code.skills.trust import (
+    SKILL_TRUST_INTERRUPT_TYPE,
+    SkillTrustRequest,
+    parse_skill_trust_request,
 )
 from deepagents_code.tool_display import format_tool_message_content
 from deepagents_code.tui.widgets.messages import (
@@ -205,6 +241,46 @@ def _dispatch_tool_use_hook(
 def _dispatch_tool_error_hook(tool_name: str) -> None:
     """Dispatch a `tool.error` hook with the payload documented in `hooks`."""
     dispatch_hook_fire_and_forget("tool.error", build_tool_error_payload(tool_name))
+
+
+class _PartialTruncationTracker:
+    """Find streamed replies that showed some output but were cut off.
+
+    A reply cut off before any output fails on the server
+    (`EmptyTruncatedReplyMiddleware`) and reaches the user as an error. This
+    tracker covers the other case: the user saw part of a reply, so the turn
+    goes on, but the user must know that the reply is incomplete.
+    """
+
+    def __init__(self) -> None:
+        self._replied: set[tuple[tuple, str | None]] = set()
+        self._warned: set[tuple[tuple, str | None]] = set()
+
+    def observe(self, ns_key: tuple, message: object) -> str | None:
+        """Record one streamed chunk of a model reply.
+
+        Args:
+            ns_key: Namespace of the agent that streamed the chunk.
+            message: The streamed chunk. Objects that are not messages are
+                ignored.
+
+        Returns:
+            Warning text the first time a reply with output is cut off,
+                else `None`.
+        """
+        from langchain_core.messages import BaseMessage
+
+        if not isinstance(message, BaseMessage):
+            return None
+        key = (ns_key, message.id)
+        tool_chunks = getattr(message, "tool_call_chunks", None)
+        if tool_chunks or getattr(message, "tool_calls", None) or message.text.strip():
+            self._replied.add(key)
+        truncation = output_truncation(message)
+        if truncation is None or key not in self._replied or key in self._warned:
+            return None
+        self._warned.add(key)
+        return f"The reply was cut off: {describe_truncation(truncation)}."
 
 
 def _is_ask_user_transcript(body: str) -> bool:
@@ -818,8 +894,21 @@ class TextualUIAdapter:
         on_approval_mode_fallback: Callable[[str], None] | None = None,
         *,
         show_diff_line_numbers: bool = True,
+        request_skill_trust: Callable[[str, str], Awaitable[bool]] | None = None,
+        on_skill_pinned: Callable[[str, str, str], None] | None = None,
+        on_cache_reconciliation: Callable[
+            [bool, CacheActivity | None, bool], Awaitable[None]
+        ]
+        | None = None,
     ) -> None:
         """Initialize the adapter."""
+        self._on_cache_reconciliation = on_cache_reconciliation
+        self._cache_attempt: tuple[str, int] | None = None
+        self._cache_activity: CacheActivity | None = None
+        self._cache_settled: set[tuple[str, int]] = set()
+        self.stream_completed = False
+        """Whether the most recent execution reached a clean end of stream."""
+
         self._mount_message = mount_message
         """Async callback to mount a message widget to the chat."""
 
@@ -867,6 +956,16 @@ class TextualUIAdapter:
         agent-executed tool (e.g. `git checkout`) returns, instead of waiting
         for the full turn to finish.
         """
+
+        self._request_skill_trust = request_skill_trust
+        """Async callback asking whether to trust a skill directory.
+
+        Called with the skill name and directory from a server `skill_trust`
+        interrupt. Without it, every such request is denied.
+        """
+
+        self._on_skill_pinned = on_skill_pinned
+        """Callback fired with `(name, description, body)` when a skill is pinned."""
 
         self._on_subagent_event = on_subagent_event
         """Sync callback fired for each validated `subagent` custom-stream event."""
@@ -916,6 +1015,10 @@ class TextualUIAdapter:
         Keeps the status bar moving during work whose cost the graph has not
         checkpointed yet — a long subagent run, say — without making the client
         a second authority: every server total replaces what this accumulated.
+        `request_id` names the request the delta belongs to so a late
+        correction only retracts its own contribution, and `is_correction`
+        marks a delta that only revises spend already reported, so one whose
+        subject a backend total has settled is dropped whatever its sign.
         """
 
         self._on_usage_update: Callable[[], None] | None = None
@@ -923,6 +1026,59 @@ class TextualUIAdapter:
 
         self._on_stream_complete: Callable[[], None] | None = None
         """Called only after the agent stream reaches a clean end."""
+
+    async def _reconcile_cache(
+        self, *, pending: bool = False, read: bool = False, write: bool = False
+    ) -> None:
+        """Settle the active request before releasing expiry notifications."""
+        if self._on_cache_reconciliation:
+            await self._on_cache_reconciliation(
+                pending, self._cache_activity if read or write else None, write
+            )
+        if not pending and self._cache_attempt is not None:
+            self._cache_settled.add(self._cache_attempt)
+
+    async def _cache_attempt_event(self, event: dict[str, Any]) -> None:
+        """Ignore stale boundaries and renew only from confirmed cache usage."""
+        from deepagents_code.cold_cache import parse_cache_activity
+        from deepagents_code.model_retry import model_attempt_from_event
+
+        parsed = model_attempt_from_event(event)
+        if parsed is None:
+            return
+        scope = (cast("str", parsed["call_id"]), cast("int", parsed["attempt"]))
+        if scope in self._cache_settled:
+            return
+        if parsed["phase"] == "start":
+            if scope == self._cache_attempt:
+                return
+            if self._cache_attempt is not None:
+                self._cache_settled.add(self._cache_attempt)
+            self._cache_attempt = scope
+            self._cache_activity = parse_cache_activity(event.get("cache_activity"))
+            await self._reconcile_cache(pending=self._cache_activity is not None)
+        elif scope == self._cache_attempt:
+            await self._reconcile_cache(
+                read=event.get("cache_read") is True,
+                write=event.get("cache_write") is True,
+            )
+
+    async def _cache_usage(self, message: object, metadata: object) -> None:
+        """Use correlated main-model cache usage as soon as it is streamed."""
+        from deepagents_code.cost_tracking import cache_token_counts
+
+        if (
+            self._cache_attempt is None
+            or self._cache_attempt in self._cache_settled
+            or not isinstance(metadata, dict)
+        ):
+            return
+        scope = metadata.get("dcode_cache_attempt")
+        if not isinstance(scope, (tuple, list)) or tuple(scope) != self._cache_attempt:
+            return
+        reads, writes = cache_token_counts(getattr(message, "usage_metadata", None))
+        if reads or any(writes):
+            await self._reconcile_cache(read=bool(reads), write=any(writes))
 
     def _reset_auto_mode_review_tracking(self) -> None:
         """Start each user turn with no in-flight batch and no replay guard.
@@ -1087,15 +1243,96 @@ class TextualUIAdapter:
             self._set_active_message(None)
 
 
+def _message_tool_call_ids(message: object) -> set[str]:
+    """Return tool-call IDs from a serialized or deserialized message."""
+    tool_calls = (
+        message.get("tool_calls")
+        if isinstance(message, dict)
+        else getattr(message, "tool_calls", None)
+    )
+    if not isinstance(tool_calls, list):
+        return set()
+    return {
+        tool_id
+        for call in tool_calls
+        if isinstance(
+            tool_id := call.get("id") if isinstance(call, dict) else None, str
+        )
+    }
+
+
+def _current_turn_messages(state: object) -> list[object]:
+    """Return checkpointed messages after the current turn's user message."""
+    values = getattr(state, "values", None)
+    if not isinstance(values, dict) or not isinstance(values.get("messages"), list):
+        return []
+
+    current: list[object] = []
+    for message in reversed(values["messages"]):
+        message_type = (
+            message.get("type")
+            if isinstance(message, dict)
+            else getattr(message, "type", None)
+        )
+        if message_type in {"human", "HumanMessage"}:
+            break
+        current.append(message)
+    return current
+
+
+def _tool_call_ids_from_current_turn(state: object) -> set[str]:
+    """Return tool-call IDs checkpointed after the current turn's user message."""
+    persisted: set[str] = set()
+    for message in _current_turn_messages(state):
+        persisted.update(_message_tool_call_ids(message))
+    return persisted
+
+
+def _is_ai_message(message: object) -> bool:
+    """Return whether a message is serialized or deserialized assistant output."""
+    message_type = (
+        message.get("type")
+        if isinstance(message, dict)
+        else getattr(message, "type", None)
+    )
+    return message_type in {"ai", "AIMessage"}
+
+
+def _content_from_message(message: object) -> str:
+    """Return plain text content when a message uses that representation."""
+    content = (
+        message.get("content")
+        if isinstance(message, dict)
+        else getattr(message, "content", None)
+    )
+    return content.strip() if isinstance(content, str) else ""
+
+
+def _persisted_text_for_tool_calls(
+    messages: list[object], tool_call_ids: set[str]
+) -> str:
+    """Return text from the checkpointed AI message owning active tool calls."""
+    if not tool_call_ids:
+        return ""
+    for message in messages:
+        if _is_ai_message(message) and _message_tool_call_ids(message) & tool_call_ids:
+            return _content_from_message(message)
+    return ""
+
+
 def _build_interrupted_ai_message(
     pending_text_by_namespace: dict[tuple, str],
     current_tool_messages: dict[str, Any],
+    persisted_tool_call_ids: set[str] | None = None,
+    persisted_text: str = "",
 ) -> AIMessage | None:
     """Build an AIMessage capturing interrupted state (text + tool calls).
 
     Args:
         pending_text_by_namespace: Dict of accumulated text by namespace
         current_tool_messages: Dict of tool_id -> ToolCallMessage widget
+        persisted_tool_call_ids: Tool calls already owned by the graph checkpoint.
+        persisted_text: Assistant text already owned by the current checkpoint.
 
     Returns:
         AIMessage with accumulated content and tool calls, or None if empty.
@@ -1104,10 +1341,20 @@ def _build_interrupted_ai_message(
 
     main_ns_key = ()
     accumulated_text = pending_text_by_namespace.get(main_ns_key, "").strip()
+    if accumulated_text == persisted_text:
+        accumulated_text = ""
 
     # Reconstruct tool_calls from displayed tool messages
     tool_calls = []
+    persisted_tool_call_ids = persisted_tool_call_ids or set()
     for tool_id, tool_widget in list(current_tool_messages.items()):
+        if tool_id in persisted_tool_call_ids:
+            logger.info(
+                "Omitting tool call %s from interrupted AIMessage; the graph "
+                "already owns it in the current turn",
+                tool_id,
+            )
+            continue
         if tool_widget.deferred_success_output is not None:
             # An answered `ask_user` stays tracked until its `ToolMessage`
             # arrives, so a cancel lands here with the row still present. The
@@ -1314,6 +1561,18 @@ def _session_cost_thread_id(data: Any) -> str:  # noqa: ANN401  # custom-stream 
     return thread_id if isinstance(thread_id, str) else ""
 
 
+def _session_cost_breakdown(data: Any) -> Mapping[str, Any] | None:  # noqa: ANN401
+    """Return an optional versioned breakdown from a validated cost event."""
+    from deepagents_code.cost_tracking import SESSION_COST_EVENT_VERSION
+
+    if not isinstance(data, dict) or data.get("version") != SESSION_COST_EVENT_VERSION:
+        return None
+    breakdown = data.get("breakdown")
+    if not isinstance(breakdown, dict) or breakdown.get("version") != 1:
+        return None
+    return breakdown
+
+
 def _session_cost_pricing_ok(data: Any) -> bool | None:  # noqa: ANN401  # custom-stream payload is dynamic
     """Return whether the pricing process reported healthy price data.
 
@@ -1512,12 +1771,27 @@ def _apply_recorded_usage(
         adapter._on_usage_update()
     if recorded_usage.cost_usd is None or not adapter._on_provisional_cost:
         return
+    if recorded_usage.cost_usd == 0:
+        # A zero delta changes nothing, so do not forward it.
+        return
     # Display-only: the graph checkpoints the same spend and streams the
-    # authoritative total, which supersedes this estimate.
+    # authoritative total, which supersedes this estimate. The request ID lets
+    # the app reconcile a later correction with its own contribution rather
+    # than the whole running provisional total.
     try:
-        adapter._on_provisional_cost(recorded_usage.cost_usd)
+        adapter._on_provisional_cost(
+            recorded_usage.cost_usd,
+            request_id=recorded_usage.request_id,
+            is_correction=recorded_usage.is_correction,
+        )
     except Exception:
-        logger.warning("on_provisional_cost callback failed", exc_info=True)
+        logger.warning(
+            "on_provisional_cost callback failed; the provisional cost display "
+            "may stall until the next backend total. request_id=%r delta_usd=%r",
+            recorded_usage.request_id,
+            recorded_usage.cost_usd,
+            exc_info=True,
+        )
 
 
 async def _mount_diff_note(adapter: Any, text: str) -> None:  # noqa: ANN401  # adapter type is the TUI callback bundle
@@ -1542,6 +1816,28 @@ async def _mount_diff_note(adapter: Any, text: str) -> None:  # noqa: ANN401  # 
         logger.exception("Failed to mount diff note: %s", text)
 
 
+async def _resolve_skill_trust(
+    adapter: TextualUIAdapter, request: SkillTrustRequest | None
+) -> bool:
+    """Ask the user about a server skill trust request, failing closed.
+
+    Returns:
+        Whether the user approved the directory. A malformed request, a
+            missing callback, or a prompt error is a deny.
+    """
+    if request is None or adapter._request_skill_trust is None:
+        return False
+    if adapter._set_spinner:
+        await adapter._set_spinner(None)
+    try:
+        return await adapter._request_skill_trust(
+            request["skill"], request["directory"]
+        )
+    except Exception:
+        logger.exception("Skill trust prompt failed; denying")
+        return False
+
+
 async def execute_task_textual(
     user_input: str,
     agent: Any,  # noqa: ANN401  # Dynamic agent graph type
@@ -1552,7 +1848,7 @@ async def execute_task_textual(
     image_tracker: MediaTracker | None = None,
     context: CLIContext | None = None,
     *,
-    show_reasoning: bool = False,
+    show_reasoning: bool = True,
     sandbox_type: str | None = None,
     message_kwargs: dict[str, Any] | None = None,
     skill_name: str | None = None,
@@ -1627,8 +1923,12 @@ async def execute_task_textual(
     from deepagents_code.hooks.client_lifecycle import ClientHookStopError
     from deepagents_code.hooks.models.domain import HookEvent
 
+    adapter.stream_completed = False
     hitl_request_adapter = _get_hitl_request_adapter(HITLRequest)
     ask_user_adapter = _get_ask_user_adapter()
+    adapter._cache_attempt = None
+    adapter._cache_activity = None
+    adapter._cache_settled.clear()
     adapter._reset_auto_mode_review_tracking()
 
     message_content: str | list[dict[str, Any]] | None = None
@@ -1754,6 +2054,7 @@ async def execute_task_textual(
 
     displayed_tool_ids: set[str] = set()
     tool_call_buffers: dict[ToolCallBufferKey, ToolCallBuffer] = {}
+    truncation_tracker = _PartialTruncationTracker()
     # Tool-call ids that already received terminal hooks before a resumed
     # `ToolMessage` can stream. When the turn still resumes, middleware
     # synthetic messages would otherwise re-dispatch `tool.result`; this set
@@ -1847,6 +2148,8 @@ async def execute_task_textual(
             "messages": messages,
             "goal_criteria_request": None,
         }
+        if skill_name and not prompt_outcome.suppress_original_prompt:
+            stream_input["pinned_skills"] = [skill_name]
         if rubric:
             stream_input["rubric"] = rubric
     else:
@@ -1881,6 +2184,7 @@ async def execute_task_textual(
             pending_interrupts: dict[str, tuple[tuple[Any, ...], HITLRequest]] = {}
             pending_ask_user: dict[str, AskUserRequest] = {}
             pending_hook_resumes: dict[str, dict[str, Any]] = {}
+            pending_skill_trust: dict[str, SkillTrustRequest | None] = {}
 
             if context is None:
                 context = CLIContext()
@@ -1898,7 +2202,7 @@ async def execute_task_textual(
                 )
             try:
                 selected_mode = ApprovalMode(raw_mode)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 selected_mode = ApprovalMode.MANUAL
             context["approval_mode"] = selected_mode.value
             context["auto_approve"] = selected_mode is not ApprovalMode.MANUAL
@@ -1999,7 +2303,15 @@ async def execute_task_textual(
                     # than only once it returns. Consume the event whatever came
                     # of it: a duplicate of a request the message stream already
                     # recorded is still ours, not input for the handlers below.
-                    if not is_main_agent and _session_stats.is_model_usage_event(data):
+                    if is_main_agent and _session_stats.is_summarization_started_event(
+                        data
+                    ):
+                        if not summarization_in_progress:
+                            summarization_in_progress = True
+                            if adapter._set_spinner:
+                                await adapter._set_spinner("Offloading")
+                        continue
+                    if _session_stats.is_model_usage_event(data):
                         try:
                             from deepagents_code.config import runtime_state
 
@@ -2035,6 +2347,7 @@ async def execute_task_textual(
                                     session_cost_total,
                                     thread_id=_session_cost_thread_id(data),
                                     pricing_ok=_session_cost_pricing_ok(data),
+                                    breakdown=_session_cost_breakdown(data),
                                 )
                             except Exception:
                                 logger.warning(
@@ -2042,9 +2355,20 @@ async def execute_task_textual(
                                 )
                         continue
 
+                    load_errors = skills_load_errors_from_event(data)
+                    if load_errors is not None:
+                        # A subagent scans the same sources, so show them once.
+                        if is_main_agent and load_errors:
+                            await adapter._mount_message(
+                                AppMessage(format_skills_load_errors(load_errors))
+                            )
+                        continue
+
                     if isinstance(data, dict) and data.get("type") == "model_attempt":
                         attempt_event = model_attempt_from_event(data)
                         if attempt_event is not None:
+                            if is_main_agent:
+                                await adapter._cache_attempt_event(data)
                             attempt_scope = _ModelAttemptScope(
                                 ns_key,
                                 cast("str", attempt_event["call_id"]),
@@ -2147,6 +2471,16 @@ async def execute_task_textual(
 
                     if isinstance(data, dict) and data.get("type") == "model_retry":
                         retry_correlation = model_retry_from_event(data)
+                        if (
+                            is_main_agent
+                            and retry_correlation is not None
+                            and adapter._cache_attempt
+                            == (
+                                retry_correlation["call_id"],
+                                retry_correlation["failed_attempt"],
+                            )
+                        ):
+                            await adapter._reconcile_cache()
                         if is_main_agent and adapter._set_spinner is not None:
                             # Runs for valid, malformed, and legacy (uncorrelated)
                             # retries alike: the spinner status predates attempt
@@ -2343,6 +2677,8 @@ async def execute_task_textual(
 
                 # Handle UPDATES stream - for interrupts and todos
                 if current_stream_mode == "updates":
+                    if is_main_agent:
+                        await adapter._reconcile_cache()
                     if not isinstance(data, dict):
                         continue
 
@@ -2356,6 +2692,17 @@ async def execute_task_textual(
                                     resume_value = await hooks.fulfill_interrupt(iv)
                                     pending_hook_resumes[interrupt_obj.id] = (
                                         resume_value
+                                    )
+                                    interrupt_occurred = True
+                                    continue
+                                if (
+                                    isinstance(iv, dict)
+                                    and iv.get("type") == SKILL_TRUST_INTERRUPT_TYPE
+                                ):
+                                    # A malformed request is kept as `None`
+                                    # and denied when the run resumes.
+                                    pending_skill_trust[interrupt_obj.id] = (
+                                        parse_skill_trust_request(iv)
                                     )
                                     interrupt_occurred = True
                                     continue
@@ -2558,6 +2905,8 @@ async def execute_task_textual(
                     if _is_auto_mode_classifier_chunk(metadata):
                         continue
 
+                    await adapter._cache_usage(message, metadata)
+
                     # Only a visible top-level model call represents the active
                     # conversation context. Hidden usage was still recorded above.
                     if recorded_usage is not None:
@@ -2594,6 +2943,16 @@ async def execute_task_textual(
                             await adapter._set_spinner("Thinking")
 
                     if isinstance(message, HumanMessage):
+                        if (
+                            is_main_agent
+                            and adapter._on_skill_pinned is not None
+                            and (pinned := pinned_skill_parts(message)) is not None
+                        ):
+                            try:
+                                adapter._on_skill_pinned(*pinned)
+                            except Exception:
+                                logger.exception("Failed to render pinned skill")
+                            continue
                         content = message.text
                         # Flush pending text for this namespace
                         pending_text = pending_text_by_namespace.get(ns_key, "")
@@ -2615,6 +2974,7 @@ async def execute_task_textual(
                         continue
 
                     if isinstance(message, ToolMessage):
+                        await adapter._reconcile_cache()
                         tool_name = getattr(message, "name", "")
                         # Normalize to the two-value hook domain, fail-closed: an
                         # unexpected provider status is logged and treated as an
@@ -3158,6 +3518,16 @@ async def execute_task_textual(
                             pending_text_by_namespace[ns_key] = ""
                             assistant_message_by_namespace.pop(ns_key, None)
 
+                    if truncation_warning := truncation_tracker.observe(
+                        ns_key, message
+                    ):
+                        try:
+                            await adapter._mount_message(AppMessage(truncation_warning))
+                        except Exception:
+                            logger.exception("Failed to mount truncation warning")
+
+            await adapter._reconcile_cache()
+
             # Reset summarization state if stream ended mid-summarization
             # (e.g. middleware error, stream exhausted before regular chunks).
             if summarization_in_progress:
@@ -3188,6 +3558,9 @@ async def execute_task_textual(
                 ask_user_cancelled = False
                 dismissed_question_count = 0
                 resume_payload: dict[str, Any] = dict(pending_hook_resumes)
+                for interrupt_id, trust_request in pending_skill_trust.items():
+                    approved = await _resolve_skill_trust(adapter, trust_request)
+                    resume_payload[interrupt_id] = {"approved": approved}
 
                 # Tools mounted above start their spinner immediately, but a
                 # tool blocked on HITL approval or `ask_user` input is not
@@ -3951,12 +4324,13 @@ async def execute_task_textual(
                 if not hooks.has_handlers(HookEvent.NOTIFICATION):
                     await dispatch_hook("task.complete", {"thread_id": thread_id})
                 stream_completed = True
+                adapter.stream_completed = True
                 break
 
     except ClientHookStopError:
         _reject_tracked_rows(adapter)
         raise
-    except (asyncio.CancelledError, KeyboardInterrupt):
+    except asyncio.CancelledError, KeyboardInterrupt:
         await _handle_interrupt_cleanup(
             adapter=adapter,
             agent=agent,
@@ -3996,6 +4370,7 @@ async def execute_task_textual(
                 )
         raise
     finally:
+        await adapter._reconcile_cache()
         # A clean stream can leave its successful final attempt open when the
         # best-effort completion event was lost. Commit those scopes; only an
         # aborted stream owns incomplete records that must be discarded.
@@ -4139,6 +4514,18 @@ async def _stop_assistant_streams(
     assistant_message_by_namespace.clear()
 
 
+async def _update_interrupted_state(
+    agent: _StateUpdater, config: RunnableConfig, values: dict[str, Any]
+) -> None:
+    """Persist recovery state, marking it when the client supports that contract."""
+    update_state = agent.aupdate_state
+    parameters = inspect.signature(update_state).parameters
+    if "recovery" in parameters:
+        await update_state(config, values, recovery=True)
+    else:
+        await update_state(config, values)
+
+
 async def _handle_interrupt_cleanup(
     *,
     adapter: TextualUIAdapter,
@@ -4174,7 +4561,7 @@ async def _handle_interrupt_cleanup(
             `thread_id` in `config` (a contract violation rather than a
             transient remote failure).
     """
-    from langchain_core.messages import HumanMessage
+    from langchain_core.messages import HumanMessage, add_notification_metadata
 
     # Clear active message immediately so it won't block pruning.
     # If we don't do this, the store still thinks it's active and protects
@@ -4197,7 +4584,7 @@ async def _handle_interrupt_cleanup(
         )
 
     # Proactively cancel server-side runs before persisting recovery state, so
-    # the aupdate_state writes below don't 409 against a still-busy thread. This
+    # the aupdate_state write below doesn't 409 against a still-busy thread. This
     # is defense-in-depth layered on top of aupdate_state's own 409 -> cancel ->
     # retry path (see RemoteAgent.aupdate_state); a failure here is not fatal.
     # Absent on local agents, so this is a no-op for them.
@@ -4219,10 +4606,29 @@ async def _handle_interrupt_cleanup(
                 exc_info=True,
             )
 
+    persisted_tool_call_ids: set[str] = set()
+    persisted_text = ""
+    get_state = getattr(agent, "aget_state", None)
+    if recover_interrupted_turn and get_state is not None:
+        try:
+            state = await get_state(config)
+            current_messages = _current_turn_messages(state)
+            persisted_tool_call_ids = _tool_call_ids_from_current_turn(state)
+            persisted_text = _persisted_text_for_tool_calls(
+                current_messages, set(adapter._current_tool_messages)
+            )
+        except Exception:
+            logger.warning(
+                "Could not inspect interrupted state; preserving displayed output",
+                exc_info=True,
+            )
+
     interrupted_msg = (
         _build_interrupted_ai_message(
             pending_text_by_namespace,
             adapter._current_tool_messages,
+            persisted_tool_call_ids,
+            persisted_text,
         )
         if recover_interrupted_turn
         else None
@@ -4234,7 +4640,7 @@ async def _handle_interrupt_cleanup(
     # (mirroring the HITL-reject branches). The turn does not resume from here,
     # so the returned ids need not be tracked for dedup.
     #
-    # Dispatched *before* the `aupdate_state` writes below (not alongside the
+    # Dispatched *before* the `aupdate_state` write below (not alongside the
     # `set_rejected` loop after them): those writes await a possibly-slow remote
     # checkpointer, and on an interactive quit the graceful-exit drain in
     # `app.py` snapshots the in-flight hook tasks right after cancelling this
@@ -4262,22 +4668,23 @@ async def _handle_interrupt_cleanup(
     from langsmith import tracing_context
 
     try:
-        # tracing_context(enabled=False) suppresses only the UpdateState traced
-        # run that each aupdate_state call would otherwise emit in LangSmith — it
-        # does not affect any other tracing in the surrounding turn. These writes
-        # are internal interrupt-recovery mechanics (partial AI message +
-        # cancellation notice), not user-driven agent activity; surfacing them as
-        # standalone peer runs alongside real agent turns clutters the trace view.
+        # This suppresses local UpdateState tracing without affecting the surrounding
+        # turn. A remote server creates its trace after receiving the HTTP request,
+        # outside this context; `_update_interrupted_state` marks those requests so
+        # server-side tracing policy can distinguish the recovery write.
         with tracing_context(enabled=False):
             if recover_interrupted_turn:
-                if interrupted_msg:
-                    await agent.aupdate_state(config, {"messages": [interrupted_msg]})
-
-                cancellation_msg = HumanMessage(
-                    content=f"{SYSTEM_MESSAGE_PREFIX} Task interrupted by user. "
-                    "Previous operation was cancelled."
+                cancellation_msg = add_notification_metadata(
+                    HumanMessage(
+                        content=f"{SYSTEM_MESSAGE_PREFIX} Task interrupted by user. "
+                        "Previous operation was cancelled."
+                    ),
+                    source=TASK_INTERRUPTED_MESSAGE_SOURCE,
                 )
-                cancellation_values: dict[str, Any] = {"messages": [cancellation_msg]}
+                messages = [cancellation_msg]
+                if interrupted_msg:
+                    messages.insert(0, interrupted_msg)
+                cancellation_values: dict[str, Any] = {"messages": messages}
                 # Piggy-back the latest token count on this already-required
                 # write instead of issuing a separate `aupdate_state`.
                 # `after_model` never ran on the partial turn, so without this
@@ -4285,7 +4692,7 @@ async def _handle_interrupt_cleanup(
                 captured_total = captured_input_tokens + captured_output_tokens
                 if captured_total:
                     cancellation_values["_context_tokens"] = captured_total
-                await agent.aupdate_state(config, cancellation_values)
+                await _update_interrupted_state(agent, config, cancellation_values)
     except (httpx.TransportError, httpx.TimeoutException) as e:
         logger.warning("Could not save interrupted state (network): %s", e)
     except Exception as exc:  # interrupt cleanup must not propagate

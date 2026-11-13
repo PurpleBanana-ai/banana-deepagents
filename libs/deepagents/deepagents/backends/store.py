@@ -87,6 +87,27 @@ def _validate_namespace(namespace: tuple[str, ...]) -> tuple[str, ...]:
     return namespace
 
 
+def _encode_upload(content: bytes) -> tuple[str, str]:
+    """Encode uploaded bytes as a `(content, encoding)` pair for storage.
+
+    Content is stored as text only if it is valid UTF-8 and contains no NUL
+    bytes; NUL marks content as binary and can't be stored in a Postgres
+    JSONB-backed store.
+
+    Args:
+        content: Raw uploaded bytes.
+
+    Returns:
+        The stored string and its encoding (`"utf-8"` or `"base64"`).
+    """
+    if b"\x00" not in content:
+        try:
+            return content.decode("utf-8"), "utf-8"
+        except UnicodeDecodeError:
+            pass
+    return base64.standard_b64encode(content).decode("ascii"), "base64"
+
+
 class StoreBackend(BackendProtocol):
     """Backend that stores files in LangGraph's BaseStore (persistent).
 
@@ -347,7 +368,7 @@ class StoreBackend(BackendProtocol):
                 fd = self._convert_store_item_to_file_data(item)
             except ValueError:
                 continue
-            size = len(file_data_to_string(fd))
+            size = len(file_data_to_string(fd).encode("utf-8"))
             infos.append(
                 {
                     "path": item.key,
@@ -443,6 +464,7 @@ class StoreBackend(BackendProtocol):
             file_data = update_file_data(existing_file_data, content)
         else:
             file_data = create_file_data(content)
+        file_data["encoding"] = "utf-8"
         store_value = self._convert_file_data_to_store_value(file_data)
         store.put(namespace, file_path, store_value)
         return WriteResult(path=file_path)
@@ -465,6 +487,7 @@ class StoreBackend(BackendProtocol):
             file_data = update_file_data(existing_file_data, content)
         else:
             file_data = create_file_data(content)
+        file_data["encoding"] = "utf-8"
         store_value = self._convert_file_data_to_store_value(file_data)
         await store.aput(namespace, file_path, store_value)
         return WriteResult(path=file_path)
@@ -492,6 +515,9 @@ class StoreBackend(BackendProtocol):
             file_data = self._convert_store_item_to_file_data(item)
         except ValueError as e:
             return EditResult(error=f"Error: {e}")
+
+        if file_data.get("encoding") == "base64":
+            return EditResult(error="Error: Cannot edit binary files with text replacements.")
 
         content = file_data_to_string(file_data)
         result = perform_string_replacement(content, old_string, new_string, replace_all)
@@ -530,6 +556,9 @@ class StoreBackend(BackendProtocol):
             file_data = self._convert_store_item_to_file_data(item)
         except ValueError as e:
             return EditResult(error=f"Error: {e}")
+
+        if file_data.get("encoding") == "base64":
+            return EditResult(error="Error: Cannot edit binary files with text replacements.")
 
         content = file_data_to_string(file_data)
         result = perform_string_replacement(content, old_string, new_string, replace_all)
@@ -641,7 +670,7 @@ class StoreBackend(BackendProtocol):
         infos: list[FileInfo] = []
         for p in paths:
             fd = files.get(p)
-            size = len(file_data_to_string(fd)) if fd else 0
+            size = len(file_data_to_string(fd).encode("utf-8")) if fd else 0
             infos.append(
                 {
                     "path": p,
@@ -655,8 +684,9 @@ class StoreBackend(BackendProtocol):
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """Upload multiple files to the store.
 
-        Binary files (images, PDFs, etc.) are stored as base64-encoded strings.
-        Text files are stored as utf-8 strings.
+        Content that is valid UTF-8 and contains no NUL bytes is stored as a
+        UTF-8 string. Everything else (images, PDFs, etc.) is stored as a
+        base64-encoded string.
 
         Args:
             files: List of `(path, content)` tuples where content is bytes.
@@ -671,13 +701,7 @@ class StoreBackend(BackendProtocol):
         responses: list[FileUploadResponse] = []
 
         for path, content in files:
-            try:
-                content_str = content.decode("utf-8")
-                encoding = "utf-8"
-            except UnicodeDecodeError:
-                content_str = base64.standard_b64encode(content).decode("ascii")
-                encoding = "base64"
-
+            content_str, encoding = _encode_upload(content)
             file_data = create_file_data(content_str, encoding=encoding)
             store_value = self._convert_file_data_to_store_value(file_data)
 

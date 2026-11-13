@@ -1,175 +1,189 @@
 ---
-type: how-to workflow
-title: "Workflow: Build a Deep Agent with the SDK"
-description: End-to-end, task-focused guide for constructing, extending, and invoking a custom deep agent with create_deep_agent, from the README quickstart through the extension points (tools, middleware, subagents, backends, profiles, skills).
-tags: [deepagents, create_deep_agent, workflow, quickstart, agent-construction, extension-points]
+type: implementation workflow
+title: Build a Deep Agent
+description: Build and customize a Deep Agents graph by deliberately assembling its model, backend, middleware, subagent boundary, prompt-cache layer, and filesystem approval policy. Verify the construction and task-result contract with focused graph and subagent tests.
+tags: [deepagents, agent-construction, middleware, subagents, prompt-caching, permissions, testing]
 verified:
-  - by: openwiki/0.4.0
-    at: 2026-08-26T21:35:57.774Z
+  - by: openwiki/0.4.2
+    at: 2026-11-13T08:03:55.116Z
 sources:
-  - id: openwiki-source-74041f38a072190c5b487aea
-    resource: repo://examples/deep_research/agent.py
+  - id: openwiki-source-b93533cac55718d75277d1cf
+    resource: repo://libs/deepagents/deepagents/_excluded_middleware.py
+  - id: openwiki-source-07f9eac13e71bcbdb4e6994b
+    resource: repo://libs/deepagents/deepagents/backends/state.py
   - id: openwiki-source-0fc0e47059e4d07e23e50be2
     resource: repo://libs/deepagents/deepagents/graph.py
-  - id: openwiki-source-bf922bb2704cfd50154e92e5
-    resource: repo://libs/deepagents/README.md
-  - id: openwiki-source-23775c3de52f3ab95a13cb8b
-    resource: repo://README.md
-generated: {by: "openwiki/0.4.0", at: "2026-08-26T21:35:57.774Z"}
+  - id: openwiki-source-7a16b9a53a07e882b7305459
+    resource: repo://libs/deepagents/deepagents/middleware/_prompt_caching.py
+  - id: openwiki-source-fed4b84a38685f37e58018c5
+    resource: repo://libs/deepagents/deepagents/middleware/filesystem.py
+  - id: openwiki-source-114a1c7a58992fa867a94ef0
+    resource: repo://libs/deepagents/deepagents/middleware/subagents.py
+  - id: openwiki-source-0f308f1610986e2f3ed6d53c
+    resource: repo://libs/deepagents/Makefile
+  - id: openwiki-source-6d183faf1a4bc5a5ba451aba
+    resource: repo://libs/deepagents/tests/unit_tests/test_graph.py
+  - id: openwiki-source-851e3a9c96663d8db5ca3dec
+    resource: repo://libs/deepagents/tests/unit_tests/test_permissions.py
+  - id: openwiki-source-917b61d56e652536ba962f3a
+    resource: repo://libs/deepagents/tests/unit_tests/test_subagent_refusal.py
+  - id: openwiki-source-ca8183c87e6002c442ee2d62
+    resource: repo://libs/deepagents/tests/unit_tests/test_subagents.py
+generated: { by: "openwiki/0.4.2", at: "2026-11-13T08:03:55.116Z" }
 ---
 
-# Workflow: Build a Deep Agent with the SDK
+# Build a Deep Agent
 
-This page walks through building a custom deep agent end to end: construct it with
-`create_deep_agent(...)`, invoke it with `{"messages": ...}`, and let the agent
-loop until the task is done. It stays task-focused — for the internals of how the
-graph is assembled and executed, see
-[SDK construction & execution](/openwiki/architecture/sdk-construction-execution.md).
+`create_deep_agent` is the SDK assembly entry point. It resolves the model and harness profile, selects a backend, turns subagent specifications into model-visible tools, assembles middleware, and returns a configured LangGraph graph. Treat the builder as an integration boundary: `tools=`, `middleware=`, `subagents=`, permissions, backend selection, and profile behavior compose into one graph rather than configuring isolated features.
 
-For working, runnable patterns, start from [`/examples/`](repo://examples) and
-[`libs/deepagents/README.md`](repo://libs/deepagents/README.md).
+See [SDK construction and execution](/openwiki/architecture/sdk-construction-execution.md) for the execution boundary, [SDK Middleware Assembly](/openwiki/architecture/middleware-stack.md) for middleware roles, [subagents and skills](/openwiki/concepts/subagents-skills.md) for delegation concepts, [backends](/openwiki/concepts/backends.md) for storage choices, and the [testing guide](/openwiki/testing/testing-guide.md) for repository-wide test guidance.
 
-## What you are building
+## 1. Choose the model and storage boundary
 
-Deep Agents is an opinionated agent harness built on top of LangChain's
-`create_agent` and LangGraph. `create_deep_agent` bundles planning, a pluggable
-filesystem, subagent delegation, context summarization, skills, and memory into a
-single compiled graph so you get a long-horizon agent out of the box, then
-extend or replace any piece without forking.
+Pass a `provider:model` string or an initialized `BaseChatModel`. The builder resolves an explicit model before choosing its `HarnessProfile`; a pre-initialized model preserves provider-specific configuration. In particular, `openai:` strings use the Responses API by default. Initialize the model yourself to select Chat Completions or to configure Responses retention. Do not rely on `model=None`: its Claude fallback is deprecated and will be removed in `deepagents==1.0.0`.
 
-## Quickstart: construct and invoke
+The resolved model selects the active profile. A profile can supply prompt fragments, tool-description overrides, extra middleware, tool exclusions, middleware exclusions, and the default general-purpose worker. The authored system prompt is assembled in `USER -> BASE -> SUFFIX` order. Supplying a `SystemMessage` preserves its existing content blocks, including cache-control markers, and appends profile prompt text as a new block.
 
-The three arguments you almost always start with are `model`, `tools`, and
-`system_prompt`, straight from the README quickstart:
+Choose the backend as both the filesystem implementation and persistence boundary. When `backend` is omitted, the builder creates `StateBackend()`. It stores files in the graph's `files` state, which persists in a checkpointed conversation thread but not across threads, and it may only be used inside LangGraph execution. Seed files through invocation input rather than calling that backend directly.
 
 ```python
 from deepagents import create_deep_agent
+from deepagents.backends import StateBackend
 
 agent = create_deep_agent(
     model="openai:gpt-5.5",
-    tools=[my_custom_tool],
-    system_prompt="You are a research assistant.",
+    backend=StateBackend(),
+    tools=[my_application_tool],
+    system_prompt="You are a careful research assistant.",
 )
-result = agent.invoke({"messages": "Research LangGraph and write a summary"})
+
+result = agent.invoke(
+    {
+        "messages": [{"role": "user", "content": "Investigate this task."}],
+        "files": {},
+    }
+)
 ```
 
-- `model` accepts either a `provider:model` string (e.g. `"openai:gpt-5.5"`,
-  resolved via `init_chat_model`) or a pre-initialized `BaseChatModel` instance.
-- `tools` is **additive**: your tools are merged with the built-in tool suite
-  (`ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `execute`, and
-  `task`). Passing tools never removes a built-in.
-- `system_prompt` is your caller-authored instruction block. It is placed first,
-  then any active harness profile's `BASE` and `SUFFIX` are appended
-  (`USER -> BASE -> SUFFIX`).
+`tools=` is additive: it does not remove filesystem tools, `execute`, or `task` when synchronous subagents exist. Use profile `excluded_tools` to hide a built-in from the model, or replace `FilesystemMiddleware` with one configured with `tools=[...]` to change the filesystem suite. `execute` requires a backend implementing `SandboxBackendProtocol`; otherwise it returns a tool error.
 
-`create_deep_agent` returns a compiled LangGraph graph, so you invoke it with the
-standard LangGraph inputs — a dict whose `messages` key holds the conversation.
-The return value is the updated agent state (including the full `messages` list).
-
-## Construct → invoke → loop
+## 2. Assemble the graph in its actual order
 
 ```mermaid
 flowchart TD
-    A["create_deep_agent(model, tools, system_prompt, ...)"] --> B["Compiled agent graph"]
-    B --> C["agent.invoke({messages: ...})"]
-    C --> D["Model call"]
-    D --> E{"Tool calls requested"}
-    E -->|yes| F["Run tools: files, execute, task subagents"]
-    F --> D
-    E -->|no| G["Return final state with messages"]
+    Input["Builder inputs"] --> Resolve["Resolve model and harness profile"]
+    Resolve --> Backend["Use supplied backend or StateBackend"]
+    Backend --> Classify["Split subagent specifications"]
+    Classify --> Inline["Inline declarative and compiled workers"]
+    Classify --> Async["Remote graph_id workers"]
+    Inline --> General["Add default general-purpose worker when enabled"]
+    General --> Core["Filesystem then task then parent notifier then summarization then patch"]
+    Async --> Core
+    Core --> AsyncSlot["Append async subagent middleware when remote workers exist"]
+    AsyncSlot --> Tail["Profile then skills then provider caching then memory then HITL then content and refusal"]
+    Tail --> Filter["Apply profile exclusions"]
+    Filter --> Merge["Replace or insert caller middleware"]
+    Merge --> Refilter["Apply exclusions and tool exclusions again"]
+    Refilter --> Compile["Compile with create_agent"]
 ```
 
-Caption: A deep agent is constructed once, then invoked; inside a single invoke
-the model and tools loop until the model stops requesting tool calls.
+*This construction flow shows the main-stack assembly order; caller middleware is merged only after the initial tail has been constructed and filtered.*
 
-The tool-calling loop is the standard `create_agent` agent loop that
-`create_deep_agent` compiles into. To keep long-horizon runs from stalling, the
-compiled graph is configured with a high `recursion_limit` (`9_999`) so the
-loop can take many steps before hitting the LangGraph recursion guard.
+The main core is `FilesystemMiddleware`, optional `SubAgentMiddleware`, `_ParentNotifierMiddleware`, summarization, and `PatchToolCallsMiddleware`; `AsyncSubAgentMiddleware` follows only when remote specifications exist. The tail is profile extras, optional skills, provider cache middleware, optional memory, optional human approval, unsupported-content handling, and refusal handling. The builder forwards `checkpointer`, `store`, `context_schema`, `response_format`, `cache`, `name`, `debug`, and the state schema to LangChain `create_agent`, then configures the graph with recursion limit 9,999.
 
-## Extension points
+Caller middleware is merged by `.name`, not simply appended. A matching name replaces its assembled member in place. A new middleware is inserted after the complete core—including async-subagent middleware when present—and before profile extras, skills, caching, memory, HITL, unsupported-content, and refusal handling. This placement is part of the extension contract: caller fallback middleware runs before the default refusal handler, and ordinary caller middleware runs before skills disclosure and cache breakpoints.
 
-`create_deep_agent` exposes each part of the harness as a keyword argument. Reach
-for the one that matches how much you need to customize.
+A profile's `excluded_middleware` is subtractive both before and after the caller merge. Class entries use exact type and string entries exact middleware name. Protected filesystem/task scaffolding, private names, unmatched exclusions, and ambiguous name collisions fail fast. Tool exclusions run last, so custom middleware cannot restore an excluded tool.
 
-### Custom tools (`tools=`)
+### Keep provider cache behavior in the assembled stack
 
-Pass any LangChain `BaseTool`, plain callable, or tool dict. These are merged
-with the built-in suite. To *stop* offering a built-in tool you register a
-`HarnessProfile` with `excluded_tools` (or supply your own `FilesystemMiddleware`
-with an explicit `tools=[...]`) — the `tools=` argument alone cannot remove a
-built-in.
+`append_prompt_caching_middleware` always appends an `AnthropicPromptCachingMiddleware`-named lazy stand-in. It imports and delegates to the real Anthropic middleware only for an Anthropic request; other request models pass through unchanged, including when a session switches models. This keeps importing `deepagents` from loading the Anthropic SDK while retaining name-based replacement and exclusion behavior.
 
-### Middleware (`middleware=`)
+When installed, `langchain-aws` contributes `BedrockPromptCachingMiddleware` and `langchain-fireworks` contributes `FireworksPromptCachingMiddleware`; each is configured to ignore unsupported models. The helper caches optional class lookup, including absence, but creates a fresh middleware instance for each assembled stack. Consequently, cache middleware is appended separately to the main graph and each declarative/default synchronous subagent stack. If a custom or profile middleware changes the system prompt or tools, keep it before cache middleware and verify cache-sensitive ordering in `test_graph.py`.
 
-Custom middleware is inserted after the base stack (skills, filesystem, subagents,
-summarization, patch-tool-calls) but before the tail stack (profile middleware,
-prompt caching, memory, human-in-the-loop). A custom middleware whose `.name`
-matches an existing entry replaces it in place; otherwise it splices in after the
-core stack. See the [middleware catalog](/openwiki/concepts/middleware-catalog.md)
-for the built-in middleware and their responsibilities.
+The main graph appends `ModelRefusalMiddleware` after caller middleware. A parent refusal therefore raises by default, but a caller-supplied `ModelFallbackMiddleware` can recover first. Excluding the refusal middleware leaves the provider refusal response in the result.
 
-### Subagents (`subagents=`)
+## 3. Design the delegation and result boundary
 
-Delegate work to agents with isolated context windows via the `task` tool. Three
-forms are supported:
+`subagents=` supports three execution models:
 
-- `SubAgent` — a declarative synchronous spec (`name`, `description`,
-  `system_prompt`, plus optional `tools`, `model`, `middleware`, `skills`,
-  `permissions`, `interrupt_on`, `response_format`).
-- `CompiledSubAgent` — a pre-built runnable exposed through `task`.
-- `AsyncSubAgent` — a remote/background subagent (identified by `graph_id`),
-  routed into `AsyncSubAgentMiddleware` and run as a non-blocking task.
+- `SubAgent` is a declarative synchronous worker rebuilt by the harness and called through `task`.
+- `CompiledSubAgent` is an already-built runnable, also exposed through `task`.
+- `AsyncSubAgent` has `graph_id`; it is routed to `AsyncSubAgentMiddleware`, runs as a background task, and exposes the async task controls rather than joining the synchronous `task` tool.
 
-If you do not supply a subagent named `general-purpose`, a default one is added
-automatically (unless the active harness profile disables it). The
-[Deep Research example](repo://examples/deep_research/agent.py#L39-L59) shows a
-declarative research subagent with its own tools. See
-[subagents & skills](/openwiki/concepts/subagents-skills.md) for detail.
+If no synchronous worker named `general-purpose` is supplied, the active profile supplies one unless it disables it. Set `GeneralPurposeSubagentProfile(enabled=False)` and provide no synchronous workers to remove `task`; remote async workers do not affect that decision. Declarative workers inherit parent tools when their `tools` key is absent, and inherit `permissions` and `interrupt_on` unless their specification supplies replacements. Compiled and remote workers own their own graph schema and approval configuration.
 
-### Backends (`backend=`)
+Use default isolated mode when a worker should receive only the delegated description. Experimental `mode="fork"` gives a declarative worker the parent's effective, summarized conversation plus the task. The fork retains the parent's system prompt and rebuilds inherited prompt-producing middleware; its own `system_prompt` is placed in the task message to preserve the reusable prefix. Forks inherit parent skills rather than declaring separate `skills`, and a fork's `task` call is refused to prevent recursive delegation. A fork is context sharing, not an authorization shortcut.
 
-The filesystem and shell tools run against a pluggable backend. The default is
-`StateBackend` (files live in graph state); the `execute` tool only runs shell
-commands when the backend implements `SandboxBackendProtocol`, otherwise it
-returns an error. See [backends](/openwiki/concepts/backends.md).
+The `task` boundary deliberately returns a narrow result to the parent:
 
-### Skills (`skills=`) and memory (`memory=`)
+1. It strips messages, todos, structured responses, skills/rubric state, and middleware-private state from normal child input and returned updates. Unchanged values are also suppressed to avoid duplicate reducer updates during parallel calls.
+2. A child result must contain `messages`. If it has `structured_response`, the boundary JSON-serializes it into the parent `ToolMessage`; otherwise it selects the last non-empty `AIMessage` text, skipping trailing empty messages. The child response object itself does not become parent `structured_response`.
+3. Declarative and compiled child model refusals become a task-result notice with available category or explanation, rather than failing the parent invocation. Non-refusal exceptions still propagate.
+4. For checkpointed compiled graphs, the returned `ToolMessage` artifact carries the child checkpoint namespace when one was saved; the model does not see that artifact.
 
-`skills=` takes a list of skill source paths loaded on demand into the system
-prompt through `SkillsMiddleware`; `memory=` takes `AGENTS.md`-style file paths
-loaded at startup into the system prompt through `MemoryMiddleware`. With the
-default `StateBackend`, provide skill files at invoke time via `files={...}`. See
-[subagents & skills](/openwiki/concepts/subagents-skills.md).
+When extending state, prefer `state_schema` on the owning middleware. A graph-wide custom schema must derive from `DeepAgentState` to preserve the `messages` `DeltaChannel` reducer. Declarative workers can receive it; precompiled and remote workers do not inherit it. If parallel `task` calls update the same custom field, define a reducer or the graph can fail with `InvalidUpdateError`.
 
-### Profiles
+## 4. Make filesystem policy and approval explicit
 
-Harness and provider profiles adjust prompt assembly, tool-description overrides,
-excluded tools, and extra middleware based on the model in use. Profiles are
-resolved automatically from the model but can be registered
-(`register_harness_profile`, `register_provider_profile`). Profiles cannot strip
-the protected scaffolding middleware (`FilesystemMiddleware`, `SubAgentMiddleware`),
-which back core file tools and the `task` tool respectively; attempting to
-exclude them raises `ValueError`.
+Use `FilesystemPermission` rules for filesystem tools, not as a general sandbox policy. Rules are ordered: the first matching read/write rule produces `allow`, `deny`, or `interrupt`, while no match allows the call. Patterns must be absolute and reject traversal components. `FilesystemMiddleware` enforces rules for its built-in tools, including a resolved symlink target on real-filesystem backends; direct backend calls are outside this enforcement.
 
-## Runtime configuration
+`interrupt` rules are translated into path-aware `HumanInTheLoopMiddleware` predicates. Supplying `interrupt_on` also installs HITL, and explicit entries win over generated permission entries for the same tool. Configure a checkpointer when an approval must survive interruption and resume. Keep these separate:
 
-Several arguments are passed through to `create_agent`/LangGraph rather than
-changing the agent's behavior: `checkpointer` and `store` (persistence and
-cross-session memory), `context_schema`, `state_schema`, `response_format`
-(structured output), `cache`, `name`, and `debug`. For human-in-the-loop,
-`interrupt_on` (and `permissions` rules with `mode="interrupt"`) auto-install
-`HumanInTheLoopMiddleware` so tool calls pause for approval.
+- the backend determines storage and whether shell execution is available;
+- permissions gate filesystem middleware tools; and
+- HITL pauses selected tool calls for review.
 
-`state_schema`, when supplied, must be a `TypedDict` subclass of `DeepAgentState`
-so the built-in `DeltaChannel` reducer on `messages` is preserved; prefer adding
-state via middleware unless you specifically need a custom base schema.
+Recursive deletion is intentionally more conservative than ordinary first-match operations: if a directory deletion could overlap a denied write subtree, it is refused without deleting anything. Permission-generated bulk approval predicates likewise require review for pathless calls, current-directory aliases, protected-subtree overlap, absolute globs, and relative globs that climb from their nominal path.
 
-## Where to go next
+```python
+from deepagents.middleware.filesystem import FilesystemPermission
 
-- [`/examples/`](repo://examples/README.md) — research, coding, content, and
-  deployable-service agents built on this workflow.
-- [`libs/deepagents/README.md`](repo://libs/deepagents/README.md) — the library
-  quickstart and feature overview.
-- [SDK construction & execution](/openwiki/architecture/sdk-construction-execution.md)
-  — how the middleware stack is assembled and how the graph runs.
+permissions = [
+    FilesystemPermission(operations=["read", "write"], paths=["/workspace/**"], mode="allow"),
+    FilesystemPermission(operations=["read", "write"], paths=["/secrets/**"], mode="interrupt"),
+    FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
+]
+
+agent = create_deep_agent(
+    model=model,
+    backend=backend,
+    permissions=permissions,
+    interrupt_on={"execute": True},
+    checkpointer=checkpointer,
+)
+```
+
+## 5. Run the focused validations
+
+Start with the owning suites rather than a broad smoke test.
+
+| Change | Focused test | Assert the important branch |
+|---|---|---|
+| Builder inputs, profile selection, exact stack order, middleware replacement/exclusion, or provider cache wiring | `tests/unit_tests/test_graph.py` | core-to-tail placement, new versus matching middleware name, cache middleware before no later prompt mutation, and unavailable optional providers |
+| Synchronous task routing, returned state, structured task results, parallel state isolation, or checkpoint result artifacts | `tests/unit_tests/test_subagents.py` | final text versus JSON `structured_response`, private-state stripping, duplicate-update suppression, and separate `ToolMessage` results |
+| Isolated/fork input semantics, fork cache-prefix behavior, or recursion refusal | `tests/unit_tests/middleware/test_subagent_middleware_init.py` | description-only isolation versus inherited fork prefix, fork instruction placement, matching tool order, and refused nested `task` |
+| Child or parent model refusal behavior | `tests/unit_tests/test_subagent_refusal.py` | child refusal becomes a task result while parent refusal raises, falls back, or remains in result according to stack configuration |
+| Filesystem matching, resolved paths, recursive delete, or permission-generated HITL | `tests/unit_tests/test_permissions.py` | first-match normal operations, conservative recursive delete, and bulk-search approval geometry |
+
+Run focused tests from the package. `make test` uses the `test` dependency group, parallel pytest, coverage, and socket restrictions; `make lint` runs Ruff formatting/lint checks and `ty`.
+
+```bash
+cd libs/deepagents
+uv sync --all-groups
+make test TEST_FILE=tests/unit_tests/test_graph.py
+make test TEST_FILE=tests/unit_tests/test_subagents.py
+make test TEST_FILE=tests/unit_tests/middleware/test_subagent_middleware_init.py
+make test TEST_FILE=tests/unit_tests/test_subagent_refusal.py
+make test TEST_FILE=tests/unit_tests/test_permissions.py
+make lint
+```
+
+## Safe-change checklist
+
+1. Specify the model and backend explicitly; document provider settings and intended file lifetime.
+2. Inspect the final middleware order, not only the `middleware=` argument. Preserve required filesystem/task scaffolding and place prompt-mutating middleware before caching.
+3. Decide whether a worker is isolated, forked, precompiled, or remote; then test that context, state, approval, and schema ownership match the choice.
+4. Test task-result extraction explicitly: JSON structured output, final text fallback, refusal notice, and state keys that must not cross the boundary.
+5. Treat permissions, HITL, and sandbox execution as separate defenses. Cover recursive-delete and bulk-search geometry whenever permission code changes.
+6. Run the focused construction and subagent suites, then lint.

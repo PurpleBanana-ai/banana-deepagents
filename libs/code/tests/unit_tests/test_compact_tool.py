@@ -9,27 +9,31 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from deepagents.backends.protocol import FileDownloadResponse, WriteResult
-from langchain.agents.middleware.types import ModelRequest
-from langchain_core.exceptions import ContextOverflowError
-from langchain_core.messages import AIMessage, HumanMessage
+from deepagents.middleware.summarization import create_summarization_middleware
+from langchain.agents.middleware.types import (
+    ExtendedModelResponse,
+    ModelRequest,
+    ModelResponse,
+)
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langgraph.runtime import Runtime
 
 from deepagents_code._cli_context import CLIContextSchema
 from deepagents_code.config import MODEL_RETRIES_ATTR
+from deepagents_code.configurable_model import ConfigurableModelMiddleware
+from deepagents_code.hooks.models.domain import HookEvent, PreCompactDecision
 from deepagents_code.offload_middleware import (
     _SUMMARY_TRIM_FALLBACK,
     CLICompactionMiddleware,
     _ArchiveReadGuard,
     _install_lazy_summary_model,
-    _install_summary_model_retries,
-    _install_summary_token_counter,
-    _install_summary_trim_limit,
     _require_helper_slot,
     _RetryingModelInvoker,
     _runtime_model_config,
@@ -39,10 +43,11 @@ from deepagents_code.offload_middleware import (
 _NO_BACKOFF = "deepagents_code.model_retry._retry_delay_seconds"
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from pathlib import Path
 
     from deepagents.backends.protocol import BackendProtocol
-    from langchain_core.messages import AnyMessage
+
+    from deepagents_code.offload_middleware import _OffloadState
 
 
 class TestHITLGating:
@@ -118,6 +123,127 @@ class TestArchiveReadGuard:
         assert guard.write(response.path, "new history") == expected
 
 
+class _BudgetChatModel(FakeListChatModel):
+    model_name: str
+    max_tokens: int = 1_000
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    ("startup_limit", "selected_limit", "context_limit", "tokens", "output", "compact"),
+    [
+        (32_000, 128_000, None, 64_000, 2_000, False),
+        (128_000, 32_000, None, 26_000, 8_000, True),
+        (128_000, 32_000, None, 26_000, 2_000, False),
+        (128_000, 128_000, 24_000, 26_000, 2_000, True),
+    ],
+)
+async def test_auto_compaction_uses_selected_model_budget(
+    asynchronous: bool,
+    startup_limit: int,
+    selected_limit: int,
+    context_limit: int | None,
+    tokens: int,
+    output: int,
+    compact: bool,
+    tmp_path: Path,
+) -> None:
+    """Budget checks follow runtime selection without bypassing model overrides."""
+    from deepagents.backends import FilesystemBackend
+
+    from deepagents_code.agent import build_model_identity_section
+    from deepagents_code.config import ModelResult
+
+    startup = _BudgetChatModel(
+        model_name="startup",
+        responses=["startup"],
+        profile={"max_input_tokens": startup_limit},
+    )
+    selected = _BudgetChatModel(
+        model_name="selected",
+        responses=["selected"],
+        profile={"max_input_tokens": selected_limit},
+    )
+    backend = FilesystemBackend(root_dir=tmp_path, virtual_mode=True)
+    middleware = CLICompactionMiddleware(
+        create_summarization_middleware(startup, backend)
+    )
+    configurable = ConfigurableModelMiddleware(
+        persist_model_state=False, openai_prompt_cache_key=False
+    )
+    messages: list[AnyMessage] = [
+        HumanMessage("x" * (tokens * 4)),
+        AIMessage("done"),
+        HumanMessage("next"),
+    ]
+    request: ModelRequest[Any] = ModelRequest(
+        model=startup,
+        messages=messages,
+        tools=[],
+        state={"messages": messages},
+        system_prompt=build_model_identity_section("startup", provider="anthropic"),
+        model_settings={"max_tokens": 16_000, "cache_control": "ephemeral"},
+        runtime=Runtime(
+            context=CLIContextSchema(
+                model="selected",
+                model_params={"max_tokens": output},
+                profile_overrides={"max_input_tokens": selected_limit},
+                model_context_limit=context_limit,
+            )
+        ),
+    )
+    received: list[ModelRequest] = []
+
+    def call_model(resolved: ModelRequest) -> ModelResponse:
+        received.append(resolved)
+        return ModelResponse(result=[resolved.model.invoke(resolved.messages)])
+
+    async def acall_model(resolved: ModelRequest) -> ModelResponse:
+        received.append(resolved)
+        return ModelResponse(result=[await resolved.model.ainvoke(resolved.messages)])
+
+    async def aconfigure(resolved: ModelRequest) -> ModelResponse:
+        response = await configurable.awrap_model_call(resolved, acall_model)
+        assert isinstance(response, ModelResponse)
+        return response
+
+    def configure(resolved: ModelRequest) -> ModelResponse:
+        response = configurable.wrap_model_call(resolved, call_model)
+        assert isinstance(response, ModelResponse)
+        return response
+
+    with patch(
+        "deepagents_code.config.create_model",
+        return_value=ModelResult(
+            model=selected,
+            model_name="selected",
+            provider="openai",
+            context_limit=context_limit or selected_limit,
+        ),
+    ):
+        response = (
+            await middleware.awrap_model_call(request, aconfigure)
+            if asynchronous
+            else middleware.wrap_model_call(request, configure)
+        )
+
+    command = response.command if isinstance(response, ExtendedModelResponse) else None
+    update = command.update if command is not None else None
+    compacted = isinstance(update, dict) and "_summarization_event" in update
+    assert compacted is compact
+    assert len(received) == 1
+    resolved = received[0]
+    assert resolved.model is selected
+    assert resolved.model_settings["max_tokens"] == output
+    assert "cache_control" not in resolved.model_settings
+    assert resolved.system_prompt is not None
+    assert "selected" in resolved.system_prompt
+    assert "startup" not in resolved.system_prompt
+    assert (resolved.messages != messages) is compact
+    assert request.model is startup
+    assert request.model_settings["max_tokens"] == 16_000
+
+
 class TestCLICompactionMiddleware:
     """Cover dcode's explicit `/offload` behavior layered over the SDK tool."""
 
@@ -153,114 +279,63 @@ class TestCLICompactionMiddleware:
         summarization._compute_state_cutoff.return_value = 2
         return summarization
 
-    @pytest.mark.parametrize("is_async", [False, True])
-    @pytest.mark.parametrize("overflow", [False, True])
-    async def test_auto_compaction_runs_precompact_hook(
-        self, overflow: bool, is_async: bool
-    ) -> None:
-        """Every automatic compaction must ask `PreCompact` before summarizing.
-
-        `wrap_model_call` and `awrap_model_call` are separately written parallel
-        implementations, so both are driven here to keep the two from drifting.
-        """
-        from deepagents.middleware.summarization import SummarizationMiddleware
-
-        from deepagents_code.hooks.models.domain import (
-            HookEvent,
-            PreCompactDecision,
-        )
-
-        messages: list[AnyMessage] = [HumanMessage("one"), HumanMessage("two")]
-        summarization = self._summarization()
-        summarization._get_effective_messages.return_value = messages
-        summarization._count_tokens.return_value = 2
-        summarization._truncate_args.return_value = (messages, False)
-        summarization._should_summarize.return_value = not overflow
-        summarization._determine_cutoff_index.return_value = 1
-        wrapper_name = "awrap_model_call" if is_async else "wrap_model_call"
-        if overflow:
-            setattr(
-                summarization,
-                wrapper_name,
-                MethodType(
-                    getattr(SummarizationMiddleware, wrapper_name), summarization
-                ),
-            )
-
-        middleware = CLICompactionMiddleware(summarization)
-        request: ModelRequest[None] = ModelRequest(
-            model=MagicMock(),
-            messages=messages,
-            state={"messages": messages},
-            runtime=Runtime(context=None),
-        )
-        error = ContextOverflowError("too large") if overflow else None
-        handler = (
-            AsyncMock(side_effect=error) if is_async else MagicMock(side_effect=error)
-        )
-        invoke = MagicMock(
-            return_value=PreCompactDecision(
-                event=HookEvent.PRE_COMPACT,
-                continue_processing=False,
-                stop_reason="preserve context",
-            )
-        )
+    def test_auto_compaction_uses_each_runtime_workspace(self, tmp_path: Path) -> None:
+        """One process must expose each run's bound directory to hooks."""
+        launch_dir = tmp_path / "launch"
+        workspaces = [tmp_path / "one", tmp_path / "two"]
+        middleware = CLICompactionMiddleware(self._summarization())
+        request = MagicMock()
+        request.messages = [HumanMessage("compact")]
+        context: dict[str, Any] = {
+            "hooks_snapshot_id": "snapshot",
+            "hooks_server_events": [HookEvent.PRE_COMPACT.value],
+        }
+        request.runtime.context = context
+        decisions = PreCompactDecision(event=HookEvent.PRE_COMPACT)
 
         with (
             patch(
-                "deepagents_code.offload_middleware._event_enabled", return_value=True
+                "deepagents_code.offload_middleware.Path.cwd", return_value=launch_dir
             ),
-            patch("deepagents_code.offload_middleware._invoke_hook", invoke),
+            patch(
+                "deepagents_code.offload_middleware._invoke_hook",
+                return_value=decisions,
+            ) as invoke_hook,
         ):
+            resolved = []
+            for workspace in workspaces:
+                context["workspace"] = {"cwd": str(workspace)}
+                assert middleware._pre_auto_compact(request)
+                resolved.append(invoke_hook.call_args.args[0].cwd)
 
-            async def run_middleware() -> None:
-                if is_async:
-                    await middleware.awrap_model_call(request, handler)
-                else:
-                    middleware.wrap_model_call(request, handler)
+        assert resolved == workspaces
 
-            if overflow:
-                with pytest.raises(ContextOverflowError, match="too large"):
-                    await run_middleware()
-            else:
-                await run_middleware()
+    def test_auto_compaction_without_workspace_uses_process_cwd(
+        self, tmp_path: Path
+    ) -> None:
+        """Runs without a workspace must retain the process-cwd behavior."""
+        launch_dir = tmp_path / "launch"
+        middleware = CLICompactionMiddleware(self._summarization())
+        request = MagicMock()
+        request.messages = [HumanMessage("compact")]
+        request.runtime.context = {
+            "hooks_snapshot_id": "snapshot",
+            "hooks_server_events": [HookEvent.PRE_COMPACT.value],
+        }
+        decision = PreCompactDecision(event=HookEvent.PRE_COMPACT)
 
-        event = invoke.call_args.args[1]
-        assert event.trigger.value == "auto"
-        logical_id = invoke.call_args.kwargs["logical_event_id"]
-        assert logical_id == middleware._auto_compaction_id(request)
-        assert logical_id != middleware._auto_compaction_id(
-            request.override(messages=[*messages, HumanMessage("three")])
-        )
-        invoke.assert_called_once()
-        if is_async:
-            handler.assert_awaited_once()
-            summarization._aoffload_to_backend.assert_not_awaited()
-            summarization._acreate_summary.assert_not_awaited()
-        else:
-            handler.assert_called_once()
-            summarization._offload_to_backend.assert_not_called()
-            summarization._create_summary.assert_not_called()
+        with (
+            patch(
+                "deepagents_code.offload_middleware.Path.cwd", return_value=launch_dir
+            ),
+            patch(
+                "deepagents_code.offload_middleware._invoke_hook",
+                return_value=decision,
+            ) as invoke_hook,
+        ):
+            assert middleware._pre_auto_compact(request)
 
-    async def test_operation_path_writes_through_the_archive_guard(self) -> None:
-        """The server `/offload` operation's write path has the same invariant.
-
-        The guard is applied per write site rather than by the backend's type, so
-        the server operation entry point does not inherit it from the tool paths
-        — it has to apply it itself, and nothing but a test says so.
-        """
-        summarization = self._summarization()
-        middleware = CLICompactionMiddleware(summarization)
-        runtime = MagicMock()
-        runtime.context = None
-
-        await middleware.arun_forced_compaction_update(
-            {"messages": [HumanMessage("one"), HumanMessage("two")]}, runtime
-        )
-
-        write_backend = summarization._aoffload_to_backend.await_args.args[0]
-        assert isinstance(write_backend, _ArchiveReadGuard)
-        assert write_backend._backend is summarization._backend
+        assert invoke_hook.call_args.args[0].cwd == launch_dir
 
     async def test_operation_plan_defers_archive_until_checkpoint_reservation(
         self,
@@ -278,6 +353,82 @@ class TestCLICompactionMiddleware:
         assert plan is not None
         assert plan.update(None)["_summarization_event"]["file_path"] is None
         summarization._aoffload_to_backend.assert_not_awaited()
+
+    @pytest.mark.parametrize("archive_status", ["failed", "missing", "existing"])
+    async def test_handoff_archive_recovers_full_compacted_history(
+        self, archive_status: str, tmp_path: Path
+    ) -> None:
+        """Snapshots stay complete without duplicating the source's archive."""
+        from deepagents.backends import FilesystemBackend
+        from deepagents.middleware.summarization import SummarizationMiddleware
+        from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+        backend = FilesystemBackend(root_dir=tmp_path, virtual_mode=True)
+        summarization = SummarizationMiddleware(
+            FakeListChatModel(responses=["New summary"]),
+            backend=backend,
+            keep=("messages", 2),
+        )
+        middleware = CLICompactionMiddleware(summarization)
+        messages: list[AnyMessage] = [
+            HumanMessage("The deployment region is eu-west-2."),
+            AIMessage("The service name is kestrel."),
+            HumanMessage("Now add monitoring."),
+            AIMessage("Monitoring configured."),
+            HumanMessage("Next configure alerts."),
+            AIMessage("Alerts configured."),
+        ]
+        source_path = summarization._get_history_path("source")
+        if archive_status == "existing":
+            assert (
+                await summarization._aoffload_to_backend(
+                    backend, messages[:2], "source"
+                )
+                == source_path
+            )
+        previous = (await backend.adownload_files([source_path]))[0]
+        state: _OffloadState = {
+            "messages": messages,
+            "_summarization_session_id": "source",
+            "_summarization_event": {
+                "cutoff_index": 2,
+                "summary_message": HumanMessage(
+                    "Earlier deployment work.",
+                    additional_kwargs={"lc_source": "summarization"},
+                ),
+                "file_path": None if archive_status == "failed" else source_path,
+            },
+        }
+        runtime = SimpleNamespace(context=None)
+        paths: set[str] = set()
+        for _ in range(2):
+            plan = await middleware._aplan_forced_compaction_update(
+                state, runtime, handoff=True
+            )
+            assert plan is not None
+            archive = await plan.archive.write()
+            assert archive is not None
+            transcript = (await backend.adownload_files([archive.path]))[0].content
+            assert transcript is not None
+            for message in messages:
+                assert transcript.decode("utf-8").count(message.text) == 1
+            assert archive.path != source_path
+            assert archive.path not in paths
+            paths.add(archive.path)
+            assert (await backend.adownload_files([source_path]))[0] == previous
+
+        if archive_status == "existing":
+            update = await middleware.arun_forced_compaction_update(state, runtime)
+            assert update is not None
+            event = update["_summarization_event"]
+            assert event["file_path"] == source_path
+            assert event["cutoff_index"] == 4
+            transcript = (await backend.adownload_files([source_path]))[0].content
+            assert transcript is not None
+            for message in messages[:4]:
+                assert transcript.decode("utf-8").count(message.text) == 1
+            for message in messages[4:]:
+                assert message.text not in transcript.decode("utf-8")
 
     async def test_operation_path_returns_an_absolute_cutoff(self) -> None:
         """The committed event must carry the absolute cutoff, not the relative one.
@@ -315,6 +466,41 @@ class TestCLICompactionMiddleware:
         assert event["file_path"] == "/conversation_history/thread.md"
         assert isinstance(event["summary_message"], HumanMessage)
 
+    async def test_operation_path_anchors_prior_cutoff_and_records_its_id(
+        self,
+    ) -> None:
+        summarization = self._summarization()
+        summarization._determine_cutoff_index.return_value = 2
+        summarization._compute_state_cutoff.return_value = 2
+        middleware = CLICompactionMiddleware(summarization)
+        runtime = MagicMock()
+        runtime.context = None
+        messages = [
+            HumanMessage("b", id="b"),
+            HumanMessage("c", id="c"),
+            HumanMessage("d", id="d"),
+        ]
+        # "a" was removed after this event was written, so "b" moved to index 0.
+        prior = {
+            "cutoff_index": 1,
+            "cutoff_message_id": "b",
+            "summary_message": None,
+            "file_path": None,
+        }
+
+        result = await middleware.arun_forced_compaction_update(
+            cast("Any", {"messages": messages, "_summarization_event": prior}),
+            runtime,
+        )
+
+        assert result is not None
+        anchored = {**prior, "cutoff_index": 0}
+        summarization._apply_event_to_messages.assert_called_once_with(
+            messages, anchored
+        )
+        summarization._compute_state_cutoff.assert_called_once_with(anchored, 2)
+        assert result["_summarization_event"]["cutoff_message_id"] == "d"
+
     async def test_operation_path_threads_and_persists_the_session_id(self) -> None:
         """`/offload` must reuse and re-commit the SDK's archive-file id.
 
@@ -337,48 +523,6 @@ class TestCLICompactionMiddleware:
         assert result is not None
         assert result["_summarization_session_id"] == "session_abc"
         assert summarization._aoffload_to_backend.await_args.args[2] == "session_abc"
-
-    async def test_operation_path_refuses_a_chained_no_advance_compaction(
-        self,
-    ) -> None:
-        """A compaction that would not advance the cutoff must not commit.
-
-        The degenerate chained case: everything eligible already sits behind the
-        prior event, so the only thing left to summarize is the previous summary
-        itself. `_compute_state_cutoff` returns the prior absolute cutoff
-        unchanged, and the client — which keys its report on that value moving —
-        reports "nothing to offload". Committing anyway would spend a model
-        call, replace the in-context summary with a summary-of-a-summary, and
-        drop the prior archive's `file_path`, all while telling the user nothing
-        happened. Stop before the model call so the report and the state agree.
-        """
-        summarization = self._summarization()
-        summarization._determine_cutoff_index.return_value = 1
-        summarization._compute_state_cutoff.return_value = 7
-        middleware = CLICompactionMiddleware(summarization)
-        runtime = MagicMock()
-        runtime.context = None
-        prior = {
-            "cutoff_index": 7,
-            "summary_message": None,
-            "file_path": "/conversation_history/thread.md",
-        }
-
-        result = await middleware.arun_forced_compaction_update(
-            cast(
-                "Any",
-                {
-                    "messages": [HumanMessage("summary"), HumanMessage("recent")],
-                    "_summarization_event": prior,
-                },
-            ),
-            runtime,
-        )
-
-        assert result is None
-        # Neither the billable step nor the archive write may happen.
-        summarization._acreate_summary.assert_not_awaited()
-        summarization._aoffload_to_backend.assert_not_awaited()
 
     async def test_operation_path_rejects_an_empty_conversation(self) -> None:
         """An empty `messages` must raise rather than report a clean no-op.
@@ -425,26 +569,6 @@ class TestCLICompactionMiddleware:
         assert result is not None
         assert result["_summarization_event"]["file_path"] is None
         assert "archive write failed" in caplog.text
-
-    async def test_operation_path_returns_none_when_nothing_to_compact(self) -> None:
-        """A cutoff of 0 must be `None`, not an event pinning cutoff 0.
-
-        The caller distinguishes "nothing old enough" from a real compaction by
-        this return value; an empty-but-present event would advance nothing while
-        still reading as success.
-        """
-        summarization = self._summarization()
-        summarization._determine_cutoff_index = MagicMock(return_value=0)
-        middleware = CLICompactionMiddleware(summarization)
-        runtime = MagicMock()
-        runtime.context = None
-
-        result = await middleware.arun_forced_compaction_update(
-            {"messages": [HumanMessage("one")]}, runtime
-        )
-
-        assert result is None
-        summarization._aoffload_to_backend.assert_not_awaited()
 
     def test_runtime_model_builds_matching_summarizer(self) -> None:
         """A `/model` override selects the summarizer used by `/offload`."""
@@ -668,32 +792,6 @@ class TestCLICompactionMiddleware:
         assert create_summarization.call_args.args[0] is active_model
         assert create_summarization.call_args.args[1] is startup._backend
 
-    def test_model_initiated_tool_delegates_to_gated_path(self) -> None:
-        """The public tool keeps using the SDK's eligibility-gated sync path."""
-        middleware = CLICompactionMiddleware(self._summarization())
-        tool: Any = middleware.tools[0]
-        runtime = MagicMock()
-
-        with patch.object(middleware, "_run_compact", return_value="gated") as gated:
-            assert tool.func(runtime) == "gated"
-
-        gated.assert_called_once_with(runtime)
-
-    async def test_model_initiated_tool_delegates_to_gated_path_async(self) -> None:
-        """The public tool keeps using the SDK's eligibility-gated async path."""
-        middleware = CLICompactionMiddleware(self._summarization())
-        tool: Any = middleware.tools[0]
-        runtime = MagicMock()
-
-        with patch.object(
-            middleware,
-            "_arun_compact",
-            new=AsyncMock(return_value="gated"),
-        ) as gated:
-            assert await tool.coroutine(runtime) == "gated"
-
-        gated.assert_awaited_once_with(runtime)
-
     async def test_operation_read_failure_never_truncates_archive(self) -> None:
         """A transient archive read failure blocks the server operation's write."""
         from deepagents.middleware.summarization import SummarizationMiddleware
@@ -830,33 +928,6 @@ class TestRuntimeModelConfig:
         assert config.context_limit == 7
 
 
-class TestSdkContractGuards:
-    """Guard summarization-event assumptions shared with the SDK."""
-
-    def test_summarization_cutoff_is_an_absolute_index(self) -> None:
-        """`cutoff_index` must index unfiltered persisted messages.
-
-        `goal_state_notice.validated_summarization_cutoff` and
-        `GoalToolsMiddleware._request_with_goal_notice` both depend on this: the
-        goal middleware wraps the summarizer, so anything it removes from the
-        request below the cutoff shifts the indices this slice uses. If the SDK
-        ever stored an effective-list index instead, the bounds check would keep
-        returning a plausible integer and the notice logic would degrade
-        silently rather than fail.
-        """
-        from deepagents.middleware.summarization import SummarizationMiddleware
-
-        messages = ["m0", "m1", "m2", "m3"]
-        event = {"summary_message": "S", "cutoff_index": 2}
-
-        applied = SummarizationMiddleware._apply_event_to_messages(
-            messages,  # ty: ignore[invalid-argument-type]
-            event,  # ty: ignore[invalid-argument-type]
-        )
-
-        assert applied == ["S", "m2", "m3"]
-
-
 class TestSummaryTrimLimit:
     """The bound on history handed to a dedicated summary model.
 
@@ -921,40 +992,6 @@ class TestSummarySlotGuards:
     def test_require_helper_slot_accepts_a_present_slot(self) -> None:
         _require_helper_slot(SimpleNamespace(_present=None), "_present", "unused")
 
-    @pytest.mark.parametrize(
-        ("install", "slots"),
-        [
-            pytest.param(
-                _install_summary_model_retries, ("_summary_model",), id="retries"
-            ),
-            pytest.param(
-                _install_summary_trim_limit, ("trim_tokens_to_summarize",), id="trim"
-            ),
-            pytest.param(
-                _install_summary_token_counter,
-                ("token_counter", "_partial_token_counter"),
-                id="counter",
-            ),
-        ],
-    )
-    def test_installers_raise_when_a_slot_is_missing(
-        self, install: Callable[..., None], slots: tuple[str, ...]
-    ) -> None:
-        model = SimpleNamespace(profile={"max_input_tokens": 10_000})
-        for dropped in slots:
-            helper = SimpleNamespace(
-                **{slot: None for slot in slots if slot != dropped}
-            )
-            summarization = SimpleNamespace(_lc_helper=helper, model=model)
-            with pytest.raises(AttributeError, match=repr(dropped)):
-                install(cast("Any", summarization), cast("Any", model))
-
-    def test_lazy_install_raises_when_a_summary_hook_is_missing(self) -> None:
-        helper = SimpleNamespace(_create_summary=None)
-        summarization = SimpleNamespace(_lc_helper=helper)
-        with pytest.raises(AttributeError, match="_acreate_summary"):
-            _install_lazy_summary_model(cast("Any", summarization), "p:m", None)
-
 
 class TestLazySummaryModel:
     """Deferred construction of the dedicated summary model.
@@ -1001,21 +1038,6 @@ class TestLazySummaryModel:
         create_model.assert_called_once_with("p:summary", cli_max_retries=0)
         assert summarization._lc_helper._summary_model._model is summary_model
         assert summarization._lc_helper.trim_tokens_to_summarize == 8_000
-
-    def test_model_is_built_once_across_summaries(self) -> None:
-        summarization = self._summarizer()
-        _install_lazy_summary_model(cast("Any", summarization), "p:summary", None)
-        with patch(
-            "deepagents_code.config.create_model",
-            return_value=SimpleNamespace(
-                model=SimpleNamespace(
-                    profile={"max_input_tokens": 10_000}, _llm_type="summary"
-                )
-            ),
-        ) as create_model:
-            summarization._lc_helper._create_summary([])
-            summarization._lc_helper._create_summary([])
-        assert create_model.call_count == 1
 
     def test_unresolvable_spec_degrades_to_the_main_model(self) -> None:
         """A broken summary model is a broken optimization, not a broken turn.
@@ -1422,51 +1444,3 @@ class TestRetryingModelInvoker:
         model = SimpleNamespace(invoke=invoke, ainvoke=ainvoke)
         setattr(model, MODEL_RETRIES_ATTR, 2)
         return model
-
-    def test_invoke_retries_a_transient_failure(self) -> None:
-        calls: list[str] = []
-        invoker = _RetryingModelInvoker(cast("Any", self._model(calls)))
-
-        with patch(_NO_BACKOFF, lambda *_args: 0):
-            result = invoker.invoke("summarize this")
-
-        assert calls == ["sync", "sync"]
-        assert result.content == "summary"
-
-    async def test_ainvoke_retries_a_transient_failure(self) -> None:
-        """A hoisted coroutine would raise "cannot reuse already awaited"."""
-        calls: list[str] = []
-        invoker = _RetryingModelInvoker(cast("Any", self._model(calls)))
-
-        with patch(_NO_BACKOFF, lambda *_args: 0):
-            result = await invoker.ainvoke("summarize this")
-
-        assert calls == ["async", "async"]
-        assert result.content == "summary"
-
-    def test_unstamped_model_keeps_a_usable_budget(self) -> None:
-        """Falling back to zero would make the wrapper a silent passthrough."""
-        calls: list[str] = []
-        model = self._model(calls)
-        delattr(model, MODEL_RETRIES_ATTR)
-        invoker = _RetryingModelInvoker(cast("Any", model))
-
-        with patch(_NO_BACKOFF, lambda *_args: 0):
-            assert invoker.invoke("summarize this").content == "summary"
-
-        assert calls == ["sync", "sync"]
-
-
-def test_summary_model_slot_rename_is_loud() -> None:
-    """A renamed SDK slot must fail, not silently keep LangChain's retries.
-
-    Plain assignment would create an unused attribute and leave the stock
-    three-attempt `with_retry` installed, so `--max-retries 0` would keep
-    retrying and nothing would say why.
-    """
-    summarization = cast(
-        "Any", SimpleNamespace(_lc_helper=SimpleNamespace(), model=SimpleNamespace())
-    )
-
-    with pytest.raises(AttributeError, match="_summary_model"):
-        _install_summary_model_retries(summarization)

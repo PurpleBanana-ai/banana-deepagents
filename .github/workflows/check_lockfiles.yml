@@ -1,18 +1,11 @@
-# Check that all uv.lock files are up-to-date
+# Check lockfile freshness
 #
 # Prevents PRs from being merged when lockfiles are out of sync with pyproject.toml
 
 name: "🔒 Check Lockfiles"
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-  merge_group:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 permissions:
   contents: read
@@ -27,6 +20,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: "🐍 Set up Python and uv"
         uses: "./.github/actions/uv_setup"
@@ -38,7 +32,5 @@ jobs:
           # but `uv_setup` doesn't forward it.)
           enable-cache: "false"
 
-      - name: "🔍 Check changed lockfiles"
-        run: |
-          mapfile -t changed < <(git diff --name-only HEAD^ HEAD)
-          python3 .github/scripts/checks/check_lockfiles_pre_commit.py "${changed[@]}"
+      - name: "🔍 Check all lockfiles"
+        run: python3 .github/scripts/checks/check_lockfiles_pre_commit.py

@@ -273,6 +273,7 @@ def _resolve(
         _ranked_source,
         resolve_auto_classifier_model_with_source,
         resolve_auto_classifier_timeout_with_source,
+        resolve_mcp_tool_timeout_with_source,
         resolve_startup_mode_with_source,
     )
     from deepagents_code.configuration.resolver import (
@@ -323,6 +324,13 @@ def _resolve(
         )
         return source != "default", source, timeout
 
+    if option.key == "mcp.tool_timeout":
+        timeout, source = resolve_mcp_tool_timeout_with_source(
+            toml_data=toml_data,
+            managed_toml_data=managed_toml_data,
+        )
+        return source != "default", source, timeout
+
     if option.key == "startup.mode":
         # The manifest default that plain resolution returns ignores the
         # app-managed `[startup].recent` fallback that `load_startup_mode`
@@ -351,6 +359,27 @@ def _resolve(
     if option.key == "runtime.recursion_limit" and source == "default":
         return _langgraph_default_recursion_limit()
     return source != "default", source, resolved.value
+
+
+def _resolve_for_display(
+    option: ConfigOption[object],
+    toml_data: dict[str, Any],
+    *,
+    stored: _StoredCredentialView | None = None,
+    managed_toml_data: dict[str, Any],
+) -> tuple[bool, str, object]:
+    """Resolve an option and add display-only dotenv source attribution.
+
+    Returns:
+        The effective set state, attributed source, and value.
+    """
+    is_set, source, value = _resolve(
+        option,
+        toml_data,
+        stored=stored,
+        managed_toml_data=managed_toml_data,
+    )
+    return is_set, _attribute_env_source(source), value
 
 
 def _has_prefixed_env_override(option: ConfigOption[object]) -> bool:
@@ -398,7 +427,10 @@ def _display_value(option: ConfigOption[object], *, is_set: bool, value: object)
         text = _with_availability(option, text)
     max_len = 60
     if len(text) > max_len:
-        return text[: max_len - 1] + "\N{HORIZONTAL ELLIPSIS}"
+        from deepagents_code.config import get_glyphs
+
+        ellipsis = get_glyphs().ellipsis
+        return text[: max_len - len(ellipsis)] + ellipsis
     return text
 
 
@@ -413,6 +445,36 @@ def _source_label(source: str, *, option: ConfigOption[object] | None = None) ->
         if env is not None and env.startswith("DEEPAGENTS_CODE_"):
             return f"{source}; session override"
     return source
+
+
+def _attribute_env_source(source: str) -> str:
+    """Append the dotenv path for an environment value loaded by dcode.
+
+    Returns:
+        The attributed source, or `source` when it was not dotenv-injected.
+    """
+    from deepagents_code.config import (
+        _dotenv_loaded_values,
+        _dotenv_provenance,
+        _environment_key,
+        active_environment,
+    )
+
+    if active_environment() is not os.environ:
+        return source
+    suffix = "; invalid"
+    core = source.removesuffix(suffix)
+    name = _env_source_name(core)
+    if name is None:
+        return source
+    key = _environment_key(name)
+    if os.environ.get(key) != _dotenv_loaded_values.get(key):
+        return source
+    path = _dotenv_provenance.get(key)
+    if path is None:
+        return source
+    attributed = f"{core[:-1]}, {path})"
+    return f"{attributed}{suffix}" if source.endswith(suffix) else attributed
 
 
 def _env_source_name(source: str) -> str | None:
@@ -610,6 +672,30 @@ def _config_json_row(
     return row
 
 
+def _print_tracing_summary() -> None:
+    """Show local tracing state and the session/environment opt-outs."""
+    from langsmith.utils import tracing_is_enabled
+
+    from deepagents_code._invocation import invoked_name
+    from deepagents_code.config import (
+        _clear_langsmith_env_caches,
+        console,
+        is_tracing_disabled,
+    )
+
+    _clear_langsmith_env_caches()
+    enabled = not is_tracing_disabled() and tracing_is_enabled() is True
+    console.print("LangSmith agent tracing: " + ("ON" if enabled else "OFF"))
+    console.print(f"Disable for a session: {invoked_name()} --no-tracing", markup=False)
+    console.print("Or set DEEPAGENTS_CODE_LANGSMITH_TRACING=false", markup=False)
+    console.print(
+        "Local configuration only; existing servers are unaffected. "
+        "Local history and model-provider requests are unchanged.",
+        style="dim",
+    )
+    console.print()
+
+
 def _run_config(output_format: OutputFormat, *, verbose: bool) -> int:
     """Resolve every option and print its effective value and source.
 
@@ -642,7 +728,7 @@ def _run_config(output_format: OutputFormat, *, verbose: bool) -> int:
     resolved = [
         ResolvedOption(
             opt,
-            *_resolve(
+            *_resolve_for_display(
                 opt,
                 toml_data,
                 stored=stored,
@@ -674,6 +760,7 @@ def _run_config(output_format: OutputFormat, *, verbose: bool) -> int:
         )
         return 0
 
+    _print_tracing_summary()
     if verbose:
         _print_config_verbose(
             resolved,
@@ -962,7 +1049,7 @@ def _run_get_section(
     resolved = [
         ResolvedOption(
             opt,
-            *_resolve(
+            *_resolve_for_display(
                 opt,
                 toml_data,
                 stored=stored,
@@ -992,6 +1079,8 @@ def _run_get_section(
         )
         return 0
 
+    if any(opt.group == "Tracing" for opt in options):
+        _print_tracing_summary()
     if verbose:
         _print_config_verbose(resolved, store_error=store_error, health=health)
     else:
@@ -1038,7 +1127,7 @@ def _run_get(
     # Only credential options consult the store, so skip the read (and its
     # warning) for everything else.
     stored = _load_stored_credentials() if option.group == "Credentials" else None
-    is_set, source, value = _resolve(
+    is_set, source, value = _resolve_for_display(
         option,
         toml_data,
         stored=stored,

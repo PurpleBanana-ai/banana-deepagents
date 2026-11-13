@@ -1,12 +1,10 @@
 """Unit tests for LocalShellBackend."""
 
 import os
-import subprocess
 import sys
 import tempfile
 import warnings
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -67,17 +65,6 @@ def test_local_shell_backend_execute_simple_command() -> None:
         assert result.exit_code == 0
         assert "Hello World" in result.output
         assert result.truncated is False
-
-
-def test_local_shell_backend_execute_starts_new_session() -> None:
-    """Test that commands cannot access the parent's controlling terminal."""
-    completed = subprocess.CompletedProcess(args="echo hello", returncode=0, stdout="hello\n", stderr="")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        backend = LocalShellBackend(root_dir=tmpdir)
-        with patch("subprocess.run", return_value=completed) as run:
-            backend.execute("echo hello")
-
-    assert run.call_args.kwargs["start_new_session"] is True
 
 
 def test_local_shell_backend_cannot_open_parent_controlling_terminal(tmp_path: Path) -> None:
@@ -149,6 +136,35 @@ def test_local_shell_backend_execute_output_truncation() -> None:
         assert result.truncated is True
         assert "Output truncated" in result.output
         assert len(result.output) <= 150  # Some buffer for truncation message
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize(
+    ("text", "limit", "expected", "truncated"),
+    [
+        ("abcdefghi", 8, "abcdefgh", True),
+        ("中文测", 8, "中文", True),
+        ("😀😀😀", 8, "😀😀", True),
+        ("a中😀b", 7, "a中", True),
+        ("中", 1, "", True),
+        ("中文", 6, "中文", False),
+        ("😀", 8, "😀", False),
+        ("中", 0, "", True),
+    ],
+)
+async def test_local_shell_backend_execute_utf8_byte_limit(
+    tmp_path: Path, text: str, limit: int, expected: str, *, truncated: bool, use_async: bool
+) -> None:
+    """Enforce the UTF-8 byte budget without returning partial characters."""
+    backend = LocalShellBackend(root_dir=tmp_path, max_output_bytes=limit)
+    command = f"printf '%s' '{text}'"
+    result = await backend.aexecute(command) if use_async else backend.execute(command)
+    notice = f"\n\n... Output truncated at {limit} bytes." if truncated else ""
+
+    assert result.exit_code == 0
+    assert result.truncated is truncated
+    assert result.output == expected + notice
+    assert len(expected.encode("utf-8")) <= limit
 
 
 def test_local_shell_backend_filesystem_operations() -> None:

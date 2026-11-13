@@ -72,7 +72,7 @@ import uuid
 import warnings
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, NotRequired, cast
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Never, NotRequired, cast
 
 from langchain.agents.middleware.summarization import (
     _DEFAULT_MESSAGES_TO_KEEP,
@@ -87,7 +87,16 @@ from langchain.tools import (
     ToolRuntime,  # noqa: TC002  # runtime import: StructuredTool resolves the compact-tool annotations at schema-inference time
 )
 from langchain_core.exceptions import ContextOverflowError
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolCall, ToolMessage, get_buffer_string
+from langchain_core.messages import (
+    AIMessage,
+    AnyMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolCall,
+    ToolMessage,
+    add_notification_metadata,
+    get_buffer_string,
+)
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.types import Command
 from pydantic import BaseModel
@@ -119,6 +128,7 @@ DEEPAGENTS_DEFAULT_SUMMARY_PROMPT = DEFAULT_SUMMARY_PROMPT.replace(
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from langchain.agents.middleware.summarization import Summarizer
     from langchain.agents.middleware.types import ModelRequest, ModelResponse
     from langchain.chat_models import BaseChatModel
     from langchain_core.tools import BaseTool
@@ -132,17 +142,46 @@ class CompactConversationSchema(BaseModel):
     """Input schema for the `compact_conversation` tool."""
 
 
+SUMMARIZATION_EVENT_KEY = "_summarization_event"
+"""State key holding the most recent `SummarizationEvent`."""
+
+SUMMARIZATION_SESSION_ID_KEY = "_summarization_session_id"
+"""State key holding the id that names the offload history file."""
+
+_BEDROCK_PROVIDERS = frozenset({"bedrock", "bedrock_converse"})
+"""`model_provider` values for Amazon Bedrock, which serves Claude among other models."""
+
+_NATIVE_REASONING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking", "reasoning_content"})
+"""Reasoning block types in the Anthropic and Bedrock Converse native formats."""
+
+
 class SummarizationEvent(TypedDict):
     """Represents a summarization event."""
 
     cutoff_index: int
     """The index in the messages list where summarization occurred."""
 
+    cutoff_message_id: NotRequired[str | None]
+    """Id of the message at `cutoff_index`; stays correct when earlier messages are removed.
+
+    `None` if that message has no id. Absent on events created before this field existed.
+    """
+
     summary_message: HumanMessage
     """The `HumanMessage` containing the summary."""
 
     file_path: str | None
     """Path where the conversation history was offloaded, or `None` if offload failed."""
+
+    created_at_index: NotRequired[int]
+    """Number of state messages when the summary was created.
+
+    Messages from `cutoff_index` up to this index were kept verbatim from before
+    the summary. Claude binds each reasoning block to the conversation before it
+    and can reject a request once that conversation changes, so their reasoning
+    blocks are left out of the messages the model sees. Absent on events created
+    before this field existed.
+    """
 
 
 class TriggerClause(TypedDict, total=False):
@@ -490,6 +529,95 @@ def _upload_response_error(responses: list[FileUploadResponse]) -> str | None:
     return str(error)
 
 
+def _is_context_overflow(exc: Exception) -> bool:
+    """Recognize context errors without retrying unrelated bad requests."""
+    if isinstance(exc, ContextOverflowError):
+        return True
+    if getattr(exc, "status_code", None) not in {400, 413, 422}:
+        return False
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "context_length_exceeded",
+            "contextwindowexceedederror",
+            "maximum context length",
+            "exceeds the context window",
+            "exceeds the available context size",
+            "context window exceeded",
+            "context limit exceeded",
+            "input tokens exceed the configured limit",
+            "prompt is too long",
+        )
+    )
+
+
+def _bound_reasoning_types(message: AIMessage) -> frozenset[str]:
+    """Return the block types in `message` that carry reasoning bound to earlier history.
+
+    Only Claude binds reasoning this way. Bedrock messages count when their model
+    is Claude, read from `model_name`, so other Bedrock models such as OpenAI's keep
+    their reasoning. Messages tagged with any other provider keep theirs too
+    (Gemini, for example, also uses `thinking` blocks). Untagged messages, such as
+    those from integrations that do not set `model_provider`, are checked for the
+    native block types only.
+    """
+    provider = message.response_metadata.get("model_provider")
+    if provider is None:
+        return _NATIVE_REASONING_BLOCK_TYPES
+    model = str(message.response_metadata.get("model_name", "")).lower()
+    if provider == "anthropic" or (provider in _BEDROCK_PROVIDERS and ("claude" in model or "anthropic" in model)):
+        return _NATIVE_REASONING_BLOCK_TYPES | {"reasoning"}
+    return frozenset()
+
+
+def _resolve_cutoff_index(
+    messages: list[AnyMessage],
+    event: SummarizationEvent,
+) -> int:
+    """Return the event's cutoff index, by `cutoff_message_id` when it is still present.
+
+    Args:
+        messages: Full message list from state.
+        event: A `_summarization_event` dict.
+
+    Returns:
+        The cutoff index in `messages`.
+    """
+    cutoff_id = event.get("cutoff_message_id")
+    if cutoff_id:
+        for index, message in enumerate(messages):
+            if message.id == cutoff_id:
+                return index
+    return event["cutoff_index"]
+
+
+def _cutoff_message_id(messages: list[AnyMessage], cutoff_index: int) -> str | None:
+    """Return the id of the message at `cutoff_index`, or `None` if out of range."""
+    if 0 <= cutoff_index < len(messages):
+        return messages[cutoff_index].id
+    return None
+
+
+def _drop_bound_reasoning(message: AnyMessage) -> AnyMessage:
+    """Return `message` without reasoning blocks bound to the conversation before it.
+
+    Args:
+        message: A message kept from before a summary.
+
+    Returns:
+        A copy of an AI message with those blocks removed, or `message` unchanged
+            when it has none.
+    """
+    if not isinstance(message, AIMessage) or not isinstance(message.content, list):
+        return message
+    bound = _bound_reasoning_types(message)
+    content = [block for block in message.content if not (isinstance(block, dict) and block.get("type") in bound)]
+    if len(content) == len(message.content):
+        return message
+    return message.model_copy(update={"content": content})
+
+
 class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
     """Summarization middleware with backend for conversation history offloading."""
 
@@ -525,6 +653,7 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
         summary_prompt: str = DEEPAGENTS_DEFAULT_SUMMARY_PROMPT,
         trim_tokens_to_summarize: int | None = _DEFAULT_TRIM_TOKEN_LIMIT,
         truncate_args_settings: TruncateArgsSettings | None = None,
+        summarizer: Summarizer | None = None,
         **deprecated_kwargs: Any,
     ) -> None:
         """Initialize summarization middleware with backend support.
@@ -540,9 +669,24 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
                 Defaults to keeping last 20 messages.
             token_counter: Function to count tokens in messages.
             summary_prompt: Prompt template for generating summaries.
-            trim_tokens_to_summarize: Max tokens to include when generating summary.
+            trim_tokens_to_summarize: Token budget for the older history sent to the
+                summarization model, measured by `token_counter`. Applied after
+                setting aside the recent messages selected by `keep`.
 
-                Defaults to 4000.
+                If the older history exceeds this budget, trim it to its most
+                recent messages before summarizing. History excluded by this
+                trimming is not summarized. This does not set the summarization
+                trigger or limit the generated summary's length.
+
+                For example, with `keep=("messages", 20)` and
+                `trim_tokens_to_summarize=4000`, preserve the latest 20 messages
+                and summarize up to 4,000 tokens from the end of the older
+                history. The agent receives that summary followed by the
+                preserved messages.
+
+                Pass `None` to summarize all selected history without this
+                trimming. Unlike `create_summarization_middleware`, which
+                defaults to `None`, this constructor defaults to 4000.
             truncate_args_settings: Settings for truncating large tool arguments in old messages.
 
                 Provide a [`TruncateArgsSettings`][deepagents.middleware.summarization.TruncateArgsSettings]
@@ -557,6 +701,42 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
 
                     # Truncate when 50% of context window reached, ignoring messages in last 10% of window
                     {"trigger": ("fraction", 0.5), "keep": ("fraction", 0.1), "max_length": 2000, "truncation_text": "...(truncated)"}
+
+            summarizer: Optional replacement for the summarization model call.
+
+                Used for both automatic summarization and the
+                `compact_conversation` tool. `model` is still used for its profile
+                and token counting, but is not called to write summaries.
+
+                Pass a model name or a `BaseChatModel` instance to summarize with
+                a different chat model; it is prompted with `summary_prompt`. Pass
+                a `Runnable` or function to generate the summary text another way;
+                it receives the messages to summarize and `summary_prompt` is not
+                used. See LangChain's `SummarizationMiddleware` for details.
+
+                !!! example
+
+                    ```python
+                    from deepagents import create_deep_agent
+                    from deepagents.backends import StateBackend
+                    from deepagents.middleware.summarization import SummarizationMiddleware
+
+                    backend = StateBackend()
+
+                    # Manage gpt-6-sol's context window, summarize with gpt-6-luna
+                    summarization = SummarizationMiddleware(
+                        model="openai:gpt-6-sol",
+                        backend=backend,
+                        trigger=("fraction", 0.85),
+                        keep=("fraction", 0.10),
+                        summarizer="openai:gpt-6-luna",
+                    )
+                    agent = create_deep_agent(
+                        model="openai:gpt-6-sol",
+                        backend=backend,
+                        middleware=[summarization],  # replaces the default
+                    )
+                    ```
 
         Raises:
             TypeError: If the removed `history_path_prefix` argument is provided.
@@ -586,6 +766,7 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
             token_counter=token_counter,
             summary_prompt=summary_prompt,
             trim_tokens_to_summarize=trim_tokens_to_summarize,
+            summarizer=summarizer,
             **deprecated_kwargs,
         )
 
@@ -672,7 +853,7 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
         Returns:
             A session id (e.g. `'session_<uuid4 hex>'`).
         """
-        existing = state.get("_summarization_session_id")
+        existing = state.get(SUMMARIZATION_SESSION_ID_KEY)
         if isinstance(existing, str) and existing:
             return existing
         # Full uuid4 entropy: history filenames must not collide across
@@ -750,12 +931,7 @@ A condensed summary follows:
         else:
             content = f"Here is a summary of the conversation to date:\n\n{summary}"
 
-        return [
-            HumanMessage(
-                content=content,
-                additional_kwargs={"lc_source": "summarization"},
-            )
-        ]
+        return [add_notification_metadata(HumanMessage(content=content), source="summarization")]
 
     def _get_effective_messages(self, request: ModelRequest) -> list[AnyMessage]:
         """Generate effective messages for model call based on summarization event.
@@ -770,7 +946,7 @@ A condensed summary follows:
         Returns:
             The effective message list to use for the model call.
         """
-        event = request.state.get("_summarization_event")
+        event = request.state.get(SUMMARIZATION_EVENT_KEY)
         return self._apply_event_to_messages(request.messages, event)
 
     @staticmethod
@@ -782,6 +958,8 @@ A condensed summary follows:
 
         When a prior summarization event exists, the effective conversation is
         the summary message followed by all messages from `cutoff_index` onward.
+        Messages kept from before the summary lose their bound reasoning blocks
+        (see `SummarizationEvent.created_at_index`).
 
         Args:
             messages: Full message list from state.
@@ -795,10 +973,11 @@ A condensed summary follows:
 
         try:
             summary_msg = event["summary_message"]
-            cutoff_idx = event["cutoff_index"]
+            stored_cutoff = event["cutoff_index"]
         except (KeyError, TypeError) as exc:
             logger.warning("Malformed _summarization_event (missing keys): %s", exc)
             return list(messages)
+        cutoff_idx = _resolve_cutoff_index(messages, event)
 
         if cutoff_idx > len(messages):
             logger.warning(
@@ -808,14 +987,21 @@ A condensed summary follows:
             )
             return [summary_msg]
 
+        kept_from = event.get("created_at_index")
+        if not isinstance(kept_from, int):
+            kept_from = cutoff_idx
+        elif isinstance(stored_cutoff, int):
+            kept_from += cutoff_idx - stored_cutoff
         result: list[AnyMessage] = [summary_msg]
-        result.extend(messages[cutoff_idx:])
+        for index, message in enumerate(messages[cutoff_idx:], start=cutoff_idx):
+            result.append(_drop_bound_reasoning(message) if index < kept_from else message)
         return result
 
     @staticmethod
     def _compute_state_cutoff(
         event: SummarizationEvent | None,
         effective_cutoff: int,
+        messages: list[AnyMessage] | None = None,
     ) -> int:
         """Translate an effective-list cutoff index to an absolute state index.
 
@@ -828,6 +1014,7 @@ A condensed summary follows:
         Args:
             event: The prior `_summarization_event`, or `None`.
             effective_cutoff: Cutoff index within the effective message list.
+            messages: Full message list from state, or `None` to use the stored index.
 
         Returns:
             The absolute cutoff index for the state.
@@ -838,6 +1025,8 @@ A condensed summary follows:
         if not isinstance(prior_cutoff, int):
             logger.warning("Malformed _summarization_event: missing cutoff_index")
             return effective_cutoff
+        if messages is not None:
+            prior_cutoff = _resolve_cutoff_index(messages, event)
         return prior_cutoff + effective_cutoff - 1
 
     def _should_truncate_args(self, messages: list[AnyMessage], total_tokens: int) -> bool:
@@ -1335,6 +1524,110 @@ A condensed summary follows:
             logger.debug("Offloaded %d messages to %s", len(filtered_messages), path)
             return path
 
+    @staticmethod
+    def _with_replacements(response: ModelResponse, replacements: list[AnyMessage]) -> ModelResponse | ExtendedModelResponse:
+        if replacements:
+            return ExtendedModelResponse(model_response=response, command=Command(update={"messages": replacements}))
+        return response
+
+    @staticmethod
+    def _raise_recovery_exhausted(error: Exception) -> Never:
+        """Expose a terminal model error instead of another retryable HTTP response."""
+        msg = "Model input still does not fit after recovery; reduce input, tools, or configured output tokens."
+        raise ContextOverflowError(msg) from error
+
+    def _input_budget(self, request: ModelRequest) -> int | None:
+        """Reserve configured output and 5% headroom from the advertised input limit."""
+        profile = request.model.profile
+        limit = profile.get("max_input_tokens") if isinstance(profile, dict) else None
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            return None
+        output = 0
+        for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            value = request.model_settings.get(key, getattr(request.model, key, None))
+            if isinstance(value, int) and not isinstance(value, bool):
+                output = max(output, value)
+        return max(0, int(limit * 0.95) - output)
+
+    def _over_budget(self, request: ModelRequest, total_tokens: int | None = None) -> bool:
+        budget = self._input_budget(request)
+        if budget is None:
+            return False
+        count = total_tokens if total_tokens is not None else self._count_tokens(request.messages, request.system_message, request.tools)
+        return count > budget
+
+    def _check_reduction(self, original: ModelRequest, reduced: ModelRequest, error: Exception | None) -> None:
+        """Never resend an unchanged rejected request or a known oversized request."""
+        count = self._count_tokens(reduced.messages, reduced.system_message, reduced.tools)
+        if error is not None and count >= self._count_tokens(original.messages, original.system_message, original.tools):
+            self._raise_recovery_exhausted(error)
+        budget = self._input_budget(reduced)
+        if budget is not None and count > budget:
+            msg = "Context remains above the input budget after compaction; reduce input, tools, or configured output tokens."
+            raise ContextOverflowError(msg)
+
+    def _call_with_budget(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+        *,
+        error: Exception | None = None,
+        rejected: ModelRequest | None = None,
+    ) -> tuple[ModelResponse, list[AnyMessage]]:
+        """Check the complete request and allow one strictly smaller tail recovery."""
+        original = rejected if rejected is not None else request
+        replacements: list[AnyMessage] = []
+        if error is not None or self._over_budget(request):
+            messages, replacements = _clip_overflow_tail(
+                request.messages,
+                self._backend,
+                keep=("tokens", 1),
+                max_input_tokens=self._get_profile_limits(),
+                token_counter=self.token_counter,
+                large_tool_results_prefix=self._large_tool_results_prefix,
+            )
+            request = request.override(messages=messages)
+            self._check_reduction(original, request, error)
+        try:
+            return handler(request), replacements
+        except Exception as exc:
+            if not _is_context_overflow(exc):
+                raise
+            if error is not None or replacements:
+                self._raise_recovery_exhausted(exc)
+            return self._call_with_budget(request, handler, error=exc)
+
+    async def _acall_with_budget(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+        *,
+        error: Exception | None = None,
+        rejected: ModelRequest | None = None,
+    ) -> tuple[ModelResponse, list[AnyMessage]]:
+        """Check the complete request and allow one strictly smaller tail recovery."""
+        original = rejected if rejected is not None else request
+        replacements: list[AnyMessage] = []
+        if error is not None or self._over_budget(request):
+            messages, replacements = await _aclip_overflow_tail(
+                request.messages,
+                self._backend,
+                keep=("tokens", 1),
+                max_input_tokens=self._get_profile_limits(),
+                token_counter=self.token_counter,
+                large_tool_results_prefix=self._large_tool_results_prefix,
+            )
+            request = request.override(messages=messages)
+            self._check_reduction(original, request, error)
+        try:
+            return await handler(request), replacements
+        except Exception as exc:
+            if not _is_context_overflow(exc):
+                raise
+            if error is not None or replacements:
+                self._raise_recovery_exhausted(exc)
+            return await self._acall_with_budget(request, handler, error=exc)
+
     def wrap_model_call(
         self,
         request: ModelRequest,
@@ -1350,22 +1643,23 @@ A condensed summary follows:
 
         - If thresholds say "do not summarize", we still attempt one normal
             model call with the current effective/truncated messages.
-        - If that call raises `ContextOverflowError`, we immediately fall back to
-            the summarization path and retry the model call with
-            `summary_message + preserved_recent_messages`.
+        - Recognized provider context errors fall back to summarization and
+            offloading large trailing tool results. At most one smaller retry
+            is sent, including when the first request was already summarized.
+        - The complete request is checked against the input budget after
+            summarization. Irreducible input raises `ContextOverflowError`.
 
-        Unlike the legacy `before_model` approach, this does NOT modify the LangGraph state.
-        Instead, it tracks summarization events in middleware state and modifies the model
-        request directly.
+        History is condensed through a summary event rather than removing raw
+        messages. Offloaded tail results are persisted by message ID.
 
         Args:
             request: The model request to process.
             handler: The handler to call with the (possibly modified) request.
 
         Returns:
-            A plain `ModelResponse` when no summarization event is created, or
-                an `ExtendedModelResponse` that updates `_summarization_event`
-                with `cutoff_index`, `summary_message`, and `file_path`.
+            A plain `ModelResponse` when no state updates are needed, or an
+                `ExtendedModelResponse` with the summary event and/or offloaded
+                tool result replacements.
 
                 If `cutoff_index <= 0`, no compaction occurs and no
                 `_summarization_event` update is emitted.
@@ -1386,38 +1680,28 @@ A condensed summary follows:
         # Step 2: Check if summarization should happen
         if truncate_modified:
             total_tokens = self._count_tokens(truncated_messages, request.system_message, request.tools)
-        should_summarize = self._should_summarize(truncated_messages, total_tokens)
+        should_summarize = self._should_summarize(truncated_messages, total_tokens) or self._over_budget(request, total_tokens)
 
         # If no summarization needed, return with truncated messages
-        overflow_triggered = False
+        overflow_error: Exception | None = None
         if not should_summarize:
             try:
                 return handler(request.override(messages=truncated_messages))
-            except ContextOverflowError:
-                overflow_triggered = True
+            except Exception as exc:
+                if not _is_context_overflow(exc):
+                    raise
+                overflow_error = exc
                 # Fallback to summarization on context overflow
 
         # Step 3: Perform summarization
         cutoff_index = self._determine_cutoff_index(truncated_messages)
         if cutoff_index <= 0:
-            # Can't summarize, return truncated messages
-            return handler(request.override(messages=truncated_messages))
+            response, replacements = self._call_with_budget(request.override(messages=truncated_messages), handler, error=overflow_error)
+            return self._with_replacements(response, replacements)
 
         messages_to_summarize, preserved_messages = self._partition_messages(truncated_messages, cutoff_index)
 
         backend = self._backend
-        # On overflow, offload the large preserved tail TM batch to per-TM files.
-        new_state_tail: list[AnyMessage] = []
-        if overflow_triggered:
-            preserved_messages, new_state_tail = _clip_overflow_tail(
-                preserved_messages,
-                backend,
-                keep=self._lc_helper.keep,
-                max_input_tokens=self._get_profile_limits(),
-                token_counter=self.token_counter,
-                large_tool_results_prefix=self._large_tool_results_prefix,
-            )
-
         # Upload inline media once so both offload and summary see path references.
         offloaded_media_messages, failed_media = self._offload_inline_media(backend, messages_to_summarize)
 
@@ -1449,23 +1733,32 @@ A condensed summary follows:
         # Build summary message with file path reference
         new_messages = self._build_new_messages_with_path(summary, file_path)
 
-        previous_event = request.state.get("_summarization_event")
-        state_cutoff_index = self._compute_state_cutoff(previous_event, cutoff_index)
+        previous_event = request.state.get(SUMMARIZATION_EVENT_KEY)
+        state_messages = request.state.get("messages", [])
+        state_cutoff_index = self._compute_state_cutoff(previous_event, cutoff_index, state_messages)
 
         # Create new summarization event
         new_event: SummarizationEvent = {
             "cutoff_index": state_cutoff_index,
+            "cutoff_message_id": _cutoff_message_id(state_messages, state_cutoff_index),
             "summary_message": new_messages[0],  # The HumanMessage with summary  # ty: ignore[invalid-argument-type]
             "file_path": file_path,
+            "created_at_index": len(request.messages),
         }
 
         # Modify request to use summarized messages
-        modified_messages = [*new_messages, *preserved_messages]
-        response = handler(request.override(messages=modified_messages))
+        modified_messages = [*new_messages, *map(_drop_bound_reasoning, preserved_messages)]
+        modified_request = request.override(messages=modified_messages)
+        response, new_state_tail = self._call_with_budget(
+            modified_request,
+            handler,
+            error=overflow_error,
+            rejected=request.override(messages=truncated_messages),
+        )
 
         update: dict[str, Any] = {
-            "_summarization_event": new_event,
-            "_summarization_session_id": session_id,
+            SUMMARIZATION_EVENT_KEY: new_event,
+            SUMMARIZATION_SESSION_ID_KEY: session_id,
         }
         if new_state_tail:
             update["messages"] = list(new_state_tail)
@@ -1491,22 +1784,23 @@ A condensed summary follows:
 
         - If thresholds say "do not summarize", we still attempt one normal
             model call with the current effective/truncated messages.
-        - If that call raises `ContextOverflowError`, we immediately fall back
-            to the summarization path and retry the model call with
-            `summary_message + preserved_recent_messages`.
+        - Recognized provider context errors fall back to summarization and
+            offloading large trailing tool results. At most one smaller retry
+            is sent, including when the first request was already summarized.
+        - The complete request is checked against the input budget after
+            summarization. Irreducible input raises `ContextOverflowError`.
 
-        Unlike the legacy `abefore_model` approach, this does NOT modify the LangGraph state.
-        Instead, it tracks summarization events in middleware state and modifies the model
-        request directly.
+        History is condensed through a summary event rather than removing raw
+        messages. Offloaded tail results are persisted by message ID.
 
         Args:
             request: The model request to process.
             handler: The handler to call with the (possibly modified) request.
 
         Returns:
-            A plain `ModelResponse` when no summarization event is created, or
-                an `ExtendedModelResponse` that updates `_summarization_event`
-                with `cutoff_index`, `summary_message`, and `file_path`.
+            A plain `ModelResponse` when no state updates are needed, or an
+                `ExtendedModelResponse` with the summary event and/or offloaded
+                tool result replacements.
 
                 If `cutoff_index <= 0`, no compaction occurs and no
                 `_summarization_event` update is emitted.
@@ -1527,38 +1821,28 @@ A condensed summary follows:
         # Step 2: Check if summarization should happen
         if truncate_modified:
             total_tokens = self._count_tokens(truncated_messages, request.system_message, request.tools)
-        should_summarize = self._should_summarize(truncated_messages, total_tokens)
+        should_summarize = self._should_summarize(truncated_messages, total_tokens) or self._over_budget(request, total_tokens)
 
         # If no summarization needed, return with truncated messages
-        overflow_triggered = False
+        overflow_error: Exception | None = None
         if not should_summarize:
             try:
                 return await handler(request.override(messages=truncated_messages))
-            except ContextOverflowError:
-                overflow_triggered = True
+            except Exception as exc:
+                if not _is_context_overflow(exc):
+                    raise
+                overflow_error = exc
                 # Fallback to summarization on context overflow
 
         # Step 3: Perform summarization
         cutoff_index = self._determine_cutoff_index(truncated_messages)
         if cutoff_index <= 0:
-            # Can't summarize, return truncated messages
-            return await handler(request.override(messages=truncated_messages))
+            response, replacements = await self._acall_with_budget(request.override(messages=truncated_messages), handler, error=overflow_error)
+            return self._with_replacements(response, replacements)
 
         messages_to_summarize, preserved_messages = self._partition_messages(truncated_messages, cutoff_index)
 
         backend = self._backend
-        # On overflow, offload the large preserved tail TM batch to per-TM files.
-        new_state_tail: list[AnyMessage] = []
-        if overflow_triggered:
-            preserved_messages, new_state_tail = await _aclip_overflow_tail(
-                preserved_messages,
-                backend,
-                keep=self._lc_helper.keep,
-                max_input_tokens=self._get_profile_limits(),
-                token_counter=self.token_counter,
-                large_tool_results_prefix=self._large_tool_results_prefix,
-            )
-
         # Upload inline media once so both offload and summary see path references.
         # This must complete before the gather since both methods consume the result.
         offloaded_media_messages, failed_media = await self._aoffload_inline_media(backend, messages_to_summarize)
@@ -1591,23 +1875,32 @@ A condensed summary follows:
         # Build summary message with file path reference
         new_messages = self._build_new_messages_with_path(summary, file_path)
 
-        previous_event = request.state.get("_summarization_event")
-        state_cutoff_index = self._compute_state_cutoff(previous_event, cutoff_index)
+        previous_event = request.state.get(SUMMARIZATION_EVENT_KEY)
+        state_messages = request.state.get("messages", [])
+        state_cutoff_index = self._compute_state_cutoff(previous_event, cutoff_index, state_messages)
 
         # Create new summarization event
         new_event: SummarizationEvent = {
             "cutoff_index": state_cutoff_index,
+            "cutoff_message_id": _cutoff_message_id(state_messages, state_cutoff_index),
             "summary_message": new_messages[0],  # The HumanMessage with summary  # ty: ignore[invalid-argument-type]
             "file_path": file_path,
+            "created_at_index": len(request.messages),
         }
 
         # Modify request to use summarized messages
-        modified_messages = [*new_messages, *preserved_messages]
-        response = await handler(request.override(messages=modified_messages))
+        modified_messages = [*new_messages, *map(_drop_bound_reasoning, preserved_messages)]
+        modified_request = request.override(messages=modified_messages)
+        response, new_state_tail = await self._acall_with_budget(
+            modified_request,
+            handler,
+            error=overflow_error,
+            rejected=request.override(messages=truncated_messages),
+        )
 
         update: dict[str, Any] = {
-            "_summarization_event": new_event,
-            "_summarization_session_id": session_id,
+            SUMMARIZATION_EVENT_KEY: new_event,
+            SUMMARIZATION_SESSION_ID_KEY: session_id,
         }
         if new_state_tail:
             update["messages"] = list(new_state_tail)
@@ -1633,6 +1926,7 @@ def create_summarization_middleware(
     summary_prompt: str = DEEPAGENTS_DEFAULT_SUMMARY_PROMPT,
     trim_tokens_to_summarize: int | None = None,
     token_counter: TokenCounter = count_tokens_approximately,
+    summarizer: Summarizer | None = None,
 ) -> _DeepAgentsSummarizationMiddleware:
     """Create a Deep Agents `SummarizationMiddleware` with model-aware defaults.
 
@@ -1675,8 +1969,21 @@ def create_summarization_middleware(
             Use `resolve_model()` first if needed for model strings.
         backend: Backend instance for persisting conversation history.
         summary_prompt: Prompt template for generating summaries.
-        trim_tokens_to_summarize: Max tokens to include when generating summary.
+        trim_tokens_to_summarize: Token budget for the older history sent to the
+            summarization model, measured by `token_counter`. Applied after
+            setting aside the recent messages selected by the retention policy.
+
+            For example, `4000` summarizes up to 4,000 tokens from the end of
+            that older history; earlier history excluded by trimming is not
+            summarized. This does not set the summarization trigger or limit
+            the generated summary's length.
+
+            `None` skips this trimming and summarizes all selected history.
+            This factory defaults to `None`, unlike constructing
+            `SummarizationMiddleware` directly, which defaults to 4000.
         token_counter: Function to count tokens in messages.
+        summarizer: Optional replacement for the summarization model call. See
+            `SummarizationMiddleware`.
 
     Returns:
         Configured `SummarizationMiddleware` instance.
@@ -1700,6 +2007,7 @@ def create_summarization_middleware(
         summary_prompt=summary_prompt,
         trim_tokens_to_summarize=trim_tokens_to_summarize,
         truncate_args_settings=defaults["truncate_args_settings"],
+        summarizer=summarizer,
     )
 
 
@@ -1924,18 +2232,21 @@ class SummarizationToolMiddleware(AgentMiddleware):
         """
         s = self._summarization
         summary_msg = s._build_new_messages_with_path(summary, file_path)[0]
-        state_cutoff = s._compute_state_cutoff(event, cutoff)
+        state_messages = runtime.state.get("messages", [])
+        state_cutoff = s._compute_state_cutoff(event, cutoff, state_messages)
 
         new_event: SummarizationEvent = {
             "cutoff_index": state_cutoff,
+            "cutoff_message_id": _cutoff_message_id(state_messages, state_cutoff),
             "summary_message": summary_msg,  # ty: ignore[invalid-argument-type]
             "file_path": file_path,
+            "created_at_index": len(state_messages),
         }
 
         return Command(
             update={
-                "_summarization_event": new_event,
-                "_summarization_session_id": session_id,
+                SUMMARIZATION_EVENT_KEY: new_event,
+                SUMMARIZATION_SESSION_ID_KEY: session_id,
                 "messages": [
                     ToolMessage(
                         content=f"Conversation compacted. Summarized {len(to_summarize)} messages into a concise summary.",
@@ -1988,6 +2299,7 @@ class SummarizationToolMiddleware(AgentMiddleware):
                             "— no messages were summarized or removed."
                         ),
                         tool_call_id=tool_call_id,
+                        status="error",
                     )
                 ],
             }
@@ -2058,7 +2370,7 @@ class SummarizationToolMiddleware(AgentMiddleware):
         s = self._summarization
         tool_call_id = runtime.tool_call_id or ""
         messages = runtime.state.get("messages", [])
-        event = runtime.state.get("_summarization_event")
+        event = runtime.state.get(SUMMARIZATION_EVENT_KEY)
         effective = s._apply_event_to_messages(messages, event)
 
         if not self._is_eligible_for_compaction(effective):
@@ -2092,7 +2404,7 @@ class SummarizationToolMiddleware(AgentMiddleware):
         s = self._summarization
         tool_call_id = runtime.tool_call_id or ""
         messages = runtime.state.get("messages", [])
-        event = runtime.state.get("_summarization_event")
+        event = runtime.state.get(SUMMARIZATION_EVENT_KEY)
         effective = s._apply_event_to_messages(messages, event)
 
         if not self._is_eligible_for_compaction(effective):

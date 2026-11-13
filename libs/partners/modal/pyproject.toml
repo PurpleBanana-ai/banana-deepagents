@@ -19,11 +19,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-version = "0.0.6"
+version = "0.0.8"
 requires-python = ">=3.11,<4.0"
 dependencies = [
-    "deepagents>=0.7.0,<0.8.0",
-    "modal",
+    "deepagents>=0.7.38,<0.8.0",
+    "modal>=1.5.3",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -51,7 +51,6 @@ test = [
 deepagents = { path = "../../deepagents", editable = true }
 
 [tool.ty.environment]
-python-version = "3.11"
 extra-paths = ["../../deepagents"]
 
 [tool.ty.rules]

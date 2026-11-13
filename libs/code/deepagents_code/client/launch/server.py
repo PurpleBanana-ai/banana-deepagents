@@ -17,20 +17,29 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 from urllib.parse import quote
 
-from deepagents_code._env_vars import SERVER_ENV_PREFIX
+from deepagents_code._env_vars import INVOKED_AS, SERVER_ENV_PREFIX
+from deepagents_code._invocation import invoked_name
 from deepagents_code._paths import (
     DEEPAGENTS_HOME_ENV,
+    DEFAULT_PROFILE_MARKER_ENV,
     PATHS,
     export_profile_env,
 )
-from deepagents_code.config import _INHERITED_PYTHONPATH_ENV
+from deepagents_code._startup_error import startup_error_from_output
+from deepagents_code.config import (
+    _INHERITED_PYTHONPATH_ENV,
+    _USER_LANGSMITH_ENV_CARRIER,
+    _encode_user_langsmith_env,
+    _strip_dotenv_loaded_values,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Awaitable, Callable, Iterator, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +74,16 @@ teardown before dcode escalates; `TestFlushBudget` guards that margin.
 
 _SIGKILL_TIMEOUT = 2
 """Seconds to wait for the group/process to exit after SIGKILL."""
+
+_ABANDONED_START_GRACE = 0.5
+"""Graceful-exit window for a server whose startup was abandoned.
+
+A server that never reached its caller holds no runs, checkpoints, or traces
+worth flushing. Uvicorn answers SIGTERM by waiting for in-flight requests, so a
+server still building its graph (for example, connecting to remote MCP
+servers) would hold the full `_SHUTDOWN_TIMEOUT`. This window still lets an
+idle server, and descendants such as stdio MCP servers, exit on SIGTERM.
+"""
 
 _WINDOWS_CREATE_NEW_PROCESS_GROUP = 0x00000200
 """Windows creation flag required for targeted console control signals.
@@ -240,6 +259,9 @@ def generate_langgraph_json(
         config["env"] = env_file
     if checkpointer_path:
         config["checkpointer"] = {"path": checkpointer_path}
+        from deepagents_code.thread_ownership import OWNER_KEY
+
+        config.setdefault("http", {})["configurable_headers"] = {"include": [OWNER_KEY]}
 
     output_path = Path(output_dir) / "langgraph.json"
     output_path.write_text(json.dumps(config, indent=2))
@@ -290,6 +312,10 @@ def _scoped_env_overrides(
 # ---------------------------------------------------------------------------
 
 
+class ServerStartupTimeoutError(RuntimeError):
+    """The server did not finish starting before the health-check deadline."""
+
+
 async def wait_for_server_healthy(
     url: str,
     *,
@@ -307,11 +333,12 @@ async def wait_for_server_healthy(
             we fail fast instead of waiting for the timeout.
         read_log: Optional callable returning log file contents (for
             error messages on early exit).
-        local: Use a shorter poll interval for local servers.
+        local: Connect directly and use a shorter poll interval for local servers.
 
     Raises:
+        ModelConfigError: If startup reports missing credentials or a provider package.
         RuntimeError: If the server doesn't become healthy in time.
-    """
+    """  # noqa: DOC502  # recovery error types are reconstructed from subprocess output
     import httpx
 
     poll_interval = (
@@ -322,7 +349,7 @@ async def wait_for_server_healthy(
     last_status: int | None = None
     last_exc: Exception | None = None
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=not local) as client:
         while time.monotonic() < deadline:
             if process and process.poll() is not None:
                 output = read_log() if read_log else ""
@@ -332,7 +359,8 @@ async def wait_for_server_healthy(
                     if summary:
                         msg += f": {summary}"
                     msg += f"\n{output[-_LOG_TAIL_CHARS:]}"
-                raise RuntimeError(msg)
+                error = startup_error_from_output(output, msg)
+                raise error
 
             try:
                 resp = await client.get(health_url, timeout=2)
@@ -352,7 +380,16 @@ async def wait_for_server_healthy(
         msg += f" (last status: {last_status})"
     elif last_exc is not None:
         msg += f" (last error: {last_exc})"
-    raise RuntimeError(msg)
+    output = read_log() if read_log else ""
+    summary = _extract_startup_error_marker(output)
+    if summary:
+        msg = f"{msg}: {summary}"
+    if output:
+        msg += f"\n{output[-_LOG_TAIL_CHARS:]}"
+    error = startup_error_from_output(output, msg)
+    if type(error) is RuntimeError:
+        error = ServerStartupTimeoutError(msg)
+    raise error
 
 
 # ---------------------------------------------------------------------------
@@ -401,50 +438,73 @@ def _build_server_env() -> dict[str, str]:
         Environment dict for `subprocess.Popen`.
     """
     env = os.environ.copy()
+    _strip_dotenv_loaded_values(env)
     export_profile_env(env)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["LANGGRAPH_AUTH_TYPE"] = "noop"
+    # dcode pins `langgraph-api`, so the PyPI upgrade check only costs a network
+    # fetch at startup and logs a `pip install -U` hint users cannot act on.
+    env["LANGGRAPH_NO_VERSION_CHECK"] = "1"
+    # Server output only goes to the log file, and colored logs on Windows need
+    # colorama, which a fresh install no longer pulls in.
+    env["LOG_COLOR"] = "false"
+    env[INVOKED_AS] = invoked_name()
 
-    # Capture a launch-time PYTHONPATH before stripping it. Never trust an
-    # inherited carrier var: pop it first, then set it only from the real value.
+    # Capture a launch-time PYTHONPATH before stripping it. Never trust inherited
+    # carrier vars: overwrite them only from bootstrap state in this process.
     env.pop(_INHERITED_PYTHONPATH_ENV, None)
+    env.pop(_USER_LANGSMITH_ENV_CARRIER, None)
     inherited_pythonpath = os.environ.get("PYTHONPATH")
 
     for key in (
         "LANGGRAPH_AUTH",
         "LANGGRAPH_CLOUD_LICENSE_KEY",
-        "LANGSMITH_CONTROL_PLANE_API_KEY",
         "LANGSMITH_TENANT_ID",
         *_SERVER_ENV_DENYLIST,
     ):
         env.pop(key, None)
+    env["LANGSMITH_CONTROL_PLANE_API_KEY"] = ""
 
     if inherited_pythonpath is not None:
         env[_INHERITED_PYTHONPATH_ENV] = inherited_pythonpath
+    env[_USER_LANGSMITH_ENV_CARRIER] = _encode_user_langsmith_env()
     return env
+
+
+_IMMUTABLE_SERVER_ENV_KEYS = frozenset(
+    {
+        DEEPAGENTS_HOME_ENV,
+        DEFAULT_PROFILE_MARKER_ENV,
+        _INHERITED_PYTHONPATH_ENV,
+        _USER_LANGSMITH_ENV_CARRIER,
+    }
+)
+"""Keys `_build_server_env` owns outright, immune to caller overrides.
+
+`persist_env` validates its keys against `SERVER_ENV_PREFIX`, but `update_env`
+accepts any key, so without this an `update_env` caller could point the server
+at a different profile than the client (splitting the trust root across the two
+processes), forge the LangSmith carrier that authenticates approval-gated user
+commands, or inject a `PYTHONPATH` into them. Dropping the keys before the
+overrides apply keeps that a single list to extend rather than one re-pin per
+key, which is how `_INHERITED_PYTHONPATH_ENV` was missed.
+"""
 
 
 def _server_env_with_overrides(
     persistent: Mapping[str, str], scoped: Mapping[str, str]
 ) -> dict[str, str]:
-    """Assemble the server environment, then re-pin the profile selection.
-
-    `persist_env` validates its keys against `SERVER_ENV_PREFIX`, but
-    `update_env` accepts any key. The final call therefore is not redundant:
-    without it an `update_env("DEEPAGENTS_HOME"=...)` caller could point the
-    server at a different profile than the client, splitting the trust root
-    across the two processes.
+    """Assemble the server environment, ignoring overrides of pinned keys.
 
     Returns:
         The child environment for the server subprocess.
     """
     env = _build_server_env()
-    env.update(persistent)
-    env.update(scoped)
+    overrides: dict[str, str] = {**persistent, **scoped}
     # Profile selection is immutable and is not a restart override. Say so when
     # a caller actually tried: silently pointing the server somewhere other
     # than they asked is the kind of thing that gets debugged twice.
-    requested = env.get(DEEPAGENTS_HOME_ENV)
+    requested = overrides.get(DEEPAGENTS_HOME_ENV)
     if requested is not None and requested != str(PATHS.profile.root):
         logger.warning(
             "Ignoring the %s=%r override for the server subprocess. The "
@@ -453,7 +513,9 @@ def _server_env_with_overrides(
             requested,
             PATHS.profile.root,
         )
-    export_profile_env(env)
+    for key in _IMMUTABLE_SERVER_ENV_KEYS:
+        overrides.pop(key, None)
+    env.update(overrides)
     return env
 
 
@@ -567,10 +629,12 @@ def _signal_windows_server(process: subprocess.Popen[Any]) -> None:
         process.terminate()
 
 
-def _terminate_server_process(process: subprocess.Popen[Any]) -> None:
+def _terminate_server_process(
+    process: subprocess.Popen[Any], *, grace: float | None = None
+) -> None:
     """Terminate the `langgraph dev` server and its descendants.
 
-    Signals the server for a graceful exit, waits `_SHUTDOWN_TIMEOUT`, then
+    Signals the server for a graceful exit, waits `grace`, then
     escalates to a hard kill: SIGTERM then SIGKILL on POSIX, Ctrl+Break then
     `TerminateProcess` on Windows.
 
@@ -591,7 +655,11 @@ def _terminate_server_process(process: subprocess.Popen[Any]) -> None:
 
     Args:
         process: The running server subprocess to terminate.
+        grace: Seconds to wait for a graceful exit before the hard kill.
+
+            `None` uses `_SHUTDOWN_TIMEOUT`, read at call time.
     """
+    timeout = _SHUTDOWN_TIMEOUT if grace is None else grace
     pid = process.pid
     pgid = _server_process_group(pid)
     # Windows resolves no pgid, but Ctrl+Break still reaches the whole console
@@ -607,14 +675,14 @@ def _terminate_server_process(process: subprocess.Popen[Any]) -> None:
     try:
         if pgid is not None:
             os.killpg(pgid, signal.SIGTERM)
-            stopped = _wait_for_process_group_exit(process, pgid, _SHUTDOWN_TIMEOUT)
+            stopped = _wait_for_process_group_exit(process, pgid, timeout)
         else:
             if sys.platform == "win32":
                 _signal_windows_server(process)
             else:
                 process.send_signal(signal.SIGTERM)
             try:
-                process.wait(timeout=_SHUTDOWN_TIMEOUT)
+                process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 stopped = False
             else:
@@ -733,6 +801,9 @@ class ServerProcess:
     Env-var management for restarts (e.g. configuration changes requiring a full
     restart) is handled by `_scoped_env_overrides`, keeping this class focused
     on process management.
+
+    On POSIX a parent-owned pipe lets the server root detect owner death,
+    including SIGKILL. Windows retains the existing explicit-stop behavior.
     """
 
     def __init__(
@@ -769,6 +840,8 @@ class ServerProcess:
         self._owns_config_dir = owns_config_dir
         self._scaffold = scaffold
         self._process: subprocess.Popen | None = None
+        self._parent_pipe_writer: int | None = None
+        self._parent_pipe_finalizer: weakref.finalize | None = None
         self._temp_dir: tempfile.TemporaryDirectory | None = None
         self._log_file: tempfile.NamedTemporaryFile | None = None  # ty: ignore[invalid-type-form]
         self._env_overrides: dict[str, str] = {}
@@ -818,7 +891,7 @@ class ServerProcess:
             # unreachable, so this is defensive. `read_text(errors="replace")`
             # cannot raise `ValueError` for decoding, so the catch stays narrow
             # in practice.
-            except (OSError, ValueError):
+            except OSError, ValueError:
                 logger.warning(
                     "Failed to read server log file %s",
                     self._log_file.name,
@@ -830,23 +903,28 @@ class ServerProcess:
         self,
         *,
         timeout: float = _HEALTH_TIMEOUT,  # noqa: ASYNC109
+        after_spawn: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Start the `langgraph dev` server and wait for it to be healthy.
 
         Args:
             timeout: Max seconds to wait for the server to become healthy.
+            after_spawn: Awaited once the subprocess is spawned, before the
+                health check. Lets callers overlap work with server boot that
+                must finish before the health check's imports run.
 
         Raises:
             RuntimeError: If the server fails to start or become healthy.
         """  # noqa: DOC502  # `RuntimeError` propagates from `_start`
         async with self._lifecycle_lock:
-            await self._start(timeout=timeout)
+            await self._start(timeout=timeout, after_spawn=after_spawn)
 
     async def _start(
         self,
         *,
         timeout: float,  # noqa: ASYNC109
         expected_stop_generation: int | None = None,
+        after_spawn: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Start while the caller owns `_lifecycle_lock`.
 
@@ -855,6 +933,8 @@ class ServerProcess:
             expected_stop_generation: Generation captured before a restart's
                 stop phase. If synchronous terminal shutdown ran meanwhile,
                 abort instead of resurrecting the subprocess.
+            after_spawn: Awaited once the subprocess is spawned, before the
+                health check.
         """
         process = self._spawn_process(
             expected_stop_generation=expected_stop_generation,
@@ -863,6 +943,8 @@ class ServerProcess:
             return
         started = False
         try:
+            if after_spawn is not None:
+                await after_spawn()
             await wait_for_server_healthy(
                 self.url,
                 timeout=timeout,
@@ -884,8 +966,10 @@ class ServerProcess:
                 # `stop()` error from masking the exception already propagating;
                 # `stop()` is effectively non-raising today, so if it does fire it
                 # signals an unexpected leak — hence `error`, not `warning`.
+                # The server has not built its graph yet, so nothing needs the
+                # full graceful window.
                 try:
-                    await asyncio.to_thread(self.stop)
+                    await asyncio.to_thread(self.stop, grace=_ABANDONED_START_GRACE)
                 except Exception:
                     logger.exception(
                         "Error stopping server during startup cleanup",
@@ -917,6 +1001,8 @@ class ServerProcess:
                 raise asyncio.CancelledError
             if self._running_locked():
                 return None
+            # Retire the exited generation before replacing its log or writer.
+            self._stop_process_locked()
             self._stopped = False
 
             work_dir = self.config_dir
@@ -971,18 +1057,63 @@ class ServerProcess:
                 mode="w",
                 encoding="utf-8",
             )
-            self._process = subprocess.Popen(  # noqa: S603
+            try:
+                self._process = self._launch_process(cmd, work_dir, env)
+            except BaseException:
+                # `_start` has not entered its cleanup block until spawning
+                # returns. Failed launches must release their pipe/log here.
+                self._stop_process_locked()
+                raise
+            return self._process
+
+    def _launch_process(
+        self, cmd: list[str], work_dir: Path, env: dict[str, str]
+    ) -> subprocess.Popen:
+        """Launch one generation while the caller owns `_state_lock`.
+
+        Returns:
+            The process owning this generation's server root.
+        """
+        if sys.platform == "win32":
+            return subprocess.Popen(  # noqa: S603  # argv is built internally
                 cmd,
                 cwd=str(work_dir),
                 env=env,
                 stdout=self._log_file,
                 stderr=subprocess.STDOUT,
-                start_new_session=(sys.platform != "win32"),
-                creationflags=(
-                    _WINDOWS_CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
-                ),
+                start_new_session=False,
+                creationflags=_WINDOWS_CREATE_NEW_PROCESS_GROUP,
             )
-            return self._process
+
+        from deepagents_code._session_lock import session_lock_fds
+
+        reader, writer = os.pipe()  # Both ends are non-inheritable by default.
+        self._parent_pipe_writer = writer
+        # Abandoning the manager must not leak its writer. Explicit teardown
+        # invokes this same finalizer so a reused descriptor is never closed twice.
+        self._parent_pipe_finalizer = weakref.finalize(self, os.close, writer)
+        # The session lock keeps the install marked in use while the server
+        # runs, so a migration does not rebuild it underneath.
+        inherited = (reader, *session_lock_fds())
+        try:
+            return subprocess.Popen(  # noqa: S603  # argv is built internally
+                [
+                    *cmd[:2],
+                    "deepagents_code.client.launch._server_bootstrap",
+                    ",".join(map(str, inherited)),
+                    str(_SHUTDOWN_TIMEOUT),
+                    *cmd[3:],
+                ],
+                cwd=str(work_dir),
+                env=env,
+                stdout=self._log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                creationflags=0,
+                pass_fds=inherited,
+            )
+        finally:
+            os.close(reader)
 
     async def wait_for_graph_ready(
         self,
@@ -997,9 +1128,11 @@ class ServerProcess:
             timeout: Max seconds to wait for the graph readiness request.
 
         Raises:
+            ModelConfigError: If startup reports missing credentials or a
+                provider package.
             RuntimeError: If the server process exits or the graph endpoint
                 does not return a successful response.
-        """
+        """  # noqa: DOC502  # recovery errors are reconstructed from subprocess output
         import httpx
 
         if self._process is None:
@@ -1009,7 +1142,7 @@ class ServerProcess:
         graph_url = f"{self.url}/assistants/{quote(graph_name, safe='')}/graph"
         deadline = time.monotonic() + timeout
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             while time.monotonic() < deadline:
                 if self._process.poll() is not None:
                     msg = f"Server process exited with code {self._process.returncode}"
@@ -1019,7 +1152,8 @@ class ServerProcess:
                         if summary:
                             msg += f": {summary}"
                         msg += f"\n{output[-_LOG_TAIL_CHARS:]}"
-                    raise RuntimeError(msg)
+                    error = startup_error_from_output(output, msg)
+                    raise error
 
                 remaining = max(0.1, deadline - time.monotonic())
                 try:
@@ -1041,7 +1175,8 @@ class ServerProcess:
                         msg += f": {summary}"
                     if output:
                         msg += f"\n{output[-_LOG_TAIL_CHARS:]}"
-                    raise RuntimeError(msg) from exc
+                    error = startup_error_from_output(output, msg)
+                    raise error from exc
 
                 if resp.status_code == 200:  # noqa: PLR2004
                     logger.info("Server graph %s is ready at %s", graph_name, self.url)
@@ -1057,7 +1192,8 @@ class ServerProcess:
                     msg += f": {summary}"
                 if output:
                     msg += f"\n{output[-_LOG_TAIL_CHARS:]}"
-                raise RuntimeError(msg)
+                error = startup_error_from_output(output, msg)
+                raise error
 
         msg = f"Server graph '{graph_name}' did not initialize within {timeout}s"
         raise RuntimeError(msg)
@@ -1071,27 +1207,36 @@ class ServerProcess:
         with self._state_lock:
             self._stop_process_locked()
 
-    def _stop_process_locked(self) -> None:
-        """Stop the subprocess while `_state_lock` is held."""
-        if self._process is None:
-            return
+    def _stop_process_locked(self, *, grace: float | None = None) -> None:
+        """Stop the subprocess while `_state_lock` is held.
 
-        if self._process.poll() is None:
-            _terminate_server_process(self._process)
-            # `_terminate_server_process` is best-effort. If the process is still
-            # alive here (e.g. SIGKILL failed with EPERM), then once we drop the
-            # handle below we can no longer observe or reap this pid, so surface
-            # the still-running process rather than clearing state as if shutdown
-            # succeeded.
-            if self._process.poll() is None:
-                logger.warning(
-                    "Dropping handle to server pid=%d that is still running; "
-                    "it may be orphaned",
-                    self._process.pid,
-                )
+        Args:
+            grace: Seconds to wait for a graceful exit before the hard kill.
 
-        self._process = None
+                `None` uses `_SHUTDOWN_TIMEOUT`.
+        """
+        try:
+            if self._process is not None and self._process.poll() is None:
+                _terminate_server_process(self._process, grace=grace)
+                # Best-effort termination may fail, for example with EPERM.
+                if self._process.poll() is None:
+                    logger.warning(
+                        "Dropping handle to server pid=%d that is still running; "
+                        "it may be orphaned",
+                        self._process.pid,
+                    )
+        finally:
+            self._process = None
+            # Preserve the writer throughout the explicit stop's grace budget;
+            # EOF must not start a competing shutdown while that stop is running.
+            if self._parent_pipe_finalizer is not None:
+                self._parent_pipe_finalizer()
+                self._parent_pipe_finalizer = None
+            self._parent_pipe_writer = None
+            self._close_log_file_locked()
 
+    def _close_log_file_locked(self) -> None:
+        """Release the generation's log even when process creation failed."""
         if self._log_file is not None:
             log_path = Path(self._log_file.name)
             try:
@@ -1115,13 +1260,19 @@ class ServerProcess:
                     logger.debug("Failed to clean up log file", exc_info=True)
             self._log_file = None
 
-    def stop(self) -> None:
+    def stop(self, *, grace: float | None = None) -> None:
         """Stop the server process and clean up all resources.
 
         Idempotent and safe to call concurrently. The synchronous state lock
         prevents process teardown and resource cleanup from interleaving, while
         the generation counter prevents an in-flight async restart from
         spawning a replacement after this terminal stop wins the race.
+
+        Args:
+            grace: Seconds to wait for a graceful exit before the hard kill.
+
+                `None` uses `_SHUTDOWN_TIMEOUT`. Only the first call's value
+                applies; later calls wait for that stop to finish.
         """
         with self._state_lock:
             if self._stopped:
@@ -1129,7 +1280,7 @@ class ServerProcess:
             self._stopped = True
             self._stop_generation += 1
 
-            self._stop_process_locked()
+            self._stop_process_locked(grace=grace)
 
             if self._temp_dir is not None:
                 try:

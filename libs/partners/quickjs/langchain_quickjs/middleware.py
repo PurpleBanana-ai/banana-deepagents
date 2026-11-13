@@ -3,10 +3,14 @@
 import asyncio
 import contextlib
 import logging
+import sys
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired
 
+from deepagents.backends import BackendConsumer, StateBackend
+from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware._utils import append_to_system_message
 from langchain.agents.middleware.types import (
     AgentMiddleware,
@@ -16,13 +20,17 @@ from langchain.agents.middleware.types import (
     ModelResponse,
     PrivateStateAttr,
     ResponseT,
+    TracePolicy,
+    omit_payload,
 )
 from langchain.tools import BaseTool, ToolRuntime
 from langchain_core._api import beta
+from langchain_core.callbacks import BaseCallbackManager
 from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.runnables.config import patch_config
 from langchain_core.tools import StructuredTool
 from langgraph.channels import DeltaChannel
-from langgraph.config import get_config
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
@@ -30,6 +38,7 @@ if TYPE_CHECKING:
 
 from langchain_quickjs._format import format_outcome
 from langchain_quickjs._prompt import (
+    FS_SYSTEM_PROMPT,
     render_eval_tool_code_doc,
     render_eval_tool_description,
     render_repl_system_prompt,
@@ -40,7 +49,12 @@ from langchain_quickjs._ptc import (
     filter_tools_for_ptc,
     render_ptc_prompt,
 )
-from langchain_quickjs._repl import _Registry
+from langchain_quickjs._repl import (
+    _DEFAULT_MAX_SUBAGENT_CONCURRENCY,
+    EvalOutcome,
+    _Registry,
+    _SnapshotRestoreError,
+)
 from langchain_quickjs._snapshot import (
     encode_snapshot,
     normalize_signing_key,
@@ -64,6 +78,7 @@ PersistenceMode = Literal["thread", "turn", "call"]
 class REPLState(AgentState):
     """State schema for `CodeInterpreterMiddleware`."""
 
+    _quickjs_slot_id: NotRequired[Annotated[str, PrivateStateAttr]]
     _quickjs_snapshot_payload: NotRequired[
         Annotated[
             bytes,
@@ -80,7 +95,7 @@ class EvalSchema(BaseModel):
     code: str = Field(
         description=(
             "JavaScript expression or statement(s) to evaluate. "
-            "No fs/network/real-clock access."
+            "No network/real-clock access."
         ),
     )
 
@@ -102,40 +117,42 @@ def _resolve_mode(
             raise ValueError(msg)
 
 
-def _resolve_thread_id(fallback: str) -> str:
-    """Extract `thread_id` from langgraph config or use `fallback`.
+def _same_tools(cached: tuple[BaseTool, ...], exposed: tuple[BaseTool, ...]) -> bool:
+    """Whether `exposed` is exactly the tools `cached` was rendered from."""
+    return len(cached) == len(exposed) and all(
+        a is b for a, b in zip(cached, exposed, strict=True)
+    )
 
-    The fallback is a middleware-instance-scoped id: when the caller
-    didn't configure a `thread_id` (common for ad-hoc
-    `agent.invoke(...)` in tests or single-shot scripts), we still need
-    all resolver calls within one CodeInterpreterMiddleware lifetime to return the
-    same id — otherwise `wrap_model_call` installs tools on one REPL
-    and the eval tool looks up a different one, and the model sees
-    `ReferenceError: tools is not defined`.
-    """
-    try:
-        config = get_config()
-    except RuntimeError:
-        # Not running inside a Runnable — test / bare-call path.
-        return fallback
-    thread_id = config.get("configurable", {}).get("thread_id") if config else None
-    if thread_id is not None:
-        return str(thread_id)
-    return fallback
+
+def _new_slot_id() -> str:
+    """Create a private interpreter slot id."""
+    return f"qjs_{uuid.uuid4().hex}"
 
 
 @beta()
-class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT]):
+class CodeInterpreterMiddleware(
+    AgentMiddleware[REPLState, ContextT, ResponseT], BackendConsumer
+):
     """Middleware exposing a JS REPL to the agent.
 
     Each LangGraph thread gets its own QuickJS slot (worker + runtime +
     context), so globals from one conversation cannot leak into another.
 
+    !!! danger "`fs` bypasses file permissions and approvals"
+
+        With `fs` set, code the model writes can read, write, and delete
+        anything the backend can reach. `fs` calls the backend directly, so
+        `FilesystemMiddleware` permission rules, `create_deep_agent`
+        `permissions`, and `interrupt_on` approval do not apply to it. On a
+        `FilesystemBackend` with `virtual_mode=False`, or a local shell
+        backend, that is the host's filesystem. Enable `fs` only for trusted
+        use or with a backend sandboxed to files the agent may change.
+
     Args:
         memory_limit: Bytes the QuickJS heap may use. Shared across all
             contexts under the same Runtime. Default 64 MiB.
         timeout: Per-call timeout in seconds. Applied to every
-            `eval` on every context. Default 5.
+            `eval` on every context. `None` disables the deadline. Default 5.
 
             !!! warning
 
@@ -145,6 +162,13 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                 is not counted against it. A slow or blocking host call can
                 therefore stall an `eval` for longer than `timeout` seconds, so
                 do not rely on it to bound total wall-clock duration.
+
+            !!! warning
+
+                Avoid `timeout=None` unless absolutely needed: a runaway `eval`
+                then runs forever, and asyncio cancellation cannot stop it.
+                Only use it with an external limit that can, such as a
+                process kill or workflow timeout.
         max_ptc_calls: Maximum number of `tools.*` bridge calls allowed
             during one `eval` execution. Exceeding this budget throws
             from the host-function bridge before invoking the tool.
@@ -177,6 +201,11 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                 HITL approval per dispatch. Gate the `eval` tool itself, add
                 approval middleware inside subagent specs, or set
                 `subagents=False` if per-dispatch parent approval is required.
+        max_subagent_concurrency: Positive integer limiting simultaneous `task()`
+            calls per REPL, defaulting to 32. Excess calls wait for capacity.
+            Higher values increase memory use, downstream load, and model cost;
+            use external admission controls when increasing this limit.
+            This is not a process-wide limit or a total dispatch budget.
         ptc: Programmatic tool calling — expose agent tools inside the
             REPL as `tools.<camelCase>(input) => Promise<string>`. One
             `eval` call can then orchestrate many tool calls (loops,
@@ -200,6 +229,24 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
 
             The REPL's own tool is always excluded; a model asking for
             `tools.eval("...")` would recurse pointlessly.
+        fs: Backend for a Node-style `fs` global in code: `readFile`,
+            `writeFile`, `readdir`, `access`, and `rm`, also under
+            `fs.promises`. `None` (default) gives code no `fs`. `True` uses
+            the backend `create_deep_agent` gives its file tools; with any
+            other agent factory, pass the backend itself. One middleware
+            instance with `fs=True` serves one agent's backend. `fs` reads
+            and writes UTF-8 text only and has only async functions. A file
+            too big for the QuickJS heap (`memory_limit`) ends the eval with
+            `MarshalError`.
+
+            !!! danger
+                `fs` calls the backend directly, not the file tools, so no
+                permission rule or approval guards it: code can read, write,
+                and delete anything the backend can reach. Leave `fs` unset
+                for an agent that relies on `FilesystemMiddleware`
+                permissions, `create_deep_agent` `permissions`, or
+                `interrupt_on` for files. `fs=True` gives code the same reach
+                as the agent's own backend.
         mode: REPL state persistence mode.
             - `"thread"`: state persists across calls and across turns.
             - `"turn"`: state persists across calls within a turn only.
@@ -236,30 +283,40 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         ```
     """
 
+    trace_policy = TracePolicy(process_inputs=omit_payload)
+
     state_schema = REPLState
 
     def __init__(
         self,
         *,
         memory_limit: int = _DEFAULT_MEMORY_LIMIT,
-        timeout: float = _DEFAULT_TIMEOUT,
+        timeout: float | None = _DEFAULT_TIMEOUT,
         max_ptc_calls: int | None = _DEFAULT_MAX_PTC_CALLS,
         tool_name: str = _DEFAULT_TOOL_NAME,
         max_result_chars: int = _DEFAULT_MAX_RESULT_CHARS,
         capture_console: bool = True,
         subagents: bool = True,
+        max_subagent_concurrency: int = _DEFAULT_MAX_SUBAGENT_CONCURRENCY,
         ptc: PTCOption | None = None,
+        fs: BackendProtocol | bool | None = None,
         mode: PersistenceMode | None = None,
         max_snapshot_bytes: int | None = None,
         snapshot_signing_key: str | bytes | None = None,
     ) -> None:
         """Initialize REPL middleware state and build the exposed eval tool."""
         super().__init__()
+        if timeout is not None and not timeout > 0:
+            msg = "`timeout` must be > 0 or None"
+            raise ValueError(msg)
         if max_ptc_calls is not None and max_ptc_calls < 1:
             msg = "`max_ptc_calls` must be >= 1 or None"
             raise ValueError(msg)
         if max_snapshot_bytes is not None and max_snapshot_bytes < 1:
             msg = "`max_snapshot_bytes` must be >= 1 or None"
+            raise ValueError(msg)
+        if type(max_subagent_concurrency) is not int or max_subagent_concurrency < 1:
+            msg = "`max_subagent_concurrency` must be a positive integer"
             raise ValueError(msg)
         self._memory_limit = memory_limit
         self._timeout = timeout
@@ -268,7 +325,10 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         self._max_result_chars = max_result_chars
         self._capture_console = capture_console
         self._subagents = subagents
+        self._max_subagent_concurrency = max_subagent_concurrency
         self._ptc = ptc
+        self._fs_from_agent = fs is True
+        self._fs = None if isinstance(fs, bool) else fs
         self._mode = _resolve_mode(mode=mode)
         self._max_snapshot_bytes = (
             memory_limit if max_snapshot_bytes is None else max_snapshot_bytes
@@ -285,29 +345,26 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
             max_stdout_chars=max_result_chars,
             max_ptc_calls=max_ptc_calls,
             subagents_enabled=subagents,
+            max_subagent_concurrency=max_subagent_concurrency,
         )
         self._memory_limit_mb = memory_limit // (1024 * 1024)
         self._base_prompt_cache: dict[bool, str] = {}
-        self._ptc_prompt_cache: tuple[frozenset[str], str] | None = None
-        self._ptc_tools_by_thread: dict[str, tuple[BaseTool, ...]] = {}
-        # Stable fallback thread id — used when `thread_id` isn't in
-        # langgraph config. Must be instance-scoped so `wrap_model_call`
-        # and `eval` invocations within one conversation resolve to the
-        # same REPL; otherwise the PTC install happens on one REPL and the
-        # eval runs on another (and sees `tools` undefined).
-        self._fallback_thread_id = f"session_{uuid.uuid4().hex[:8]}"
+        self._ptc_tools_by_slot: dict[str, tuple[BaseTool, ...]] = {}
+        # Rendered `tools` namespace per slot, with the tools it was rendered from.
+        self._ptc_prompt_by_slot: dict[str, tuple[tuple[BaseTool, ...], str]] = {}
         self.tools: list[BaseTool] = [self._build_tool()]
 
     def _build_tool(self) -> BaseTool:
         tool_name = self._tool_name
         max_chars = self._max_result_chars
-        fallback_id = self._fallback_thread_id
         middleware = self
         code_doc = render_eval_tool_code_doc(mode=self._mode)
-        tool_description = render_eval_tool_description(mode=self._mode)
+        tool_description = render_eval_tool_description(
+            mode=self._mode, files_attached=self._fs_enabled
+        )
 
-        def _make_tool_message(
-            outcome: Any,
+        def _make_tool_output(
+            outcome: EvalOutcome,
             tool_call_id: str | None,
         ) -> ToolMessage:
             return ToolMessage(
@@ -316,38 +373,82 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                 name=tool_name,
             )
 
+        def _restore_error_output(
+            exc: _SnapshotRestoreError, tool_call_id: str | None
+        ) -> Command:
+            return Command(
+                update={
+                    "messages": [
+                        _make_tool_output(
+                            EvalOutcome(
+                                error_type=type(exc).__name__,
+                                error_message=(
+                                    "Failed to restore JavaScript state; "
+                                    "saved state was cleared. "
+                                    "The requested code was not executed."
+                                ),
+                            ),
+                            tool_call_id,
+                        )
+                    ],
+                    "_quickjs_snapshot_payload": None,
+                    "_quickjs_snapshot_hmac": None,
+                }
+            )
+
+        def _with_eval_callbacks(
+            runtime: ToolRuntime[None, Any], callbacks: BaseCallbackManager | None
+        ) -> ToolRuntime[None, Any]:
+            # Parent PTC tool calls and `task()` subagents on the eval run, not
+            # on the agent's tools step.
+            return replace(
+                runtime, config=patch_config(runtime.config, callbacks=callbacks)
+            )
+
         def sync_eval(
             runtime: ToolRuntime[None, Any],
             code: Annotated[str, code_doc],
-        ) -> ToolMessage:
-            thread_id = _resolve_thread_id(fallback_id)
-            repl = middleware._repl_for_eval(thread_id)
+            callbacks: BaseCallbackManager | None = None,
+        ) -> ToolMessage | Command:
+            slot_id = middleware._slot_id(runtime.state)
+            repl = middleware._repl_for_eval(slot_id)
             try:
                 outcome = repl.eval_sync(
                     code,
-                    outer_runtime=runtime,
+                    outer_runtime=_with_eval_callbacks(runtime, callbacks),
+                    snapshot_payload=middleware._snapshot_for_eval(runtime.state),
+                    tools=middleware._tools_for_eval(slot_id),
+                    fs=middleware._fs,
                 )
+            except _SnapshotRestoreError as exc:
+                return _restore_error_output(exc, runtime.tool_call_id)
             finally:
                 if middleware._mode == "call":
-                    middleware._registry.reset_repl(thread_id)
-            return _make_tool_message(outcome, runtime.tool_call_id)
+                    middleware._registry.reset_repl(slot_id)
+            return _make_tool_output(outcome, runtime.tool_call_id)
 
         async def async_eval(
             runtime: ToolRuntime[None, Any],
             code: Annotated[str, code_doc],
-        ) -> ToolMessage:
-            thread_id = _resolve_thread_id(fallback_id)
-            repl = middleware._repl_for_eval(thread_id)
+            callbacks: BaseCallbackManager | None = None,
+        ) -> ToolMessage | Command:
+            slot_id = middleware._slot_id(runtime.state)
+            repl = middleware._repl_for_eval(slot_id)
             try:
                 outcome = await repl.eval_async(
                     code,
-                    outer_runtime=runtime,
+                    outer_runtime=_with_eval_callbacks(runtime, callbacks),
+                    snapshot_payload=middleware._snapshot_for_eval(runtime.state),
+                    tools=middleware._tools_for_eval(slot_id),
                     outer_loop=asyncio.get_running_loop(),
+                    fs=middleware._fs,
                 )
+            except _SnapshotRestoreError as exc:
+                return _restore_error_output(exc, runtime.tool_call_id)
             finally:
                 if middleware._mode == "call":
-                    middleware._registry.reset_repl(thread_id)
-            return _make_tool_message(outcome, runtime.tool_call_id)
+                    middleware._registry.reset_repl(slot_id)
+            return _make_tool_output(outcome, runtime.tool_call_id)
 
         return StructuredTool.from_function(
             name=tool_name,
@@ -369,14 +470,46 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                 names.add(entry.name)
         return names
 
-    def _repl_for_eval(self, thread_id: str) -> Any:
+    def _repl_for_eval(self, slot_id: str) -> Any:
         """Return the REPL slot for one eval invocation."""
-        repl = self._registry.get(thread_id)
-        if self._mode == "call" and self._ptc is not None:
-            repl.install_tools(list(self._ptc_tools_by_thread.get(thread_id, ())))
-        return repl
+        return self._registry.get(slot_id)
 
-    def _snapshot_authenticated(self, payload: bytes, state: REPLState) -> bool:
+    def _tools_for_eval(self, slot_id: str) -> tuple[BaseTool, ...] | None:
+        """Return current bindings without allocating an interpreter."""
+        return (
+            self._ptc_tools_by_slot.get(slot_id, ()) if self._ptc is not None else None
+        )
+
+    def _snapshot_for_eval(self, state: Mapping[str, object]) -> bytes | None:
+        """Return authenticated thread state for lazy restoration."""
+        payload = state.get("_quickjs_snapshot_payload")
+        if (
+            self._mode == "thread"
+            and isinstance(payload, bytes)
+            and payload
+            and self._snapshot_authenticated(payload, state)
+        ):
+            return payload
+        return None
+
+    def _slot_id(self, state: Mapping[str, object]) -> str:
+        """Return the private interpreter slot initialized by `before_agent`."""
+        slot_id = state.get("_quickjs_slot_id")
+        if isinstance(slot_id, str) and slot_id:
+            return slot_id
+        msg = (
+            "QuickJS private state is missing `_quickjs_slot_id`; "
+            "`CodeInterpreterMiddleware.before_agent` must run before eval."
+        )
+        raise ValueError(msg)
+
+    def _slot_update_for_runtime(self) -> dict[str, str]:
+        """Build a private state update with a fresh slot id when needed."""
+        return {"_quickjs_slot_id": _new_slot_id()}
+
+    def _snapshot_authenticated(
+        self, payload: bytes, state: Mapping[str, object]
+    ) -> bool:
         """Whether ``payload`` may be restored under the current signing policy.
 
         With a signing key configured, the materialized ``payload`` must carry a
@@ -387,19 +520,21 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         """
         if self._snapshot_signing_key is None:
             return True
-        thread_id = _resolve_thread_id(self._fallback_thread_id)
+        slot_id = self._slot_id(state)
         # `_quickjs_snapshot_hmac` is `NotRequired`: an unsigned or legacy
         # snapshot has no tag, and a store adversary can strip it. Default to
         # `None` so a missing tag flows into `verify_snapshot` as a rejection
         # rather than raising `KeyError`.
-        tag = state.get("_quickjs_snapshot_hmac", None)
-        if verify_snapshot(self._snapshot_signing_key, payload, thread_id, tag):
+        tag = state.get("_quickjs_snapshot_hmac")
+        if isinstance(tag, bytes) and verify_snapshot(
+            self._snapshot_signing_key, payload, slot_id, tag
+        ):
             return True
         logger.warning(
-            "Rejecting QuickJS snapshot for thread_id=%s: HMAC verification "
+            "Rejecting QuickJS snapshot for slot_id=%s: HMAC verification "
             "failed (missing or tampered signature). Snapshot will not be "
             "restored.",
-            thread_id,
+            slot_id,
         )
         return False
 
@@ -408,52 +543,34 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         state: REPLState,
         runtime: "Runtime[ContextT]",  # noqa: ARG002
     ) -> dict[str, Any] | None:
-        """Restore REPL snapshot bytes into the current thread slot."""
+        """Assign a private slot and authenticate snapshots without creating a VM."""
+        slot_id = state.get("_quickjs_slot_id")
+        update: dict[str, Any] | None = None
+        if not isinstance(slot_id, str) or not slot_id:
+            update = self._slot_update_for_runtime()
+            slot_id = update["_quickjs_slot_id"]
         if self._mode != "thread":
-            return None
+            return update
         payload = state.get("_quickjs_snapshot_payload")
         if not payload:
-            return None
-        if not self._snapshot_authenticated(payload, state):
-            return {"_quickjs_snapshot_payload": None, "_quickjs_snapshot_hmac": None}
-        thread_id = _resolve_thread_id(self._fallback_thread_id)
-        repl = self._registry.get(thread_id)
-        try:
-            repl.restore_snapshot(payload, inject_globals=True)
-        except Exception:  # noqa: BLE001  # best-effort restore path
-            logger.warning(
-                "Failed to restore QuickJS snapshot for thread_id=%s",
-                thread_id,
-                exc_info=True,
-            )
-            return {"_quickjs_snapshot_payload": None, "_quickjs_snapshot_hmac": None}
-        return None
+            return update
+        if not self._snapshot_authenticated(
+            payload, {**state, "_quickjs_slot_id": slot_id}
+        ):
+            return {
+                **(update or {}),
+                "_quickjs_snapshot_payload": None,
+                "_quickjs_snapshot_hmac": None,
+            }
+        return update
 
     async def abefore_agent(
         self,
         state: REPLState,
-        runtime: "Runtime[ContextT]",  # noqa: ARG002
+        runtime: "Runtime[ContextT]",
     ) -> dict[str, Any] | None:
-        """Async variant of `before_agent` snapshot restore."""
-        if self._mode != "thread":
-            return None
-        payload = state.get("_quickjs_snapshot_payload")
-        if not payload:
-            return None
-        if not self._snapshot_authenticated(payload, state):
-            return {"_quickjs_snapshot_payload": None, "_quickjs_snapshot_hmac": None}
-        thread_id = _resolve_thread_id(self._fallback_thread_id)
-        repl = self._registry.get(thread_id)
-        try:
-            await repl.arestore_snapshot(payload, inject_globals=True)
-        except Exception:  # noqa: BLE001  # best-effort restore path
-            logger.warning(
-                "Failed to restore QuickJS snapshot for thread_id=%s",
-                thread_id,
-                exc_info=True,
-            )
-            return {"_quickjs_snapshot_payload": None, "_quickjs_snapshot_hmac": None}
-        return None
+        """Async variant of lazy slot preparation."""
+        return self.before_agent(state, runtime)
 
     def wrap_model_call(
         self,
@@ -498,26 +615,37 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
                 memory_limit_mb=self._memory_limit_mb,
                 mode=self._mode,
                 ptc_attached=ptc_attached,
+                files_attached=self._fs_enabled,
             )
             self._base_prompt_cache[ptc_attached] = cached
         return cached
 
     def _prepare_for_call(self, request: ModelRequest[ContextT]) -> str:
-        """Install PTC bindings for this turn and return the prompt addendum.
+        """Cache live PTC bindings and return the prompt addendum.
 
         Called from both sync and async model-call wrappers. Reads the
         live tool list off the request (middlewares upstream may have
-        filtered it), installs PTC bridges on the current thread's REPL,
-        and renders matching API-reference text.
+        filtered it) and renders matching API-reference text without creating a VM.
         """
+        if self._fs_from_agent and self._fs is None:
+            msg = (
+                "CodeInterpreterMiddleware(fs=True) has no backend: build the agent "
+                "with create_deep_agent, or pass the backend as fs."
+            )
+            raise ValueError(msg)
         request_tools: list[BaseTool] = list(getattr(request, "tools", []) or [])
 
         subagent_section = ""
         if self._subagents and find_subagent_task_tool(request_tools) is not None:
-            subagent_section = render_subagent_system_prompt(tool_name=self._tool_name)
+            subagent_section = render_subagent_system_prompt(
+                tool_name=self._tool_name,
+                max_subagent_concurrency=self._max_subagent_concurrency,
+            )
 
         if self._ptc is None:
-            return self._base_prompt(ptc_attached=False) + subagent_section
+            return self._with_fs(
+                self._base_prompt(ptc_attached=False) + subagent_section
+            )
 
         exposed = filter_tools_for_ptc(
             request_tools,
@@ -525,22 +653,45 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
             self_tool_name=self._tool_name,
         )
         prompt = self._base_prompt(ptc_attached=bool(exposed)) + subagent_section
-        thread_id = _resolve_thread_id(self._fallback_thread_id)
-        repl = self._registry.get(thread_id)
-        repl.install_tools(exposed)
-        self._ptc_tools_by_thread[thread_id] = tuple(exposed)
-        # Rendering the TS-ish signature block is cheap but not free;
-        # cache by the set of exposed names. The set doesn't encode tool
-        # *identity* — if a tool keeps its name but its schema changes
-        # between turns, the cached prompt staleness is on the caller.
-        # Same tradeoff the TS package accepts; see the module docstring.
-        exposed_names = frozenset(t.name for t in exposed)
-        if self._ptc_prompt_cache is None or self._ptc_prompt_cache[0] != exposed_names:
-            self._ptc_prompt_cache = (
-                exposed_names,
-                render_ptc_prompt(exposed, tool_name=self._tool_name),
+        slot_id = self._slot_id(getattr(request, "state", {}))
+        exposed_tools = tuple(exposed)
+        self._ptc_tools_by_slot[slot_id] = exposed_tools
+        # Rendering the TS-ish signature block is cheap but not free, so it is
+        # cached. One middleware instance serves every run of a compiled
+        # graph, and concurrent runs may expose different tools under the
+        # same names, so the cache is per slot and keyed on tool identity.
+        cached = self._ptc_prompt_by_slot.get(slot_id)
+        if cached is None or not _same_tools(cached[0], exposed_tools):
+            cached = (
+                exposed_tools,
+                render_ptc_prompt(exposed_tools, tool_name=self._tool_name),
             )
-        return prompt + self._ptc_prompt_cache[1]
+            self._ptc_prompt_by_slot[slot_id] = cached
+        return self._with_fs(prompt + cached[1])
+
+    def _with_fs(self, prompt: str) -> str:
+        if not self._fs_enabled:
+            return prompt
+        return prompt.rstrip("\n") + FS_SYSTEM_PROMPT
+
+    @property
+    def _fs_enabled(self) -> bool:
+        return self._fs_from_agent or self._fs is not None
+
+    def bind_backend(self, backend: BackendProtocol) -> None:
+        """Use the agent's backend for `fs=True`; `create_deep_agent` calls this."""
+        if not self._fs_from_agent:
+            return
+        # Every `StateBackend` reads the running graph's own state, so any two
+        # are interchangeable; other backends must be the same object.
+        interchangeable = type(self._fs) is type(backend) is StateBackend
+        if self._fs is not None and self._fs is not backend and not interchangeable:
+            msg = (
+                "This CodeInterpreterMiddleware(fs=True) already serves another "
+                "agent's backend; create one middleware per agent."
+            )
+            raise ValueError(msg)
+        self._fs = backend
 
     def _extend(
         self, system_message: SystemMessage | None, prompt: str
@@ -548,17 +699,17 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         return append_to_system_message(system_message, prompt)
 
     def _snapshot_update(
-        self, *, payload: bytes, prior: bytes, thread_id: str
+        self, *, payload: bytes, prior: bytes, slot_id: str
     ) -> dict[str, Any]:
         """Build a patch-chain state update for a fresh snapshot ``payload``."""
         size = len(payload)
         if size > self._max_snapshot_bytes:
             logger.warning(
                 (
-                    "Dropping QuickJS snapshot for thread_id=%s "
+                    "Dropping QuickJS snapshot for slot_id=%s "
                     "(size=%d bytes exceeds max_snapshot_bytes=%d)"
                 ),
-                thread_id,
+                slot_id,
                 size,
                 self._max_snapshot_bytes,
             )
@@ -574,7 +725,7 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         }
         if self._snapshot_signing_key is not None:
             update["_quickjs_snapshot_hmac"] = sign_snapshot(
-                self._snapshot_signing_key, payload, thread_id
+                self._snapshot_signing_key, payload, slot_id
             )
         return update
 
@@ -584,13 +735,14 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         runtime: "Runtime[ContextT]",  # noqa: ARG002
     ) -> dict[str, Any] | None:
         """Snapshot REPL state (optional) and evict this turn's REPL slot."""
-        thread_id = _resolve_thread_id(self._fallback_thread_id)
-        self._ptc_tools_by_thread.pop(thread_id, None)
+        slot_id = self._slot_id(state)
+        self._ptc_tools_by_slot.pop(slot_id, None)
+        self._ptc_prompt_by_slot.pop(slot_id, None)
         if self._mode != "thread":
-            self._registry.evict(thread_id)
+            self._registry.evict(slot_id)
             return None
 
-        repl = self._registry.get_if_exists(thread_id)
+        repl = self._registry.get_if_exists(slot_id)
         if repl is None:
             return None
         prior = state.get("_quickjs_snapshot_payload") or b""
@@ -599,17 +751,17 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
             update = self._snapshot_update(
                 payload=repl.create_snapshot(),
                 prior=prior,
-                thread_id=thread_id,
+                slot_id=slot_id,
             )
         except Exception:  # noqa: BLE001  # best-effort snapshot path
             logger.warning(
                 "Failed to create QuickJS snapshot for thread_id=%s",
-                thread_id,
+                slot_id,
                 exc_info=True,
             )
             update = {"_quickjs_snapshot_payload": None, "_quickjs_snapshot_hmac": None}
         finally:
-            self._registry.evict(thread_id)
+            self._registry.evict(slot_id)
         return update
 
     async def aafter_agent(
@@ -618,13 +770,14 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
         runtime: "Runtime[ContextT]",  # noqa: ARG002
     ) -> dict[str, Any] | None:
         """Async variant of `after_agent` snapshot+evict behavior."""
-        thread_id = _resolve_thread_id(self._fallback_thread_id)
-        self._ptc_tools_by_thread.pop(thread_id, None)
+        slot_id = self._slot_id(state)
+        self._ptc_tools_by_slot.pop(slot_id, None)
+        self._ptc_prompt_by_slot.pop(slot_id, None)
         if self._mode != "thread":
-            await self._registry.aevict(thread_id)
+            await self._registry.aevict(slot_id)
             return None
 
-        repl = self._registry.get_if_exists(thread_id)
+        repl = self._registry.get_if_exists(slot_id)
         if repl is None:
             return None
         prior = state.get("_quickjs_snapshot_payload") or b""
@@ -633,21 +786,27 @@ class CodeInterpreterMiddleware(AgentMiddleware[REPLState, ContextT, ResponseT])
             update = self._snapshot_update(
                 payload=await repl.acreate_snapshot(),
                 prior=prior,
-                thread_id=thread_id,
+                slot_id=slot_id,
             )
         except Exception:  # noqa: BLE001  # best-effort snapshot path
             logger.warning(
                 "Failed to create QuickJS snapshot for thread_id=%s",
-                thread_id,
+                slot_id,
                 exc_info=True,
             )
             update = {"_quickjs_snapshot_payload": None, "_quickjs_snapshot_hmac": None}
         finally:
-            await self._registry.aevict(thread_id)
+            await self._registry.aevict(slot_id)
         return update
 
     def __del__(self) -> None:
         """Best-effort Runtime cleanup on GC; never raises at shutdown."""
+        # During interpreter finalization the daemon worker threads can no
+        # longer take the GIL, so closing a slot (which waits on its worker)
+        # would block forever and the process would never exit. The OS
+        # reclaims the interpreters' memory at exit anyway.
+        if sys.is_finalizing():
+            return
         # Wrapped in `contextlib.suppress` because __del__ must not raise
         # during interpreter shutdown, when dependencies may already be
         # half-unloaded.

@@ -8,7 +8,7 @@
 #   package paths — lockfiles, `pyproject.toml` lower bounds, etc. —
 #   release-please attributes the bump-worthy commit to those packages and opens
 #   a release PR for each. This is the general fan-out sibling of the
-#   empty-commit fan-out that `guard-empty-commit` (release-please.yml) blocks;
+#   empty-commit fan-out that the empty-commit guard in release-please.yml blocks;
 #   see "Lockfile churn fan-out" and "Multi-component fan-out" in
 #   .github/RELEASING.md.
 #
@@ -23,7 +23,7 @@
 # Escape hatch:
 #   Cross-package releases are occasionally legitimate (e.g. a leaf-package
 #   security bump, or a deliberate coordinated multi-package bump). Apply the
-#   `allow-lockfile-release` label to acknowledge the fan-out and let the PR
+#   `ci:allow-lockfile-release` label to acknowledge the fan-out and let the PR
 #   pass; the `labeled` trigger re-runs the check so the red clears without a
 #   new commit. A companion workflow (`release_fanout_bypass_warn.yml`) posts a
 #   loud sticky listing the components that will still fan out.
@@ -94,7 +94,7 @@ jobs:
           persist-credentials: false
 
       - name: "🐍 Setup Python 3.11"
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
@@ -184,7 +184,7 @@ jobs:
         with:
           script: |
             const STICKY_MARKER = '<!-- release-please-scope-check -->';
-            const BYPASS_LABEL = 'allow-lockfile-release';
+            const BYPASS_LABEL = 'ci:allow-lockfile-release';
             const SPLIT_RECIPE = [
               'Split into:',
               '',

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
+from rich.cells import cell_len
 from textual import events
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
@@ -21,6 +23,7 @@ from deepagents_code._constants import FIREWORKS_MODEL_ID_PREFIXES
 from deepagents_code._env_vars import HIDE_CWD, HIDE_GIT_BRANCH, is_env_truthy
 from deepagents_code._session_stats import format_cost, format_token_count
 from deepagents_code.config import get_glyphs
+from deepagents_code.tui.widgets._condense_path import condense_path
 from deepagents_code.tui.widgets.loading import Spinner
 
 logger = logging.getLogger(__name__)
@@ -30,6 +33,8 @@ if TYPE_CHECKING:
     from textual.geometry import Size
     from textual.message import Message
     from textual.timer import Timer
+
+    from deepagents_code.cold_cache import CacheConfidence
 
 PROVIDER_PREFIX_STRIPS: dict[str, tuple[str, ...]] = {
     "fireworks": FIREWORKS_MODEL_ID_PREFIXES,
@@ -258,21 +263,28 @@ class ModelLabel(Widget):
         ):
             self.suppress_click()
 
-    async def on_click(self, event: events.Click) -> None:
-        """Open a picker for a left-click on a target span in the status bar.
+    def _copy_model_slug(self) -> None:
+        """Copy the unabridged model slug to the clipboard."""
+        from deepagents_code.clipboard import copy_text_with_feedback
 
-        Textual synthesizes `Click` for any button and posts one per release, so
-        filter on both: without the button check a right-click would open a picker,
-        and without the chain check a double-click would open two. A click that
-        restores terminal focus is consumed without opening anything.
-        """
+        slug = f"{self.provider}:{self.model}" if self.provider else self.model
+        copy_text_with_feedback(
+            self.app,
+            slug,
+            failure_noun="selection",
+            success_message="Model slug copied",
+        )
+
+    async def on_click(self, event: events.Click) -> None:
+        """Open a picker, or copy the model slug on Ctrl+left-click."""
         target = self._picker_target(event)
         if event.button != _LEFT_BUTTON or target is None:
             return
-        # Stop every target click so it cannot bubble to the app handler that
-        # refocuses the chat input behind a picker.
         event.stop()
         if event.chain > _SINGLE_CLICK_CHAIN:
+            return
+        if event.ctrl and target == "model":
+            self._copy_model_slug()
             return
         await self.run_action(_PICKER_ACTIONS[target])
 
@@ -323,15 +335,89 @@ class ModelLabel(Widget):
         if len(model_with_effort) <= width:
             return self._clickable_content(model, effort=self.effort)
         suffix = f" {self.effort}" if self.effort else ""
-        if suffix and width > len(suffix) + 1:
+        ellipsis = get_glyphs().ellipsis
+        if suffix and width > len(suffix) + len(ellipsis):
             model_width = width - len(suffix)
-            truncated_model = f"\u2026{model[-(model_width - 1) :]}"
+            truncated_model = ellipsis + model[-(model_width - len(ellipsis)) :]
             return self._clickable_content(truncated_model, effort=self.effort)
         if len(model) <= width:
             return self._clickable_content(model)
-        if width > 1:
-            return self._clickable_content("\u2026" + model[-(width - 1) :])
-        return self._clickable_content("\u2026")
+        if width > len(ellipsis):
+            return self._clickable_content(ellipsis + model[-(width - len(ellipsis)) :])
+        return self._clickable_content(ellipsis[:width])
+
+
+_CWD_MAX_FRACTION = 0.45
+"""Share of the status row `.status-cwd` may claim (its CSS `max-width`)."""
+
+
+def _home_relative(path: str) -> str:
+    """Substitute `~` for the user's home directory.
+
+    Returns:
+        The path with a leading `~` when it lives under the home directory,
+            otherwise the path unchanged.
+    """
+    try:
+        candidate = Path(path)
+        home = Path.home()
+        if candidate.is_relative_to(home):
+            relative = candidate.relative_to(home).as_posix()
+            return "~" if relative == "." else f"~/{relative}"
+    except ValueError, RuntimeError:
+        pass
+    return path
+
+
+class CwdLabel(Widget):
+    """A label that displays the working directory, condensed to fit.
+
+    The tail of a path is the part users read, so directory components are
+    collapsed from the middle outward (see :func:`condense_path`) rather than
+    clipping the end the way CSS `text-overflow: ellipsis` does. The widget
+    sizes to the full path but is capped by `.status-cwd`'s `max-width`, so
+    `render` always sees the real budget in `content_size`. The untruncated
+    path is always available as the widget's tooltip.
+    """
+
+    path: reactive[str] = reactive("", layout=True)
+
+    def get_content_width(self, container: Size, viewport: Size) -> int:  # noqa: ARG002
+        """Return the intrinsic width so the widget participates in flex layout.
+
+        Args:
+            container: Size of the container.
+            viewport: Size of the viewport.
+
+        Returns:
+            Cell width of the full home-relative path. Returning the full path
+                (not the condensed form) keeps the label's size independent of
+                its own output and lets the CSS `max-width` provide the budget
+                `render` condenses against.
+        """
+        if not self.path:
+            return 0
+        return cell_len(_home_relative(self.path))
+
+    def watch_path(self, path: str) -> None:
+        """Expose the untruncated path as the widget's tooltip."""
+        self.tooltip = Content(path) if path else None
+
+    def render(self) -> RenderResult:
+        """Render the path condensed to the available width.
+
+        Returns:
+            The home-relative path, condensed when it overflows, or the empty
+                string when no path is set.
+        """
+        if not self.path:
+            return Content("")
+        display = _home_relative(self.path)
+        width = self.content_size.width
+        # Before the first layout there is no width to condense against.
+        if width <= 0:
+            return Content(display)
+        return Content(condense_path(display, width))
 
 
 class BranchLabel(Widget):
@@ -392,6 +478,27 @@ class MetricsLine(Widget):
     """
 
     segments: reactive[tuple[Content, ...]] = reactive((), layout=True)
+    _cost_hovered: reactive[bool] = reactive(False)
+
+    async def on_click(self, event: events.Click) -> None:
+        """Open the breakdown only for a left-click on the cost span."""
+        if event.button != _LEFT_BUTTON or not event.style.meta.get(
+            "status-cost-target"
+        ):
+            return
+        event.stop()
+        if event.chain == _SINGLE_CLICK_CHAIN:
+            await self.run_action("app.open_cost_breakdown")
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        """Indicate that the cost span is clickable."""
+        self._cost_hovered = bool(event.style.meta.get("status-cost-target"))
+        self.styles.pointer = "pointer" if self._cost_hovered else "default"
+
+    def on_leave(self) -> None:
+        """Clear the cost hover indication."""
+        self._cost_hovered = False
+        self.styles.pointer = "default"
 
     def _separator(self) -> Content:  # noqa: PLR6301 — reads the active glyph set
         """Return the styled separator drawn between two segments."""
@@ -403,7 +510,17 @@ class MetricsLine(Widget):
         Returns:
             Joined metric segments.
         """
-        return self._separator().join(self.segments[:count])
+        return self._separator().join(
+            segment.stylize(Style(underline=True))
+            if self._cost_hovered
+            and any(
+                isinstance(span.style, Style)
+                and span.style.meta.get("status-cost-target")
+                for span in segment.spans
+            )
+            else segment
+            for segment in self.segments[:count]
+        )
 
     def get_content_width(self, container: Size, viewport: Size) -> int:  # noqa: ARG002
         """Return the intrinsic width of the full chain so `width: auto` works.
@@ -526,7 +643,6 @@ class StatusBar(Vertical):
         padding: 0 1 0 0;
         color: $text-muted;
         overflow-x: hidden;
-        text-overflow: ellipsis;
         text-wrap: nowrap;
     }
 
@@ -606,6 +722,11 @@ class StatusBar(Vertical):
         self.cache_input_tokens = 0
         self.cache_read_tokens = 0
         self.cache_write_tokens = 0
+        self.cache_written_at: datetime | None = None
+        self.cache_expires_at: datetime | None = None
+        self.cache_window_seconds: int | None = None
+        self.cache_retention_confidence: CacheConfidence = "expired"
+        self._cache_timer: Timer | None = None
         self._status_by_source: dict[StatusMessageSource, str] = {
             "agent": "",
             "hooks": "",
@@ -624,7 +745,7 @@ class StatusBar(Vertical):
                 classes="status-auto-approve manual",
                 id="auto-approve-indicator",
             )
-            yield Static("", classes="status-cwd", id="cwd-display")
+            yield CwdLabel(classes="status-cwd", id="cwd-display")
             yield BranchLabel(classes="status-branch", id="branch-display")
             yield Static("", classes="status-rubric", id="rubric-display")
             yield ModelLabel(id="model-display")
@@ -650,11 +771,12 @@ class StatusBar(Vertical):
     def _set_cwd_visible(self, visible: bool) -> None:
         """Show or hide the cwd."""
         with suppress(NoMatches):
-            self.query_one("#cwd-display", Static).display = visible
+            self.query_one("#cwd-display", CwdLabel).display = visible
 
     def on_unmount(self) -> None:
-        """Stop the spinner timer so it can't tick on a detached widget."""
+        """Stop timers so they can't tick on a detached widget."""
         self._stop_spinner()
+        self._stop_cache_timer()
 
     def on_mount(self) -> None:
         """Set reactive values after mount to trigger watchers safely."""
@@ -714,10 +836,10 @@ class StatusBar(Vertical):
     def watch_cwd(self, new_value: str) -> None:
         """Update cwd display when it changes."""
         try:
-            display = self.query_one("#cwd-display", Static)
+            display = self.query_one("#cwd-display", CwdLabel)
         except NoMatches:
             return
-        display.update(self._format_cwd(new_value))
+        display.path = new_value or self.cwd or self._initial_cwd
 
     def watch_branch(self, new_value: str) -> None:
         """Update branch display when it changes."""
@@ -875,22 +997,6 @@ class StatusBar(Vertical):
         """
         self.queued_count = max(count, 0)
 
-    def _format_cwd(self, cwd_path: str = "") -> str:
-        """Format the current working directory for display.
-
-        Returns:
-            Formatted path string, using ~ for home directory when possible.
-        """
-        path = Path(cwd_path or self.cwd or self._initial_cwd)
-        try:
-            # Try to use ~ for home directory
-            home = Path.home()
-            if path.is_relative_to(home):
-                return "~/" + path.relative_to(home).as_posix()
-        except (ValueError, RuntimeError):
-            pass
-        return str(path)
-
     def set_mode(self, mode: str) -> None:
         """Set the current input mode.
 
@@ -1037,6 +1143,7 @@ class StatusBar(Vertical):
             Styled cache usage.
         """
         colors = theme.get_theme_colors(self)
+        timing = self._cache_timing_segment()
         hit_rate = Content("")
         if self.cache_input_tokens:
             cached = min(self.cache_read_tokens, self.cache_input_tokens)
@@ -1049,7 +1156,11 @@ class StatusBar(Vertical):
                 color = colors.muted
             hit_rate = Content.styled(f"{percent:.0f}% hit", color)
         elif not self.cache_read_tokens and not self.cache_write_tokens:
-            return Content("")
+            return (
+                Content.assemble(Content.styled("Cache", colors.muted), " ", timing)
+                if timing
+                else Content("")
+            )
         details = (
             f"{_compact_tokens(self.cache_read_tokens)} read"
             f" / {_compact_tokens(self.cache_write_tokens)} write"
@@ -1060,7 +1171,48 @@ class StatusBar(Vertical):
             hit_rate,
             f" {get_glyphs().bullet} " if hit_rate.plain else "",
             details,
+            f" {get_glyphs().bullet} " if timing else "",
+            timing,
         )
+
+    def _cache_timing_segment(self) -> str:
+        """Format the last cache write and remaining retention window.
+
+        Returns:
+            Compact local timestamp and remaining retention countdown.
+        """
+        written = (
+            f"wrote {self.cache_written_at.astimezone():%H:%M:%S}"
+            if self.cache_written_at is not None
+            else ""
+        )
+        if self.cache_expires_at is None:
+            return written
+        remaining = max(
+            0, int((self.cache_expires_at - datetime.now(UTC)).total_seconds())
+        )
+        minutes, seconds = divmod(remaining, 60)
+        countdown = (
+            "expired"
+            if datetime.now(UTC) >= self.cache_expires_at
+            else f"{minutes}:{seconds:02d}"
+        )
+        return f"{written} / {countdown}" if written else countdown
+
+    def _stop_cache_timer(self) -> None:
+        """Stop the cache countdown timer."""
+        if self._cache_timer is not None:
+            self._cache_timer.stop()
+            self._cache_timer = None
+
+    def _tick_cache_timer(self) -> None:
+        """Refresh the cache countdown and stop once it reaches zero."""
+        self._refresh_metrics()
+        if (
+            self.cache_expires_at is not None
+            and datetime.now(UTC) >= self.cache_expires_at
+        ):
+            self._stop_cache_timer()
 
     def _cost_text(self) -> str:
         """Format cumulative cost, including the initial zero state.
@@ -1083,11 +1235,18 @@ class StatusBar(Vertical):
             segment
             for segment in (
                 self._context_segment(count, approximate=approximate),
-                Content(cost) if cost else Content(""),
+                Content.styled(cost, Style.from_meta({"status-cost-target": True}))
+                if cost
+                else Content(""),
             )
             if segment.plain
         )
         cache = self._cache_segment()
+        if (
+            self.cache_expires_at is not None
+            and datetime.now(UTC) >= self.cache_expires_at
+        ):
+            cache = cache.stylize(theme.get_theme_colors(self).error)
         cache_display.segments = (cache,) if cache.plain else ()
         context_display.segments = context_segments
 
@@ -1149,6 +1308,41 @@ class StatusBar(Vertical):
         self.cache_input_tokens = inputs
         self.cache_read_tokens = reads
         self.cache_write_tokens = writes
+        self._refresh_metrics()
+
+    def set_cache_timing(
+        self,
+        written_at: datetime | None,
+        *,
+        ttl_seconds: int | None = None,
+        retention_at: datetime | None = None,
+        retention_confidence: CacheConfidence = "expired",
+    ) -> None:
+        """Set the last cache write time and optional retention countdown.
+
+        Args:
+            written_at: Last observed write, or `None` if none is known.
+            ttl_seconds: Provider retention window, if known.
+            retention_at: Latest cache hit or write; falls back to `written_at`.
+            retention_confidence: Whether the window is a maximum (`expired`)
+                or a minimum (`may_be_cold`), rather than an exact lifetime.
+        """
+        self._stop_cache_timer()
+        self.cache_written_at = written_at
+        self.cache_retention_confidence = retention_confidence
+        self.cache_window_seconds = ttl_seconds
+        retention_at = retention_at or written_at
+        self.cache_expires_at = (
+            datetime.fromtimestamp(retention_at.timestamp() + ttl_seconds, UTC)
+            if retention_at is not None and ttl_seconds is not None and ttl_seconds > 0
+            else None
+        )
+        if (
+            self.cache_expires_at is not None
+            and self.cache_expires_at > datetime.now(UTC)
+            and self._running
+        ):
+            self._cache_timer = self.set_interval(1.0, self._tick_cache_timer)
         self._refresh_metrics()
 
     def set_cost(self, cost_usd: float) -> None:

@@ -6,6 +6,7 @@ import json
 import zipfile
 from pathlib import Path
 
+import pytest
 from check_wheel_dep_freshness import (
     WheelMetadata,
     _escape_command,
@@ -153,6 +154,27 @@ def test_compare_requires_newest_eligible_sibling_metadata_to_match() -> None:
     assert "deepagents-code 0.1.57 (latest on PyPI)" in checks[0].message
 
 
+def test_compare_accepts_sibling_metadata_differing_only_by_next_major_cap() -> None:
+    checks = compare_wheel_with_pypi(
+        _metadata(),
+        {"deepagents-code": _payload(("0.1.57", ">=3.12"))},
+        sibling_requires_python={"deepagents-code": ">=3.12,<4.0"},
+    )
+
+    assert checks[0].passed
+
+
+def test_compare_flags_sibling_metadata_with_patch_level_floor_change() -> None:
+    checks = compare_wheel_with_pypi(
+        _metadata(),
+        {"deepagents-code": _payload(("0.1.57", ">=3.12"))},
+        sibling_requires_python={"deepagents-code": ">=3.12.1,<4.0"},
+    )
+
+    assert not checks[0].passed
+    assert "Release deepagents-code first" in checks[0].message
+
+
 def test_compare_rejects_direct_url_dependency() -> None:
     checks = compare_wheel_with_pypi(
         _metadata(requirements=("demo @ https://example.test/demo.whl",)),
@@ -174,50 +196,51 @@ def test_compare_allows_broader_third_party_python_support() -> None:
     assert checks[0].passed
 
 
+@pytest.mark.parametrize(
+    ("current_minor", "upper_minor"), [(14, 15), (14, 16), (15, 16), (15, 17)]
+)
 def test_compare_warns_when_third_party_caps_only_unreleased_minors(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch, current_minor: int, upper_minor: int
 ) -> None:
-    monkeypatch.setattr("check_wheel_dep_freshness.CURRENT_CPYTHON_MINOR", 14)
+    monkeypatch.setattr(
+        "check_wheel_dep_freshness.CURRENT_CPYTHON_MINOR", current_minor
+    )
     checks = compare_wheel_with_pypi(
         _metadata(
-            name="deepagents-code",
-            version="0.1.58",
-            requires_python=">=3.12,<4.0",
-            requirements=("langchain-ibm>=1.1.0,<2.0.0",),
+            name="langchain-modal",
+            version="0.0.8",
+            requires_python=">=3.11,<4.0",
+            requirements=("modal>=1.5.3",),
         ),
-        {"langchain-ibm": _payload(("1.1.0", ">=3.10,<3.15"))},
+        {"modal": _payload(("1.6.4", f">=3.10,<3.{upper_minor}"))},
     )
 
     assert len(checks) == 1
     assert checks[0].passed
     assert checks[0].warning
-    assert "langchain-ibm 1.1.0 (latest on PyPI) declares" in checks[0].message
-    assert "deepagents-code 0.1.58 requires Python >=3.12,<4.0" in checks[0].message
+    assert "modal 1.6.4 (latest on PyPI) declares" in checks[0].message
+    assert "langchain-modal 0.0.8 requires Python >=3.11,<4.0" in checks[0].message
 
 
-def test_compare_fails_when_patch_exclusion_hides_unreleased_cap() -> None:
+@pytest.mark.parametrize(
+    ("requires_python", "published_python"),
+    [
+        (">=3.12,<4.0", ">=3.12,<3.15"),
+        (">=3.12,<4.0", ">=3.13,<3.17"),
+        (">=3.12,<4.0", ">=3.12.1,<3.17"),
+        (">=3.12,<4.0", ">=3.12,!=3.15.1,<3.17"),
+        (">=3.12,<4.0", ">=3.12,!=3.14.*,<3.17"),
+        (">=3.12,<4.0", ">=3.12,!=3.16.*,<3.18"),
+        (">=3.16,<4.0", ">=3.10,<3.16"),
+    ],
+)
+def test_compare_rejects_unsafe_python_coverage_gaps(
+    monkeypatch: pytest.MonkeyPatch, requires_python: str, published_python: str
+) -> None:
+    monkeypatch.setattr("check_wheel_dep_freshness.CURRENT_CPYTHON_MINOR", 15)
     checks = compare_wheel_with_pypi(
-        _metadata(
-            name="deepagents-code",
-            version="0.1.58",
-            requires_python=">=3.12,<4.0",
-            requirements=("demo>=1",),
-        ),
-        {"demo": _payload(("1.0", ">=3.12.1,<3.15"))},
-    )
-
-    assert len(checks) == 1
-    assert not checks[0].passed
-    assert not checks[0].warning
-
-
-def test_compare_fails_when_third_party_excludes_existing_minor() -> None:
-    checks = compare_wheel_with_pypi(
-        _metadata(
-            requires_python=">=3.12,<4.0",
-            requirements=("demo>=1",),
-        ),
-        {"demo": _payload(("1.0", ">=3.13,<3.14"))},
+        _metadata(requires_python=requires_python, requirements=("demo>=1",)),
+        {"demo": _payload(("1.0", published_python))},
     )
 
     assert len(checks) == 1
@@ -228,7 +251,7 @@ def test_compare_fails_when_third_party_excludes_existing_minor() -> None:
 def test_compare_never_warns_for_sibling_python_metadata_lag() -> None:
     checks = compare_wheel_with_pypi(
         _metadata(),
-        {"deepagents-code": _payload(("0.1.57", ">=3.12,<3.15"))},
+        {"deepagents-code": _payload(("0.1.57", ">=3.12,<3.17"))},
         sibling_requires_python={"deepagents-code": ">=3.12,<4.0"},
     )
 
@@ -551,12 +574,12 @@ def test_resolve_release_target_matches_release_please_component(
 
     assert target.package_name == "deepagents-talon"
     assert target.package_path == "libs/talon"
-    assert target.python_version == "3.12"
+    assert target.python_version == "3.14"
 
 
 def test_release_python_version_matches_release_workflow() -> None:
-    assert release_python_version("deepagents-code") == "3.12"
-    assert release_python_version("deepagents-talon") == "3.12"
+    assert release_python_version("deepagents-code") == "3.14"
+    assert release_python_version("deepagents-talon") == "3.14"
     assert release_python_version("deepagents") == "3.11"
 
 
@@ -698,7 +721,7 @@ def test_validate_wheel_passes_with_warning_for_unreleased_minor_cap(
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
 
     def fetcher(_name: str) -> dict[str, object]:
-        return _payload(("1.1.0", ">=3.10,<3.15"))
+        return _payload(("1.1.0", ">=3.10,<3.16"))
 
     assert (
         validate_wheel(
@@ -773,7 +796,7 @@ def test_target_cli_writes_actions_outputs(tmp_path: Path, monkeypatch) -> None:
     assert "package_path" in written
     assert "libs/talon" in written
     assert "python_version" in written
-    assert "3.12" in written
+    assert "3.14" in written
 
 
 def test_workflow_mirrors_release_install_flags() -> None:

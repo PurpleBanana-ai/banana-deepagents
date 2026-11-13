@@ -37,7 +37,7 @@ def require_ripgrep() -> None:
     `rg` is expected and still skips. CI allows the failure in two cases: the
     bounded install on an ordinary PR hit its two-minute timeout, or the
     unbounded strict install on a release PR failed and was bypassed under the
-    `bypass-ripgrep-check` label.
+    `ci:skip-ripgrep` label.
     """
     if shutil.which("rg") is not None:
         return
@@ -190,6 +190,54 @@ def test_filesystem_backend_virtual_mode(tmp_path: Path, monkeypatch: pytest.Mon
     # path traversal blocked
     with pytest.raises(ValueError, match="traversal"):
         be.read("/../a.txt")
+
+
+@pytest.mark.parametrize("is_dir", [False, True])
+def test_ls_virtual_mode_preserves_symlink_names_and_filters_escapes(tmp_path: Path, *, is_dir: bool) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    target = root / "target"
+    outside = tmp_path / "outside"
+    for path in (target, outside):
+        if is_dir:
+            path.mkdir()
+        else:
+            path.write_text("hello\n")
+    try:
+        (root / "alias").symlink_to("target", target_is_directory=is_dir)
+        (root / "escape").symlink_to(outside, target_is_directory=is_dir)
+    except (NotImplementedError, OSError):
+        pytest.skip("platform does not support symlinks")
+
+    result = FilesystemBackend(root_dir=root, virtual_mode=True).ls("/")
+
+    assert result.error is None
+    assert result.entries is not None
+    suffix = "/" if is_dir else ""
+    assert sorted(entry["path"] for entry in result.entries) == [f"/alias{suffix}", f"/target{suffix}"]
+    assert all(entry["is_dir"] == is_dir for entry in result.entries)
+
+
+@pytest.mark.parametrize("operation", ["glob", "grep"])
+def test_search_virtual_mode_preserves_symlink_names_and_filters_escapes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "target.txt").write_text("hello\n")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("hello secret\n")
+    try:
+        (root / "alias.txt").symlink_to("target.txt")
+        (root / "escape.txt").symlink_to(outside)
+    except (NotImplementedError, OSError):
+        pytest.skip("platform does not support symlinks")
+    backend = FilesystemBackend(root_dir=root, virtual_mode=True)
+    monkeypatch.setattr(backend, "_ripgrep_search", lambda *_args, **_kwargs: (None, False))
+
+    result = backend.glob("*.txt") if operation == "glob" else backend.grep("hello")
+
+    assert result.error is None
+    assert result.matches is not None
+    assert sorted(match["path"] for match in result.matches) == ["/alias.txt", "/target.txt"]
 
 
 def test_filesystem_backend_ls_nested_directories(tmp_path: Path):
@@ -762,6 +810,17 @@ def test_filesystem_download_directory_as_file(tmp_path: Path):
     assert responses[0].error == "is_directory"
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX FIFOs")
+@pytest.mark.timeout(10)
+def test_filesystem_download_fifo_fails_without_waiting_for_a_writer(tmp_path: Path):
+    os.mkfifo(tmp_path / "pipe")
+    be = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=True)
+
+    [response] = be.download_files(["/pipe"])
+
+    assert (response.content, response.error) == (None, "file_not_found")
+
+
 @pytest.mark.parametrize(
     ("pattern", "expected_file"),
     [
@@ -863,6 +922,32 @@ def test_grep_on_single_file_path(tmp_path: Path) -> None:
     assert result.error is None, f"unexpected error: {result.error}"
     assert result.matches is not None
     assert any(m["path"].endswith("single.txt") for m in result.matches)
+
+
+@pytest.mark.usefixtures("_isolate_rg_cache")
+@pytest.mark.parametrize("virtual_mode", [False, True])
+@pytest.mark.parametrize("content", ["needle in requested file\n", "requested content only\n"])
+@pytest.mark.parametrize("glob", [None, "*.txt", "*.py", "/requested.txt"])
+def test_grep_python_fallback_scopes_single_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, virtual_mode: bool, content: str, glob: str | None
+) -> None:
+    """File-scoped fallback searches exclude matching siblings and descendants."""
+    monkeypatch.setattr(fs_module.shutil, "which", lambda _name: None)
+    target = tmp_path / "requested.txt"
+    target.write_text(content, encoding="utf-8")
+    (tmp_path / "sibling.txt").write_text("needle in sibling\n", encoding="utf-8")
+    subdir = tmp_path / "subdir"
+    subdir.mkdir()
+    (subdir / "unrelated.txt").write_text("needle in descendant\n", encoding="utf-8")
+    backend = FilesystemBackend(root_dir=tmp_path, virtual_mode=virtual_mode)
+    path = "/requested.txt" if virtual_mode else str(target)
+
+    result = backend.grep("needle", path=path, glob=glob)
+
+    expected = [{"path": path, "line": 1, "text": content.rstrip("\n")}] if "needle" in content and glob != "*.py" else []
+    assert result.error is None
+    assert result.truncated is False
+    assert result.matches == expected
 
 
 def test_grep_preserves_symlink_path_in_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2594,6 +2679,18 @@ class TestReadTrailingNewlineRoundtrip:
         assert "old_string ends with a newline" in result.error
         assert target.read_text() == "# Agent Role:\nyou are an assistant"
 
+    def test_edit_empty_old_string_leaves_file_unchanged(self, tmp_path: Path) -> None:
+        """Empty `old_string` must error and never modify the file on disk."""
+        target = tmp_path / "a.txt"
+        target.write_text("hello world")
+
+        be = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=False)
+        result = be.edit(str(target), "", "x", replace_all=True)
+
+        assert result.error is not None
+        assert "old_string cannot be empty" in result.error
+        assert target.read_text() == "hello world"
+
 
 class TestFilesystemDelete:
     """Tests for FilesystemBackend.delete."""
@@ -2709,3 +2806,55 @@ class TestFilesystemDelete:
         assert result.error is not None
         assert "Error deleting" in result.error
         assert f.exists()
+
+
+class TestRealPath:
+    """`FilesystemBackend._real_path`, used by filesystem permissions."""
+
+    def _backend(self, tmp_path: Path) -> FilesystemBackend:
+        (tmp_path / "secrets").mkdir()
+        write_file(tmp_path / "secrets" / "key.txt", "k")
+        return FilesystemBackend(root_dir=str(tmp_path), virtual_mode=True)
+
+    def test_plain_and_missing_paths_unchanged(self, tmp_path: Path) -> None:
+        real_path = self._backend(tmp_path)._real_path
+        assert real_path("/secrets/key.txt") == "/secrets/key.txt"
+        assert real_path("/secrets/new/file.txt") == "/secrets/new/file.txt"
+        assert real_path("/") == "/"
+
+    def test_follows_directory_leaf_and_dangling_symlinks(self, tmp_path: Path) -> None:
+        backend = self._backend(tmp_path)
+        try:
+            (tmp_path / "link").symlink_to(tmp_path / "secrets", target_is_directory=True)
+            (tmp_path / "alias.txt").symlink_to(tmp_path / "secrets" / "key.txt")
+            (tmp_path / "dangling").symlink_to(tmp_path / "secrets" / "future")
+        except (NotImplementedError, OSError):
+            pytest.skip("platform does not support symlinks")
+        real_path = backend._real_path
+        assert real_path("/link/key.txt") == "/secrets/key.txt"
+        assert real_path("/link/missing.txt") == "/secrets/missing.txt"
+        assert real_path("/alias.txt") == "/secrets/key.txt"
+        assert real_path("/dangling/x.txt") == "/secrets/future/x.txt"
+
+    def test_escape_outside_root_raises(self, tmp_path: Path) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        root = tmp_path / "root"
+        root.mkdir()
+        try:
+            (root / "escape").symlink_to(outside, target_is_directory=True)
+        except (NotImplementedError, OSError):
+            pytest.skip("platform does not support symlinks")
+        real_path = FilesystemBackend(root_dir=str(root), virtual_mode=True)._real_path
+        with pytest.raises(ValueError, match="outside root"):
+            real_path("/escape/x")
+
+    def test_non_virtual_mode_returns_real_path(self, tmp_path: Path) -> None:
+        self._backend(tmp_path)
+        try:
+            (tmp_path / "link").symlink_to(tmp_path / "secrets", target_is_directory=True)
+        except (NotImplementedError, OSError):
+            pytest.skip("platform does not support symlinks")
+        real_path = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=False)._real_path
+        expected = Path(os.path.realpath(tmp_path / "secrets" / "key.txt"))
+        assert real_path(str(tmp_path / "link" / "key.txt")) == "/" + expected.relative_to(expected.anchor).as_posix()

@@ -11,6 +11,7 @@ from textual.widgets import Static
 
 from deepagents_code.config import get_glyphs
 from deepagents_code.formatting import format_duration
+from deepagents_code.tui.widgets._static_update import update_in_place
 
 if TYPE_CHECKING:
     from textual.app import ComposeResult
@@ -85,16 +86,22 @@ class LoadingWidget(Static):
     }
     """
 
-    def __init__(self, status: str = "Thinking") -> None:
+    def __init__(
+        self, status: str = "Thinking", *, started_at: float | None = None
+    ) -> None:
         """Initialize loading widget.
 
         Args:
             status: Initial status text to display
+            started_at: Turn start time (`time.time()` epoch seconds) the
+                elapsed counter counts from. Pass the time the user's prompt
+                was accepted so the counter includes pre-stream setup;
+                defaults to widget mount.
         """
         super().__init__()
         self._status = status
         self._spinner = Spinner()
-        self._start_time: float | None = None
+        self._start_time = started_at
         self._spinner_widget: Static | None = None
         self._status_widget: Static | None = None
         self._hint_widget: Static | None = None
@@ -160,12 +167,13 @@ class LoadingWidget(Static):
             return
 
         if self._spinner_widget:
-            frame = self._spinner.next_frame()
-            self._spinner_widget.update(frame)
+            update_in_place(self._spinner_widget, self._spinner.next_frame())
 
         if self._hint_widget and self._start_time is not None:
             elapsed = int(time() - self._start_time)
-            self._hint_widget.update(f"({format_duration(elapsed)}, esc to interrupt)")
+            update_in_place(
+                self._hint_widget, f"({format_duration(elapsed)}, esc to interrupt)"
+            )
 
     def set_status(self, status: str) -> None:
         """Update the status text.

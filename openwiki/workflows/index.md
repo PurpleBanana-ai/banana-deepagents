@@ -1,5 +1,5 @@
 # Files
 
-- [Workflow: Build a Deep Agent with the SDK](build-a-deep-agent.md) - End-to-end, task-focused guide for constructing, extending, and invoking a custom deep agent with create_deep_agent, from the README quickstart through the extension points (tools, middleware, subagents, backends, profiles, skills).
-- [Workflow: Run & Extend a dcode Session](run-dcode-session.md) - Run dcode as an interactive TUI, a bounded headless task, or an ACP server; manage persisted threads and approvals; and safely configure hooks, MCP, skills, and sandboxes.
-- [Workflow: Evaluate & Benchmark Agents](run-evals.md) - How to run the Deep Agents eval suite and Harbor/unified benchmarks — the deepagents-evals CLI, Makefile parity, model groups, trial aggregation, exit codes, and the cross-model scorecard.
+- [Build a Deep Agent](build-a-deep-agent.md) - Build and customize a Deep Agents graph by deliberately assembling its model, backend, middleware, subagent boundary, prompt-cache layer, and filesystem approval policy. Verify the construction and task-result contract with focused graph and subagent tests.
+- [Run a dcode Session](run-dcode-session.md) - Choose dcode's ACP, interactive, or headless execution surface and operate headless sessions with safe approval, streaming, interruption, resume, statistics, and shutdown behavior.
+- [Run Evals](run-evals.md) - Choose and operate deterministic pytest checks, traced behavioral evals, local or CI Harbor benchmarks, and unified multi-model evaluation campaigns without conflating their signals.
